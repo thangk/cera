@@ -1,0 +1,61 @@
+{
+  "$schema": "./schema.json",
+  "_comment": "CERA Configuration File - Restaurant Domain Example",
+
+  "subject_profile": {
+    "query": "The Keg Steakhouse",
+    "region": "canada",
+    "category": "restaurant",
+    "custom_schema": null,
+    "seed_subject": null,
+    "feature_count": "5-10",
+    "sentiment_depth": "praise and complain",
+    "context_scope": "typical dining experiences, food quality, service, ambiance, value"
+  },
+
+  "reviewer_profile": {
+    "age_range": [18, 65],
+    "sex_distribution": {
+      "male": 0.45,
+      "female": 0.45,
+      "unspecified": 0.10
+    },
+    "audience_context": [
+      "regular diners",
+      "food enthusiasts",
+      "business lunch customers",
+      "special occasion celebrators"
+    ],
+    "seed_datasets": null
+  },
+
+  "attributes_profile": {
+    "polarity": {
+      "positive": 0.65,
+      "neutral": 0.15,
+      "negative": 0.20
+    },
+    "noise": {
+      "typo_rate": 0.01,
+      "colloquialism": true,
+      "grammar_errors": true
+    },
+    "length_range": [2, 5],
+    "temp_range": [0.7, 0.9]
+  },
+
+  "generation": {
+    "count": 2000,
+    "batch_size": 50,
+    "request_size": 5,
+    "mode": "single-provider",
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-20250514"
+  },
+
+  "output": {
+    "formats": ["jsonl", "csv", "semeval_xml"],
+    "directory": "./output/restaurant",
+    "include_metadata": true
+  }
+}
