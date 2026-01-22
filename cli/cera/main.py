@@ -144,11 +144,12 @@ def run(
         console.print(json.dumps(config_data, indent=2))
         return
 
-    # Get API key from environment or prompt
-    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    # Get API key from .env first, then Convex fallback
+    from cera.config_loader import get_openrouter_api_key
+    api_key = get_openrouter_api_key()
     if not api_key:
-        console.print("\n[yellow]Warning:[/yellow] No API key found in environment")
-        console.print("[dim]Set OPENROUTER_API_KEY or OPENAI_API_KEY environment variable[/dim]")
+        console.print("\n[yellow]Warning:[/yellow] No API key found")
+        console.print("[dim]Set OPENROUTER_API_KEY in .env or configure in web settings[/dim]")
         console.print("[dim]Using placeholder mode for testing...[/dim]")
         api_key = "placeholder"
 
@@ -472,6 +473,402 @@ def export(
     except Exception as e:
         console.print(f"[red]Error exporting:[/red] {e}")
         raise typer.Exit(1)
+
+
+def _fetch_openrouter_models() -> list[dict]:
+    """Fetch and process models from OpenRouter API."""
+    import httpx
+    from cera.config_loader import get_openrouter_api_key
+
+    api_key = get_openrouter_api_key()
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = httpx.get(
+        "https://openrouter.ai/api/v1/models",
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    models_list = data.get("data", [])
+    processed_models = []
+
+    for model in models_list:
+        model_id = model.get("id", "")
+        model_name = model.get("name", "")
+        pricing = model.get("pricing", {})
+        architecture = model.get("architecture", {})
+
+        # Check if free
+        is_free = (
+            float(pricing.get("prompt", "1")) == 0 and
+            float(pricing.get("completion", "1")) == 0
+        )
+
+        # Check modality (vision support)
+        modality = architecture.get("modality", "text->text")
+        has_vision = "image" in modality.lower() or "vision" in model_name.lower()
+
+        # Check if open source
+        is_oss = architecture.get("instruct_type") in ["llama", "mistral", "chatml", "alpaca", "vicuna", "zephyr"]
+        oss_indicators = ["llama", "mistral", "mixtral", "qwen", "yi", "deepseek", "phi", "gemma", "codellama", "falcon", "mpt", "dolly", "vicuna", "openchat", "nous", "hermes"]
+        if any(ind in model_id.lower() for ind in oss_indicators):
+            is_oss = True
+
+        # Check for tool support
+        has_tools = architecture.get("instruct_type") in ["tool_use", "function"] or "tool" in model_name.lower() or "function" in model_name.lower()
+
+        # Extract context length
+        context_length = model.get("context_length", 0)
+
+        # Calculate cost per 1M tokens
+        prompt_cost = float(pricing.get("prompt", "0")) * 1_000_000
+        completion_cost = float(pricing.get("completion", "0")) * 1_000_000
+
+        # Get additional info
+        description = model.get("description", "")
+        top_provider = model.get("top_provider", {})
+        max_completion = top_provider.get("max_completion_tokens", architecture.get("max_completion_tokens", 0))
+
+        # Extract provider from model ID
+        provider = model_id.split("/")[0] if "/" in model_id else "unknown"
+
+        processed_models.append({
+            "id": model_id,
+            "name": model_name,
+            "provider": provider,
+            "context_length": context_length,
+            "max_completion": max_completion,
+            "prompt_cost": prompt_cost,
+            "completion_cost": completion_cost,
+            "is_free": is_free,
+            "is_oss": is_oss,
+            "has_vision": has_vision,
+            "has_tools": has_tools,
+            "modality": modality,
+            "description": description[:100] + "..." if len(description) > 100 else description,
+        })
+
+    return processed_models
+
+
+def _format_model_context(context_length: int) -> str:
+    """Format context length for display."""
+    if not context_length:
+        return "?"
+    if context_length >= 1_000_000:
+        return f"{context_length / 1_000_000:.1f}M"
+    if context_length >= 1000:
+        return f"{context_length // 1000}K"
+    return str(context_length)
+
+
+def _format_model_pricing(model: dict) -> str:
+    """Format model pricing for display."""
+    if model["is_free"]:
+        return "[green]Free[/green]"
+
+    def fmt_cost(cost: float) -> str:
+        if cost == 0:
+            return "0"
+        if cost < 0.01:
+            return f"{cost:.3f}"
+        if cost < 1:
+            return f"{cost:.2f}"
+        return f"{cost:.1f}"
+
+    return f"${fmt_cost(model['prompt_cost'])}/{fmt_cost(model['completion_cost'])}"
+
+
+def _supports_online_search(model_id: str) -> bool:
+    """Check if model supports :online suffix for web search."""
+    # Perplexity models have built-in search (always on)
+    if model_id.startswith("perplexity/"):
+        return True
+    # These providers support :online suffix via OpenRouter
+    online_providers = ["anthropic", "openai", "google"]
+    provider = model_id.split("/")[0] if "/" in model_id else ""
+    if provider in online_providers:
+        return True
+    # Specific search models
+    search_models = ["openai/gpt-4o-search-preview", "openai/gpt-4o-mini-search-preview"]
+    if model_id in search_models:
+        return True
+    return False
+
+
+def _build_model_badges(model: dict) -> str:
+    """Build badges string for model."""
+    badges = []
+    if model["is_free"]:
+        badges.append("[green]Free[/green]")
+    if model["is_oss"]:
+        badges.append("[blue]OSS[/blue]")
+    if model.get("has_online", False):
+        badges.append("[cyan]Online[/cyan]")
+    if model["has_vision"]:
+        badges.append("[magenta]Vision[/magenta]")
+    if model["has_tools"]:
+        badges.append("[yellow]Tools[/yellow]")
+    return " ".join(badges) if badges else "[dim]-[/dim]"
+
+
+def _display_models_table(models: list[dict], detailed: bool = False):
+    """Display a detailed table of models after provider selection."""
+    table = Table(show_header=True, header_style="bold", show_lines=True)
+    table.add_column("Name", style="white", no_wrap=False, max_width=30)
+    table.add_column("Model ID (for config)", style="cyan", no_wrap=True)
+    table.add_column("Context", justify="right")
+    table.add_column("Price ($/1M)\nIn / Out", justify="right")
+    table.add_column("Modality", max_width=20)
+    table.add_column("Badges", justify="left")
+
+    for model in models:
+        # Add online capability check
+        model["has_online"] = _supports_online_search(model["id"])
+
+        # Format pricing
+        pricing = _format_model_pricing(model)
+
+        # Format modality more readably
+        modality = model.get("modality", "text→text")
+        modality = modality.replace("->", "→").replace("text", "txt").replace("image", "img")
+        if len(modality) > 20:
+            modality = modality[:17] + "..."
+
+        table.add_row(
+            model["name"],
+            model["id"],
+            _format_model_context(model["context_length"]),
+            pricing,
+            modality,
+            _build_model_badges(model),
+        )
+
+    console.print(table)
+
+    # Legend
+    console.print("\n[bold]Badge Legend:[/bold]")
+    console.print("  [green]Free[/green] = No cost    [blue]OSS[/blue] = Open Source    [cyan]Online[/cyan] = Web Search (:online)")
+    console.print("  [magenta]Vision[/magenta] = Image input    [yellow]Tools[/yellow] = Function calling")
+
+
+@app.command()
+def models(
+    search: Optional[str] = typer.Argument(
+        None,
+        help="Filter models by name (case-insensitive)",
+    ),
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider", "-p",
+        help="Filter by provider (e.g., anthropic, openai, google)",
+    ),
+    free_only: bool = typer.Option(
+        False,
+        "--free",
+        help="Show only free models",
+    ),
+    vision_only: bool = typer.Option(
+        False,
+        "--vision",
+        help="Show only models with vision/image support",
+    ),
+    limit: int = typer.Option(
+        50,
+        "--limit", "-l",
+        help="Maximum number of models to show",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output as JSON for scripting",
+    ),
+    detailed: bool = typer.Option(
+        False,
+        "--detailed", "-d",
+        help="Show detailed info (architecture, modality, etc.)",
+    ),
+    all_providers: bool = typer.Option(
+        False,
+        "--all", "-a",
+        help="Skip provider selection and show all models",
+    ),
+):
+    """
+    List available OpenRouter models for MAV and generation.
+
+    \b
+    Examples:
+        cera models                    # Interactive: select provider first
+        cera models --all              # Show all models (skip provider selection)
+        cera models claude             # Search for Claude models
+        cera models --provider openai  # List OpenAI models only
+        cera models --free             # List only free models
+        cera models --vision           # List models with image support
+        cera models --detailed         # Show detailed info
+        cera models --json             # Output as JSON for config files
+
+    \b
+    Legend:
+        [F] = Free        [O] = Open Source/Weights
+        [V] = Vision      [T] = Tool/Function calling
+    """
+    from rich.prompt import Prompt
+
+    console.print(Panel.fit(
+        "[bold blue]CERA[/bold blue] - Available OpenRouter Models",
+        subtitle="Use model IDs in your config files",
+    ))
+
+    # Check for API key (uses .env first, then Convex fallback)
+    from cera.config_loader import get_openrouter_api_key
+    api_key = get_openrouter_api_key()
+    if not api_key:
+        console.print("\n[yellow]Warning:[/yellow] OpenRouter API key not found")
+        console.print("[dim]Set OPENROUTER_API_KEY in .env or configure in web settings[/dim]\n")
+
+    # Fetch models from OpenRouter
+    console.print("[dim]Fetching models from OpenRouter...[/dim]")
+    try:
+        all_models = _fetch_openrouter_models()
+    except Exception as e:
+        console.print(f"[red]Error fetching models:[/red] {e}")
+        raise typer.Exit(1)
+
+    # Apply global filters first (these narrow down the set before provider selection)
+    filtered_models = all_models
+    if free_only:
+        filtered_models = [m for m in filtered_models if m["is_free"]]
+    if vision_only:
+        filtered_models = [m for m in filtered_models if m["has_vision"]]
+    if search:
+        filtered_models = [m for m in filtered_models if search.lower() in m["id"].lower() or search.lower() in m["name"].lower()]
+
+    # Track if a specific provider was selected (affects limit behavior)
+    provider_selected = False
+
+    # If provider specified via CLI, skip interactive selection
+    if provider:
+        filtered_models = [m for m in filtered_models if m["id"].startswith(f"{provider}/")]
+        provider_selected = True
+    # If search was specified, also skip interactive (show results directly)
+    elif search or all_providers:
+        pass  # Show all filtered results
+    else:
+        # Interactive provider selection
+        # Group by provider and count
+        provider_stats: dict[str, dict] = {}
+        for model in filtered_models:
+            p = model["provider"]
+            if p not in provider_stats:
+                provider_stats[p] = {"count": 0, "free": 0, "vision": 0, "oss": 0}
+            provider_stats[p]["count"] += 1
+            if model["is_free"]:
+                provider_stats[p]["free"] += 1
+            if model["has_vision"]:
+                provider_stats[p]["vision"] += 1
+            if model["is_oss"]:
+                provider_stats[p]["oss"] += 1
+
+        # Sort providers by model count (descending)
+        sorted_providers = sorted(provider_stats.items(), key=lambda x: -x[1]["count"])
+
+        # Display provider table
+        console.print(f"\n[green]Found {len(filtered_models)} models from {len(provider_stats)} providers[/green]\n")
+
+        provider_table = Table(show_header=True, header_style="bold", title="Select a Provider")
+        provider_table.add_column("#", style="dim", width=4)
+        provider_table.add_column("Provider", style="cyan")
+        provider_table.add_column("Models", justify="right")
+        provider_table.add_column("Free", justify="right", style="green")
+        provider_table.add_column("Vision", justify="right", style="magenta")
+        provider_table.add_column("OSS", justify="right", style="blue")
+
+        provider_list = []
+        for idx, (prov, stats) in enumerate(sorted_providers, 1):
+            provider_list.append(prov)
+            provider_table.add_row(
+                str(idx),
+                prov,
+                str(stats["count"]),
+                str(stats["free"]) if stats["free"] > 0 else "[dim]-[/dim]",
+                str(stats["vision"]) if stats["vision"] > 0 else "[dim]-[/dim]",
+                str(stats["oss"]) if stats["oss"] > 0 else "[dim]-[/dim]",
+            )
+
+        console.print(provider_table)
+        console.print("\n[dim]Enter a number to select a provider, or 'all' to show all models[/dim]")
+        console.print("[dim]You can also type the provider name directly (e.g., 'anthropic')[/dim]\n")
+
+        # Get user selection
+        selection = Prompt.ask("Select provider", default="1")
+
+        provider_selected = False
+        if selection.lower() == "all":
+            pass  # Show all models
+        elif selection.isdigit():
+            idx = int(selection) - 1
+            if 0 <= idx < len(provider_list):
+                provider = provider_list[idx]
+                filtered_models = [m for m in filtered_models if m["provider"] == provider]
+                provider_selected = True
+                console.print(f"\n[bold]Showing models from: {provider}[/bold]\n")
+            else:
+                console.print(f"[red]Invalid selection. Showing all models.[/red]")
+        else:
+            # Try to match by name
+            matched = [p for p in provider_list if selection.lower() in p.lower()]
+            if len(matched) == 1:
+                provider = matched[0]
+                filtered_models = [m for m in filtered_models if m["provider"] == provider]
+                provider_selected = True
+                console.print(f"\n[bold]Showing models from: {provider}[/bold]\n")
+            elif len(matched) > 1:
+                console.print(f"[yellow]Multiple matches: {', '.join(matched)}. Showing all.[/yellow]")
+            else:
+                console.print(f"[yellow]No provider matching '{selection}'. Showing all.[/yellow]")
+
+    # Sort by provider, then by name
+    filtered_models.sort(key=lambda x: (x["provider"], x["name"]))
+
+    # Limit results (no limit when a specific provider is selected)
+    total_count = len(filtered_models)
+    if provider_selected:
+        display_models = filtered_models  # Show all models for selected provider
+    else:
+        display_models = filtered_models[:limit]
+
+    # JSON output
+    if json_output:
+        import json as json_module
+        output_data = {
+            "models": filtered_models,
+            "total_count": total_count,
+            "shown": len(display_models),
+        }
+        console.print(json_module.dumps(output_data, indent=2))
+        return
+
+    # Display results
+    console.print(f"\n[green]Found {total_count} models[/green]", end="")
+    if not provider_selected and total_count > limit:
+        console.print(f" (showing first {limit}, use --provider or select a provider to see all)")
+    else:
+        console.print()
+
+    _display_models_table(display_models, detailed)
+
+    # Usage hints
+    console.print("\n[bold]Usage in config.json:[/bold]")
+    console.print("[dim]For MAV models (subject_profile.mav.models):[/dim]")
+    console.print('  "mav": { "models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o", "google/gemini-2.5-flash"] }')
+    console.print("\n[dim]For generation model (generation.model):[/dim]")
+    console.print('  "generation": { "model": "anthropic/claude-sonnet-4" }')
 
 
 @app.command()

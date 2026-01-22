@@ -7,15 +7,15 @@ from typing import Optional
 class MAVConfig(BaseModel):
     """Multi-Agent Verification configuration for SIL."""
 
-    enabled: bool = Field(default=True, description="Enable MAV verification")
+    enabled: bool = Field(default=True, description="Enable MAV verification (requires 3 models)")
     models: list[str] = Field(
-        ...,
-        min_length=3,
+        default_factory=list,
+        min_length=1,
         max_length=3,
-        description="Exactly 3 models for MAV cross-validation (2/3 majority voting). User must select all 3.",
+        description="Models for research. 1 model = no verification, 3 models = MAV (2/3 majority voting)",
     )
     similarity_threshold: float = Field(
-        default=0.85, ge=0, le=1, description="Semantic similarity threshold (τ)"
+        default=0.85, ge=0, le=1, description="Semantic similarity threshold (τ) for MAV"
     )
 
 
@@ -57,6 +57,10 @@ class ReviewerProfile(BaseModel):
     audience_context: list[str] = Field(
         default_factory=lambda: ["general user"],
         description="Audience contexts for reviewer personas",
+    )
+    additional_context: Optional[str] = Field(
+        default=None,
+        description="Additional context about typical reviewers (e.g., demographics, expectations, behaviors). Passed verbatim to generation prompt.",
     )
     seed_datasets: Optional[list[str]] = Field(
         default=None, description="Paths to seed datasets for style matching"
