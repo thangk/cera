@@ -1,0 +1,106 @@
+name: cera
+
+services:
+  # Self-hosted Convex Backend
+  convex:
+    image: ghcr.io/get-convex/convex-backend:latest
+    container_name: convex
+    ports:
+      - "3210:3210"  # Backend API
+      - "3211:3211"  # HTTP Actions
+    volumes:
+      - convex_data:/convex/data
+    environment:
+      # Required for actions to communicate back to the backend
+      # Use 127.0.0.1 instead of localhost (within container)
+      - CONVEX_CLOUD_ORIGIN=http://127.0.0.1:3210
+      - CONVEX_SITE_ORIGIN=http://127.0.0.1:3211
+      - CONVEX_SITE_URL=http://localhost:3000
+      # For Convex actions to reach the Python CLI API
+      - PYTHON_API_URL=http://cli:8000
+      # For Python API to update Convex (passed from action to Python)
+      - CONVEX_URL=http://convex:3210
+      - CONVEX_DEPLOY_KEY=${CONVEX_ADMIN_KEY:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3210/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Convex Dashboard (optional, for debugging)
+  convex-dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    container_name: convex-dashboard
+    ports:
+      - "6791:6791"
+    environment:
+      - CONVEX_BACKEND_URL=http://convex:3210
+      - CONVEX_ADMIN_KEY=${CONVEX_ADMIN_KEY:-}
+    depends_on:
+      convex:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # CERA Python CLI/API
+  cli:
+    build:
+      context: ./cli
+      dockerfile: Dockerfile
+    container_name: cli
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - CONVEX_URL=http://convex:3210
+    volumes:
+      - ./output:/app/output
+      - ./configs:/app/configs
+    depends_on:
+      convex:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # CERA Web GUI
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        - VITE_CONVEX_URL=http://localhost:3210
+        - VITE_PYTHON_API_URL=http://localhost:8000
+        - VITE_OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+        - VITE_TAVILY_API_KEY=${TAVILY_API_KEY:-}
+        - VITE_CONVEX_ADMIN_KEY=${CONVEX_ADMIN_KEY:-}
+    container_name: web
+    ports:
+      - "3001:3000"  # Use 3001 to avoid conflict with local dev server
+    depends_on:
+      convex:
+        condition: service_healthy
+      cli:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  convex_data:
+
+# ===========================================
+# CERA Full Stack with Self-Hosted Convex
+# ===========================================
+#
+# See README.md for first-time setup instructions.
+#
+# ACCESS POINTS:
+# --------------
+#    - Web GUI:          http://localhost:3001
+#    - Python API:       http://localhost:8000
+#    - Convex Backend:   http://localhost:3210
+#    - Convex Dashboard: http://localhost:6791
+#
+# CLI COMMANDS:
+# -------------
+#    docker exec -it cli python -m cera --help
+#    docker exec -it cli python -m cera models
+#    docker exec -it cli python -m cera run /app/configs/example.json
