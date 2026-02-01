@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Reviews>
+	<Review rid="0">
+		<sentences>
+			<sentence id="0:0">
+				<text>The pasta carbonara at Bella Vita was absolutely divine, creamy and perfectly seasoned.</text>
+				<Opinions>
+					<Opinion target="pasta carbonara" category="FOOD#QUALITY" polarity="positive" from="4" to="19" />
+				</Opinions>
+			</sentence>
+			<sentence id="0:1">
+				<text>Our waiter was attentive and friendly, making the dining experience really enjoyable.</text>
+				<Opinions>
+					<Opinion target="waiter" category="SERVICE#GENERAL" polarity="positive" from="4" to="10" />
+				</Opinions>
+			</sentence>
+		</sentences>
+	</Review>
+	<Review rid="1">
+		<sentences>
+			<sentence id="1:0">
+				<text>The ambiance was cozy with soft lighting and comfortable seating.</text>
+				<Opinions>
+					<Opinion target="ambiance" category="AMBIENCE#GENERAL" polarity="positive" from="4" to="12" />
+				</Opinions>
+			</sentence>
+			<sentence id="1:1">
+				<text>However, the grilled salmon tasted bland and lacked seasoning.</text>
+				<Opinions>
+					<Opinion target="grilled salmon" category="FOOD#QUALITY" polarity="negative" from="13" to="27" />
+				</Opinions>
+			</sentence>
+			<sentence id="1:2">
+				<text>Prices were reasonable for the portion sizes we received.</text>
+				<Opinions>
+					<Opinion target="Prices" category="RESTAURANT#PRICES" polarity="positive" from="0" to="6" />
+				</Opinions>
+			</sentence>
+		</sentences>
+	</Review>
+	<Review rid="2">
+		<sentences>
+			<sentence id="2:0">
+				<text>The service was incredibly slow and our server seemed completely disinterested.</text>
+				<Opinions>
+					<Opinion target="service" category="SERVICE#GENERAL" polarity="negative" from="4" to="11" />
+				</Opinions>
+			</sentence>
+			<sentence id="2:1">
+				<text>Even the house wine tasted like it had been open for days.</text>
+				<Opinions>
+					<Opinion target="house wine" category="DRINKS#QUALITY" polarity="negative" from="9" to="19" />
+				</Opinions>
+			</sentence>
+		</sentences>
+	</Review>
+</Reviews>
