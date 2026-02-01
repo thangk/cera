@@ -1,0 +1,54 @@
+{
+  "restaurant": {
+    "label": "Restaurant",
+    "categories": [
+      "FOOD#QUALITY",
+      "FOOD#PRICES",
+      "FOOD#STYLE_OPTIONS",
+      "SERVICE#GENERAL",
+      "AMBIENCE#GENERAL",
+      "RESTAURANT#GENERAL",
+      "RESTAURANT#PRICES",
+      "DRINKS#QUALITY",
+      "DRINKS#PRICES",
+      "LOCATION#GENERAL"
+    ]
+  },
+  "laptop": {
+    "label": "Laptop",
+    "categories": [
+      "LAPTOP#GENERAL",
+      "LAPTOP#DESIGN_FEATURES",
+      "LAPTOP#QUALITY",
+      "LAPTOP#OPERATION_PERFORMANCE",
+      "LAPTOP#USABILITY",
+      "LAPTOP#PORTABILITY",
+      "LAPTOP#CONNECTIVITY",
+      "LAPTOP#PRICE",
+      "SOFTWARE#GENERAL",
+      "SUPPORT#QUALITY"
+    ]
+  },
+  "hotel": {
+    "label": "Hotel",
+    "categories": [
+      "HOTEL#GENERAL",
+      "ROOMS#QUALITY",
+      "ROOMS#CLEANLINESS",
+      "SERVICE#GENERAL",
+      "LOCATION#GENERAL",
+      "FACILITIES#GENERAL",
+      "FOOD#QUALITY",
+      "VALUE#PRICES"
+    ]
+  },
+  "general": {
+    "label": "General",
+    "categories": [
+      "PRODUCT#QUALITY",
+      "PRODUCT#PRICES",
+      "SERVICE#GENERAL",
+      "EXPERIENCE#GENERAL"
+    ]
+  }
+}
