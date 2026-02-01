@@ -1,20 +1,21 @@
-"""Subject Intelligence Layer (SIL) - Factual grounding through independent web research.
+"""Subject Intelligence Layer (SIL) - Factual grounding through query-based MAV.
 
-This module implements the redesigned MAV (Multi-Agent Verification) architecture where
-each model independently:
-1. Understands what type of subject is being researched
-2. Generates its own search queries based on that understanding
-3. Searches the web using its provider's infrastructure (or Tavily fallback)
-4. Extracts facts in a consistent schema
-
-The 2/3 majority voting then compares extractions across models to find consensus.
+This module implements the query-based MAV (Multi-Agent Verification) architecture:
+1. Each model independently researches the subject and generates neutral factual queries
+2. All queries are pooled and deduplicated
+3. Each model independently answers ALL pooled queries
+4. Per-query 2/3 majority voting achieves consensus on short focused answers
+5. Verified answers are classified into categories (characteristics, positives, negatives, use_cases)
 """
 
 from dataclasses import dataclass, field
+from math import ceil
 from typing import Optional
 import asyncio
 import json
 import re
+
+from cera.prompts import load_and_format
 
 
 @dataclass
@@ -22,8 +23,11 @@ class MAVConfig:
     """Multi-Agent Verification configuration."""
 
     enabled: bool = True
-    models: list[str] = None  # 3 models for cross-validation
-    similarity_threshold: float = 0.85
+    models: list[str] = None  # N models for cross-validation (minimum 2)
+    similarity_threshold: float = 0.85  # Query deduplication threshold
+    answer_threshold: float = 0.80  # Per-query answer consensus threshold
+    max_queries: int = 30  # Soft cap on pooled queries after dedup
+    min_verification_rate: float = 0.30  # Minimum consensus rate before fallback
 
     def __post_init__(self):
         if self.models is None:
@@ -35,9 +39,9 @@ class SubjectContext:
     """Context document containing subject intelligence."""
 
     subject: str
-    features: list[str]  # Called "characteristics" in extraction, mapped to features
-    pros: list[str]  # Called "positives" in extraction
-    cons: list[str]  # Called "negatives" in extraction
+    features: list[str]  # Characteristics/specs/properties
+    pros: list[str]  # Advantages/praised aspects
+    cons: list[str]  # Disadvantages/complaints
     use_cases: list[str]
     availability: Optional[str] = None
     mav_verified: bool = False  # Whether MAV verification was applied
@@ -56,163 +60,195 @@ class SubjectUnderstanding:
 
 
 @dataclass
-class ExtractionResult:
-    """Result from a single model's extraction using consistent schema."""
+class FactualQuery:
+    """A single neutral factual query about the subject."""
+
+    id: str  # Unique ID (e.g., "q1", "q2", ...)
+    query: str  # The question text
+    source_model: str  # Which model generated this query
+    deduplicated_from: list[str] = field(default_factory=list)  # IDs of queries merged into this
+    overlap_count: int = 1  # How many models generated a similar query
+
+
+@dataclass
+class QueryAnswer:
+    """A single model's answer to a pooled query."""
+
+    query_id: str  # References FactualQuery.id
+    model: str  # Which model answered
+    response: str  # The answer text
+    confidence: str  # "high", "medium", "low"
+
+
+@dataclass
+class QueryConsensusResult:
+    """Consensus result for a single query."""
+
+    query_id: str
+    query: str
+    answers: list[QueryAnswer]  # All model answers
+    consensus_reached: bool  # Whether ceil(2/3*N) agreed
+    consensus_answer: Optional[str]  # The agreed-upon answer (most complete)
+    agreeing_models: list[str]  # Models that agreed
+    pairwise_similarities: dict[str, float]  # Model pair -> similarity score
+    agreement_count: int  # How many models agreed
+
+
+@dataclass
+class MAVQueryPoolReport:
+    """Report of the full query-based MAV process."""
+
+    total_queries_generated: int = 0  # Across all models before dedup
+    queries_after_dedup: int = 0  # After semantic deduplication
+    queries_with_consensus: int = 0  # How many reached agreement
+    queries_without_consensus: int = 0  # How many did not
+    per_query_results: list[QueryConsensusResult] = field(default_factory=list)
+    threshold_used: float = 0.80
+    used_fallback: bool = False
+
+
+@dataclass
+class MAVModelData:
+    """Raw data from a single model's MAV research."""
 
     model: str
-    characteristics: list[str]  # Key attributes (specs, ingredients, material, etc.)
-    positives: list[str]  # Things reviewers praise
-    negatives: list[str]  # Things reviewers complain about
-    use_cases: list[str]  # When/where/how it's typically used
-    availability: Optional[str] = None
-    sources: list[str] = field(default_factory=list)
-    raw_response: str = ""
+    sanitized_model: str  # For folder naming (e.g., "anthropic-claude-sonnet-4")
+    understanding: Optional[SubjectUnderstanding] = None
+    queries_generated: list[str] = field(default_factory=list)  # Queries this model generated
+    answers: list[QueryAnswer] = field(default_factory=list)  # This model's answers to pooled queries
+    search_content: str = ""  # Raw search results used
+    error: Optional[str] = None
+
+
+@dataclass
+class MAVResult:
+    """Complete MAV result including raw data from all models."""
+
+    context: SubjectContext
+    model_data: list[MAVModelData] = field(default_factory=list)
+    total_facts_extracted: int = 0
+    facts_verified: int = 0
+    facts_rejected: int = 0
+    query_pool_report: Optional[MAVQueryPoolReport] = None
 
 
 class SubjectIntelligenceLayer:
     """
-    Subject Intelligence Layer (SIL) with Independent MAV.
+    Subject Intelligence Layer (SIL) with Query-Based MAV.
 
-    Provides factual grounding to reduce hallucination by gathering
-    intelligence about the review subject through INDEPENDENT web research
-    per model, then applying Multi-Agent Verification (MAV).
+    Provides factual grounding through a 4-round protocol:
+    1. Each MAV model independently researches and generates neutral factual queries
+    2. All queries are pooled, deduplicated, and capped
+    3. Each model independently answers ALL pooled queries (with web search)
+    4. Per-query 2/3 majority voting achieves consensus
+    5. Verified answers are classified into categories
 
-    New Flow (Independent Research per Model):
-    1. Each MAV model independently understands the subject type
-    2. Each model generates its own search queries
-    3. Each model searches using its provider's infrastructure (:online) or Tavily
-    4. Each model extracts facts using a consistent schema
-    5. MAV applies 2/3 majority voting across extractions
-    6. Return verified SubjectContext with high-confidence facts
+    Prompts loaded from cli/cera/prompts/sil/:
+    - understand.md: Subject understanding (for initial research)
+    - search.md: Web search extraction (for research context)
+    - extract.md: Extraction from Tavily results (fallback)
+    - generate_queries.md: Neutral factual query generation
+    - answer_queries.md: Query answering with web search
+    - classify_facts.md: Post-consensus categorization
     """
-
-    # Prompt for understanding the subject (Step 1)
-    UNDERSTAND_SUBJECT_PROMPT = """You are researching "{subject}" to gather factual information for review generation.
-
-First, determine:
-1. What TYPE of thing is this? (electronics, clothing, food, sports equipment, vehicle, service, etc.)
-2. What aspects are RELEVANT to research for this type of subject?
-3. What would reviewers typically praise or complain about?
-
-Then generate 3-5 search queries to find factual information about this subject.
-Focus on aspects that are relevant to the type of subject identified.
-
-Return ONLY valid JSON with no other text:
-{{
-  "subject_type": "the type category",
-  "relevant_aspects": ["aspect1", "aspect2", ...],
-  "search_queries": ["query1", "query2", ...]
-}}"""
-
-    # Prompt for extracting facts with web search capability (Step 2-3)
-    SEARCH_AND_EXTRACT_PROMPT = """You have web search capabilities. Research "{subject}" using the web.
-
-Search for information about: {queries}
-
-After researching, extract facts in this EXACT JSON format:
-{{
-  "characteristics": ["key attribute 1", "key attribute 2", ...],
-  "positives": ["thing reviewers praise 1", "thing reviewers praise 2", ...],
-  "negatives": ["thing reviewers complain about 1", "thing reviewers complain about 2", ...],
-  "use_cases": ["typical use case 1", "typical use case 2", ...],
-  "availability": "price/availability info or null"
-}}
-
-IMPORTANT:
-- characteristics: Key attributes relevant to the subject type (specs for electronics, ingredients for food, material for clothing, etc.)
-- positives: Things people praise in reviews (5-10 items)
-- negatives: Things people complain about in reviews (3-5 items)
-- use_cases: Typical scenarios where this is used (3-5 items)
-- Only include information you found through web search
-- Be specific and factual
-- Return ONLY valid JSON, no other text"""
-
-    # Prompt for extracting facts from provided search results (fallback)
-    EXTRACT_FROM_RESULTS_PROMPT = """Extract factual information from these search results about "{subject}".
-
-SEARCH RESULTS:
-{search_content}
-
-Extract facts in this EXACT JSON format:
-{{
-  "characteristics": ["key attribute 1", "key attribute 2", ...],
-  "positives": ["thing reviewers praise 1", "thing reviewers praise 2", ...],
-  "negatives": ["thing reviewers complain about 1", "thing reviewers complain about 2", ...],
-  "use_cases": ["typical use case 1", "typical use case 2", ...],
-  "availability": "price/availability info or null"
-}}
-
-IMPORTANT:
-- characteristics: Key attributes relevant to the subject type (specs for electronics, ingredients for food, material for clothing, etc.)
-- positives: Things people praise in reviews (5-10 items)
-- negatives: Things people complain about in reviews (3-5 items)
-- use_cases: Typical scenarios where this is used (3-5 items)
-- Only include information supported by the search results
-- Be specific and factual
-- Return ONLY valid JSON, no other text"""
 
     def __init__(
         self,
         api_key: str,
         mav_config: Optional[MAVConfig] = None,
         tavily_api_key: Optional[str] = None,
+        usage_tracker=None,
+        log_callback=None,
     ):
-        """
-        Initialize SIL.
-
-        Args:
-            api_key: OpenRouter API key
-            mav_config: Optional MAV configuration with 3 models for verification
-            tavily_api_key: Optional Tavily API key for web search fallback
-        """
         self.api_key = api_key
         self.mav_config = mav_config or MAVConfig(enabled=False)
         self.tavily_api_key = tavily_api_key
+        self.usage_tracker = usage_tracker
+        self._similarity_model = None  # Lazy-loaded SentenceTransformer
+        self._log = log_callback  # Optional callback: (level, phase, message) -> None
+
+    def _emit_log(self, level: str, phase: str, message: str):
+        """Emit a log message via the callback if configured."""
+        if self._log:
+            try:
+                self._log(level, phase, message)
+            except Exception:
+                pass  # Silently ignore logging errors
+
+    def _sanitize_model_name(self, model: str) -> str:
+        """Sanitize model name for use as folder name."""
+        sanitized = model.lower()
+        sanitized = re.sub(r'[^a-z0-9]+', '-', sanitized)
+        sanitized = re.sub(r'^-|-$', '', sanitized)
+        return sanitized
 
     def _supports_online(self, model: str) -> bool:
         """Check if a model supports web search via :online suffix or native search."""
         from cera.llm.openrouter import supports_online_search
-
         return supports_online_search(model)
 
     def _get_search_model(self, model: str) -> Optional[str]:
         """Get the model ID configured for web search."""
         from cera.llm.openrouter import get_search_model_id
-
         return get_search_model_id(model)
 
-    async def _understand_subject(
+    def _get_similarity_model(self):
+        """Lazy-load the SentenceTransformer model (shared across all comparisons)."""
+        if self._similarity_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except ImportError:
+                self._similarity_model = None
+        return self._similarity_model
+
+    def _compute_similarity(self, text1: str, text2: str) -> float:
+        """Compute semantic similarity between two texts."""
+        model = self._get_similarity_model()
+        if model is not None:
+            from sentence_transformers import util
+            embeddings = model.encode([text1, text2], show_progress_bar=False)
+            similarity = util.cos_sim(embeddings[0], embeddings[1])
+            return float(similarity[0][0])
+        else:
+            # Fallback: Jaccard similarity
+            words1 = set(text1.lower().split())
+            words2 = set(text2.lower().split())
+            intersection = words1 & words2
+            union = words1 | words2
+            return len(intersection) / len(union) if union else 0.0
+
+    # ─── Round 1: Research + Query Generation ───────────────────────────
+
+    async def _research_subject(
         self,
         model: str,
         subject: str,
-    ) -> SubjectUnderstanding:
+        additional_context: Optional[str] = None,
+    ) -> tuple[SubjectUnderstanding, str]:
         """
-        Let a model independently understand the subject type.
-
-        Each model determines:
-        - What type of thing is this?
-        - What aspects are relevant to research?
-        - What search queries should be used?
+        Research the subject using web search and return understanding + search content.
 
         Args:
             model: Model ID to use
             subject: Subject being researched
+            additional_context: Optional extra context about the subject
 
         Returns:
-            SubjectUnderstanding with queries to use
+            Tuple of (SubjectUnderstanding, raw_search_content)
         """
         from cera.llm.openrouter import OpenRouterClient
 
-        prompt = self.UNDERSTAND_SUBJECT_PROMPT.format(subject=subject)
+        # Step 1: Understand the subject type
+        prompt = load_and_format("sil", "understand", subject=subject)
 
-        async with OpenRouterClient(self.api_key) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=model,
-                temperature=0.3,  # Slightly creative for query generation
+                temperature=0.3,
             )
 
-        # Parse JSON from response
         try:
             json_match = re.search(r"\{[\s\S]*\}", response)
             if json_match:
@@ -220,7 +256,7 @@ IMPORTANT:
             else:
                 data = json.loads(response)
 
-            return SubjectUnderstanding(
+            understanding = SubjectUnderstanding(
                 model=model,
                 subject_type=data.get("subject_type", "general"),
                 relevant_aspects=data.get("relevant_aspects", []),
@@ -228,8 +264,7 @@ IMPORTANT:
                 raw_response=response,
             )
         except json.JSONDecodeError:
-            # Fallback: generate basic queries
-            return SubjectUnderstanding(
+            understanding = SubjectUnderstanding(
                 model=model,
                 subject_type="general",
                 relevant_aspects=[],
@@ -241,26 +276,432 @@ IMPORTANT:
                 raw_response=response,
             )
 
+        # Step 2: Perform web search to gather research context
+        search_model = self._get_search_model(model)
+        raw_search_content = ""
+
+        if search_model:
+            queries_str = ", ".join(understanding.search_queries)
+            search_prompt = load_and_format("sil", "search", subject=subject, queries=queries_str)
+
+            async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+                search_response = await client.chat(
+                    messages=[{"role": "user", "content": search_prompt}],
+                    model=search_model,
+                    temperature=0.0,
+                )
+            raw_search_content = f"[Model used native web search]\n\nQueries: {queries_str}\n\nResponse:\n{search_response}"
+        else:
+            search_content, sources = await self._search_with_tavily(
+                understanding.search_queries
+            )
+            raw_search_content = search_content
+
+        return understanding, raw_search_content
+
+    async def _generate_factual_queries(
+        self,
+        model: str,
+        subject: str,
+        search_content: str,
+        additional_context: Optional[str] = None,
+    ) -> list[str]:
+        """
+        Generate neutral factual queries based on research.
+
+        Args:
+            model: Model ID to use
+            subject: Subject being researched
+            search_content: Research context from web search
+            additional_context: Optional extra context about the subject
+
+        Returns:
+            List of query strings
+        """
+        from cera.llm.openrouter import OpenRouterClient
+
+        additional_context_block = ""
+        if additional_context:
+            additional_context_block = f"\n\nAdditional context provided by the user:\n{additional_context}\n"
+
+        research_context_block = ""
+        if search_content:
+            research_context_block = f"\n\nResearch context from web search:\n{search_content[:10000]}\n"
+
+        prompt = load_and_format(
+            "sil", "generate_queries",
+            subject=subject,
+            additional_context_block=additional_context_block,
+            research_context_block=research_context_block,
+        )
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                temperature=0.3,
+            )
+
+        # Parse JSON response
+        try:
+            json_match = re.search(r"\{[\s\S]*\}", response)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                data = json.loads(response)
+
+            queries = data.get("queries", [])
+            # Ensure all queries are strings
+            return [str(q) for q in queries if q]
+        except json.JSONDecodeError:
+            # Try to extract queries from plain text (one per line)
+            lines = [line.strip().strip("-•*").strip() for line in response.split("\n")]
+            return [line for line in lines if line and "?" in line]
+
+    # ─── Round 2: Query Pooling + Deduplication ─────────────────────────
+
+    def _deduplicate_queries(
+        self,
+        all_queries: list[tuple[str, str]],  # (query_text, source_model)
+        threshold: float,
+        max_queries: int,
+    ) -> list[FactualQuery]:
+        """
+        Deduplicate and cap queries from all models.
+
+        Args:
+            all_queries: List of (query_text, source_model) tuples
+            threshold: Semantic similarity threshold for deduplication
+            max_queries: Maximum number of queries to keep
+
+        Returns:
+            List of deduplicated FactualQuery objects with unique IDs
+        """
+        if not all_queries:
+            return []
+
+        pooled: list[FactualQuery] = []
+        query_id_counter = 1
+        total_queries = len(all_queries)
+        log_interval = max(1, total_queries // 10)  # Log every ~10%
+
+        for idx, (query_text, source_model) in enumerate(all_queries):
+            # Log progress periodically during embedding computation
+            if idx % log_interval == 0 or idx == total_queries - 1:
+                self._emit_log("INFO", "SIL", f"Deduplicating queries... ({idx + 1}/{total_queries})")
+            # Check if this query is similar to any already-pooled query
+            is_duplicate = False
+            for existing in pooled:
+                similarity = self._compute_similarity(query_text, existing.query)
+                if similarity >= threshold:
+                    # Merge: increment overlap count
+                    existing.overlap_count += 1
+                    existing.deduplicated_from.append(f"q{query_id_counter}")
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                pooled.append(FactualQuery(
+                    id=f"q{query_id_counter}",
+                    query=query_text,
+                    source_model=source_model,
+                    overlap_count=1,
+                ))
+
+            query_id_counter += 1
+
+        # Apply soft cap: prioritize queries with higher overlap_count
+        if len(pooled) > max_queries:
+            # Sort by overlap count (descending) then by original order
+            pooled.sort(key=lambda q: q.overlap_count, reverse=True)
+            pooled = pooled[:max_queries]
+            # Re-assign IDs after sorting
+            for i, q in enumerate(pooled):
+                q.id = f"q{i + 1}"
+
+        return pooled
+
+    # ─── Round 3: Query Answering ───────────────────────────────────────
+
+    async def _answer_queries(
+        self,
+        model: str,
+        subject: str,
+        queries: list[FactualQuery],
+        research_context: str,
+        additional_context: Optional[str] = None,
+    ) -> list[QueryAnswer]:
+        """
+        Have a model answer all pooled queries independently.
+
+        Uses web search if available, otherwise uses research context.
+
+        Args:
+            model: Model ID to use
+            subject: Subject being researched
+            queries: List of pooled queries to answer
+            research_context: Research context from Round 1
+            additional_context: Optional extra context about the subject
+
+        Returns:
+            List of QueryAnswer objects
+        """
+        from cera.llm.openrouter import OpenRouterClient
+
+        additional_context_block = ""
+        if additional_context:
+            additional_context_block = f"\nAdditional context provided by the user:\n{additional_context}\n"
+
+        research_context_block = ""
+        if research_context:
+            research_context_block = f"\nResearch context from web search:\n{research_context[:10000]}\n"
+
+        # Format queries as JSON for the prompt
+        queries_json = json.dumps(
+            [{"query_id": q.id, "query": q.query} for q in queries],
+            indent=2,
+        )
+
+        prompt = load_and_format(
+            "sil", "answer_queries",
+            subject=subject,
+            additional_context_block=additional_context_block,
+            research_context_block=research_context_block,
+            queries_json=queries_json,
+        )
+
+        # Use search-capable model if available
+        search_model = self._get_search_model(model)
+        use_model = search_model if search_model else model
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=use_model,
+                temperature=0.0,
+            )
+
+        # Parse JSON response
+        answers = []
+        try:
+            json_match = re.search(r"\{[\s\S]*\}", response)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                data = json.loads(response)
+
+            raw_answers = data.get("answers", [])
+            for ans in raw_answers:
+                answers.append(QueryAnswer(
+                    query_id=ans.get("query_id", ""),
+                    model=model,
+                    response=ans.get("response", "unknown"),
+                    confidence=ans.get("confidence", "low"),
+                ))
+        except json.JSONDecodeError:
+            # If parsing fails, create empty answers for all queries
+            for q in queries:
+                answers.append(QueryAnswer(
+                    query_id=q.id,
+                    model=model,
+                    response="unknown",
+                    confidence="low",
+                ))
+
+        return answers
+
+    # ─── Round 4: Per-Query Consensus ───────────────────────────────────
+
+    def _compute_query_consensus(
+        self,
+        query: FactualQuery,
+        answers: list[QueryAnswer],
+        threshold: float,
+        n_models: int,
+    ) -> QueryConsensusResult:
+        """
+        Determine consensus for a single query across all model answers.
+
+        Args:
+            query: The query being evaluated
+            answers: All model answers for this query
+            threshold: Semantic similarity threshold for agreement
+            n_models: Total number of models (for min_agreement calculation)
+
+        Returns:
+            QueryConsensusResult with consensus details
+        """
+        # Filter out "unknown" answers
+        valid_answers = [a for a in answers if a.response.lower().strip() != "unknown"]
+        effective_n = len(valid_answers)
+
+        min_agreement = ceil(2 / 3 * effective_n) if effective_n >= 2 else effective_n
+
+        # Compute pairwise similarities
+        pairwise_similarities: dict[str, float] = {}
+        for i, a1 in enumerate(valid_answers):
+            for j, a2 in enumerate(valid_answers):
+                if i >= j:
+                    continue
+                sim = self._compute_similarity(a1.response, a2.response)
+                key = f"{self._sanitize_model_name(a1.model)}-{self._sanitize_model_name(a2.model)}"
+                pairwise_similarities[key] = round(sim, 4)
+
+        # Find the largest agreeing group
+        if effective_n < 2:
+            # Can't have consensus with fewer than 2 valid answers
+            return QueryConsensusResult(
+                query_id=query.id,
+                query=query.query,
+                answers=answers,
+                consensus_reached=False,
+                consensus_answer=None,
+                agreeing_models=[],
+                pairwise_similarities=pairwise_similarities,
+                agreement_count=effective_n,
+            )
+
+        # Build agreement groups: find pairs that agree, then find largest clique
+        agreeing_pairs: list[tuple[int, int]] = []
+        for i, a1 in enumerate(valid_answers):
+            for j, a2 in enumerate(valid_answers):
+                if i >= j:
+                    continue
+                sim = self._compute_similarity(a1.response, a2.response)
+                if sim >= threshold:
+                    agreeing_pairs.append((i, j))
+
+        # Find largest group where all members agree with each other
+        best_group: list[int] = []
+        for i in range(effective_n):
+            group = [i]
+            for j in range(effective_n):
+                if j == i:
+                    continue
+                # Check if j agrees with all current group members
+                agrees_with_all = True
+                for member in group:
+                    pair = tuple(sorted([j, member]))
+                    if pair not in [(a, b) for a, b in agreeing_pairs]:
+                        agrees_with_all = False
+                        break
+                if agrees_with_all:
+                    group.append(j)
+            if len(group) > len(best_group):
+                best_group = group
+
+        consensus_reached = len(best_group) >= min_agreement
+
+        # Select canonical answer: most complete (longest substantive) from agreeing group
+        consensus_answer = None
+        agreeing_models = []
+        if consensus_reached and best_group:
+            agreeing_answers = [valid_answers[i] for i in best_group]
+            agreeing_models = [a.model for a in agreeing_answers]
+            # Pick the longest response (most information units)
+            canonical = max(agreeing_answers, key=lambda a: len(a.response.strip()))
+            consensus_answer = canonical.response
+
+        return QueryConsensusResult(
+            query_id=query.id,
+            query=query.query,
+            answers=answers,
+            consensus_reached=consensus_reached,
+            consensus_answer=consensus_answer,
+            agreeing_models=agreeing_models,
+            pairwise_similarities=pairwise_similarities,
+            agreement_count=len(best_group),
+        )
+
+    # ─── Post-Consensus: Classification ─────────────────────────────────
+
+    async def _classify_verified_answers(
+        self,
+        verified_results: list[QueryConsensusResult],
+        subject: str,
+    ) -> dict[str, list[str]]:
+        """
+        Classify verified consensus answers into categories.
+
+        Args:
+            verified_results: List of consensus results that reached agreement
+            subject: The subject being researched
+
+        Returns:
+            Dict with keys: characteristics, positives, negatives, use_cases
+        """
+        from cera.llm.openrouter import OpenRouterClient
+
+        if not verified_results:
+            return {
+                "characteristics": [],
+                "positives": [],
+                "negatives": [],
+                "use_cases": [],
+            }
+
+        # Build facts list from verified answers
+        facts_list = []
+        for result in verified_results:
+            if result.consensus_answer:
+                facts_list.append({
+                    "query": result.query,
+                    "answer": result.consensus_answer,
+                })
+
+        facts_json = json.dumps(facts_list, indent=2)
+
+        prompt = load_and_format(
+            "sil", "classify_facts",
+            subject=subject,
+            facts_json=facts_json,
+        )
+
+        # Use first available model for classification
+        classify_model = self.mav_config.models[0] if self.mav_config.models else "anthropic/claude-sonnet-4"
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=classify_model,
+                temperature=0.0,
+            )
+
+        try:
+            json_match = re.search(r"\{[\s\S]*\}", response)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                data = json.loads(response)
+
+            return {
+                "characteristics": data.get("characteristics", []),
+                "positives": data.get("positives", []),
+                "negatives": data.get("negatives", []),
+                "use_cases": data.get("use_cases", []),
+            }
+        except json.JSONDecodeError:
+            # Fallback: put all facts in characteristics
+            return {
+                "characteristics": [r.consensus_answer for r in verified_results if r.consensus_answer],
+                "positives": [],
+                "negatives": [],
+                "use_cases": [],
+            }
+
+    # ─── Utility Methods ────────────────────────────────────────────────
+
     async def _search_with_tavily(
         self,
         queries: list[str],
     ) -> tuple[str, list[str]]:
-        """
-        Search the web using Tavily with model-generated queries.
-
-        Args:
-            queries: List of search queries
-
-        Returns:
-            Tuple of (combined_content, source_urls)
-        """
+        """Search the web using Tavily with model-generated queries."""
         from cera.llm.web_search import WebSearchClient
 
         async with WebSearchClient(
             openrouter_api_key=self.api_key,
             tavily_api_key=self.tavily_api_key,
         ) as search_client:
-            # Run all queries and combine results
             all_content = []
             all_sources = []
 
@@ -277,362 +718,354 @@ IMPORTANT:
 
             return "\n\n".join(all_content), all_sources
 
-    async def _search_and_extract(
-        self,
-        model: str,
-        subject: str,
-        understanding: SubjectUnderstanding,
-    ) -> ExtractionResult:
-        """
-        Search and extract facts using a model's understanding.
+    def _deduplicate_items(self, items: list[str], threshold: float = 0.80) -> list[str]:
+        """Deduplicate similar items using semantic similarity."""
+        if len(items) <= 1:
+            return items
 
-        Uses hybrid approach:
-        - If model supports :online → use model's native search
-        - Otherwise → use Tavily with model-generated queries
+        unique_items = []
+        for item in items:
+            is_duplicate = False
+            for existing in unique_items:
+                if self._compute_similarity(item, existing) >= threshold:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_items.append(item)
 
-        Args:
-            model: Model ID to use
-            subject: Subject being researched
-            understanding: Model's understanding with queries
+        return unique_items
 
-        Returns:
-            ExtractionResult with facts
-        """
-        from cera.llm.openrouter import OpenRouterClient
-
-        search_model = self._get_search_model(model)
-        queries_str = ", ".join(understanding.search_queries)
-        sources = []
-
-        if search_model:
-            # Model supports web search - let it search directly
-            prompt = self.SEARCH_AND_EXTRACT_PROMPT.format(
-                subject=subject,
-                queries=queries_str,
-            )
-
-            async with OpenRouterClient(self.api_key) as client:
-                response = await client.chat(
-                    messages=[{"role": "user", "content": prompt}],
-                    model=search_model,
-                    temperature=0.0,  # Deterministic for fact extraction
-                )
-        else:
-            # Model doesn't support web search - use Tavily fallback
-            search_content, sources = await self._search_with_tavily(
-                understanding.search_queries
-            )
-
-            prompt = self.EXTRACT_FROM_RESULTS_PROMPT.format(
-                subject=subject,
-                search_content=search_content[:15000],  # Truncate if too long
-            )
-
-            async with OpenRouterClient(self.api_key) as client:
-                response = await client.chat(
-                    messages=[{"role": "user", "content": prompt}],
-                    model=model,
-                    temperature=0.0,
-                )
-
-        # Parse JSON from response
-        try:
-            json_match = re.search(r"\{[\s\S]*\}", response)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = json.loads(response)
-
-            return ExtractionResult(
-                model=model,
-                characteristics=data.get("characteristics", []),
-                positives=data.get("positives", []),
-                negatives=data.get("negatives", []),
-                use_cases=data.get("use_cases", []),
-                availability=data.get("availability"),
-                sources=sources,
-                raw_response=response,
-            )
-        except json.JSONDecodeError:
-            return ExtractionResult(
-                model=model,
-                characteristics=[],
-                positives=[],
-                negatives=[],
-                use_cases=[],
-                sources=sources,
-                raw_response=response,
-            )
-
-    async def _gather_with_model(
-        self,
-        model: str,
-        subject: str,
-    ) -> ExtractionResult:
-        """
-        Complete pipeline for a single model's independent research.
-
-        1. Understand the subject
-        2. Search and extract facts
-
-        Args:
-            model: Model ID to use
-            subject: Subject being researched
-
-        Returns:
-            ExtractionResult from this model's independent research
-        """
-        # Step 1: Understand the subject
-        understanding = await self._understand_subject(model, subject)
-
-        # Step 2: Search and extract
-        extraction = await self._search_and_extract(model, subject, understanding)
-
-        return extraction
-
-    def _compute_similarity(self, text1: str, text2: str) -> float:
-        """Compute semantic similarity between two texts."""
-        try:
-            from sentence_transformers import SentenceTransformer, util
-
-            model = SentenceTransformer("all-MiniLM-L6-v2")
-            embeddings = model.encode([text1, text2])
-            similarity = util.cos_sim(embeddings[0], embeddings[1])
-            return float(similarity[0][0])
-        except ImportError:
-            # Fallback: Jaccard similarity
-            words1 = set(text1.lower().split())
-            words2 = set(text2.lower().split())
-            intersection = words1 & words2
-            union = words1 | words2
-            return len(intersection) / len(union) if union else 0.0
-
-    def _find_consensus(
-        self,
-        items_per_model: list[list[str]],
-        threshold: float,
-    ) -> list[str]:
-        """
-        Find items that appear in at least 2/3 of models (majority voting).
-
-        Args:
-            items_per_model: List of item lists from each model
-            threshold: Similarity threshold for matching items
-
-        Returns:
-            List of consensus items
-        """
-        if len(items_per_model) < 2:
-            return items_per_model[0] if items_per_model else []
-
-        # Flatten all items with their source model index
-        all_items = []
-        for model_idx, items in enumerate(items_per_model):
-            for item in items:
-                all_items.append((item, model_idx))
-
-        # Group similar items
-        groups = []
-        used = set()
-
-        for i, (item1, model1) in enumerate(all_items):
-            if i in used:
-                continue
-
-            group = [(item1, model1)]
-            used.add(i)
-
-            for j, (item2, model2) in enumerate(all_items):
-                if j in used or model1 == model2:
-                    continue
-
-                # Check similarity
-                similarity = self._compute_similarity(item1, item2)
-                if similarity >= threshold:
-                    group.append((item2, model2))
-                    used.add(j)
-
-            groups.append(group)
-
-        # Filter to items that appear in at least 2/3 of models
-        min_models = max(2, len(items_per_model) * 2 // 3)
-        consensus_items = []
-
-        for group in groups:
-            unique_models = len(set(model for _, model in group))
-            if unique_models >= min_models:
-                # Use the first item as the canonical form
-                consensus_items.append(group[0][0])
-
-        return consensus_items
-
-    def _apply_mav(
-        self,
-        extractions: list[ExtractionResult],
-        threshold: float,
-    ) -> SubjectContext:
-        """
-        Apply Multi-Agent Verification to extraction results.
-
-        Uses 2/3 majority voting across models to verify facts.
-
-        Args:
-            extractions: List of extraction results from each model
-            threshold: Similarity threshold for matching
-
-        Returns:
-            Verified SubjectContext
-        """
-        if not extractions:
-            return SubjectContext(
-                subject="",
-                features=[],
-                pros=[],
-                cons=[],
-                use_cases=[],
-                mav_verified=False,
-            )
-
-        # Gather items from each model (using consistent schema fields)
-        characteristics_per_model = [e.characteristics for e in extractions]
-        positives_per_model = [e.positives for e in extractions]
-        negatives_per_model = [e.negatives for e in extractions]
-        use_cases_per_model = [e.use_cases for e in extractions]
-
-        # Find consensus through majority voting
-        verified_characteristics = self._find_consensus(
-            characteristics_per_model, threshold
-        )
-        verified_positives = self._find_consensus(positives_per_model, threshold)
-        verified_negatives = self._find_consensus(negatives_per_model, threshold)
-        verified_use_cases = self._find_consensus(use_cases_per_model, threshold)
-
-        # For availability, use the most common non-null value
-        availabilities = [e.availability for e in extractions if e.availability]
-        availability = availabilities[0] if availabilities else None
-
-        # Collect all sources
-        all_sources = []
-        for e in extractions:
-            for source in e.sources:
-                if source not in all_sources:
-                    all_sources.append(source)
-
-        return SubjectContext(
-            subject="",  # Will be set by caller
-            features=verified_characteristics,  # Map characteristics → features
-            pros=verified_positives,  # Map positives → pros
-            cons=verified_negatives,  # Map negatives → cons
-            use_cases=verified_use_cases,
-            availability=availability,
-            mav_verified=True,
-            search_sources=all_sources,
-        )
+    # ─── Main Orchestrator ──────────────────────────────────────────────
 
     async def gather_intelligence(
         self,
         query: str,
         region: str = "united states",
-        category: str = "general",
-        feature_count: str = "5-10",
+        domain: str = "general",
         sentiment_depth: str = "praise and complain",
-        context_scope: str = "typical use cases",
-    ) -> SubjectContext:
+        additional_context: Optional[str] = None,
+    ) -> MAVResult:
         """
-        Gather intelligence about the subject using independent MAV research.
+        Gather intelligence using the 4-round query-based MAV protocol.
 
-        New Flow:
-        1. Each MAV model independently understands the subject type
-        2. Each model generates its own search queries
-        3. Each model searches using its provider's infrastructure or Tavily
-        4. Each model extracts facts in consistent schema
-        5. MAV applies 2/3 majority voting across extractions
-        6. Return verified SubjectContext
+        Round 1: Each model researches subject and generates neutral factual queries
+        Round 2: All queries pooled, deduplicated, and capped
+        Round 3: Each model answers ALL pooled queries (with web search)
+        Round 4: Per-query consensus (ceil(2/3*N) majority voting)
+        Post: Verified answers classified into categories
 
         Args:
-            query: The subject to research (e.g., "iPhone 15 Pro", "summer dress", "pad thai")
+            query: The subject to research
             region: Geographic region for context
-            category: Product/service category hint
-            feature_count: Range of features to extract (hint)
+            domain: Product/service domain hint
             sentiment_depth: Level of sentiment analysis (hint)
-            context_scope: Scope of contextual information (hint)
+            additional_context: Optional extra context about the subject
 
         Returns:
-            SubjectContext with gathered intelligence
+            MAVResult with verified context and full reporting data
         """
-        # Check if MAV is enabled and properly configured
-        if self.mav_config.enabled and len(self.mav_config.models) == 3:
-            # Run independent research for all 3 MAV models in parallel
-            research_tasks = [
-                self._gather_with_model(model, query)
-                for model in self.mav_config.models
-            ]
-            extractions = await asyncio.gather(*research_tasks, return_exceptions=True)
+        model_data_list: list[MAVModelData] = []
 
-            # Filter out errors
-            valid_extractions = [
-                e for e in extractions if isinstance(e, ExtractionResult)
-            ]
+        # Check if MAV is enabled with at least 2 models
+        if self.mav_config.enabled and len(self.mav_config.models) >= 2:
+            n_models = len(self.mav_config.models)
+            self._emit_log("INFO", "SIL", f"Starting MAV with {n_models} models...")
 
-            if len(valid_extractions) >= 2:
-                # Apply MAV verification (2/3 majority voting)
-                context = self._apply_mav(
-                    valid_extractions,
-                    self.mav_config.similarity_threshold,
+            # ─── ROUND 1: Research + Query Generation (parallel) ────
+            self._emit_log("INFO", "SIL", "Round 1: Researching subject and generating queries...")
+
+            async def round1_for_model(model: str) -> tuple[str, SubjectUnderstanding, str, list[str]]:
+                """Run Round 1 for a single model."""
+                understanding, search_content = await self._research_subject(
+                    model, query, additional_context
                 )
-                context.subject = query
-                return context
+                queries = await self._generate_factual_queries(
+                    model, query, search_content, additional_context
+                )
+                return model, understanding, search_content, queries
+
+            round1_tasks = [round1_for_model(m) for m in self.mav_config.models]
+            round1_results = await asyncio.gather(*round1_tasks, return_exceptions=True)
+
+            # Collect Round 1 results
+            all_raw_queries: list[tuple[str, str]] = []  # (query_text, source_model)
+            model_research: dict[str, tuple[SubjectUnderstanding, str]] = {}  # model -> (understanding, search_content)
+
+            for result in round1_results:
+                if isinstance(result, Exception):
+                    continue
+                model, understanding, search_content, queries = result
+                model_research[model] = (understanding, search_content)
+                for q in queries:
+                    all_raw_queries.append((q, model))
+
+            total_queries_generated = len(all_raw_queries)
+            self._emit_log("INFO", "SIL", f"Round 1 complete: {total_queries_generated} queries from {len(model_research)} models")
+
+            if total_queries_generated == 0:
+                # No queries generated - fall back to single model
+                self._emit_log("WARN", "SIL", "No queries generated, falling back to single model")
+                return await self._single_model_fallback(query, additional_context)
+
+            # ─── ROUND 2: Query Pooling + Deduplication ─────────────
+            self._emit_log("INFO", "SIL", "Round 2: Pooling and deduplicating queries...")
+            pooled_queries = self._deduplicate_queries(
+                all_raw_queries,
+                self.mav_config.similarity_threshold,
+                self.mav_config.max_queries,
+            )
+
+            if not pooled_queries:
+                self._emit_log("WARN", "SIL", "No queries after deduplication, falling back")
+                return await self._single_model_fallback(query, additional_context)
+
+            self._emit_log("INFO", "SIL", f"Round 2 complete: {len(pooled_queries)} unique queries (from {total_queries_generated})")
+
+            # ─── ROUND 3: Query Answering (parallel) ────────────────
+            self._emit_log("INFO", "MAV", f"Round 3: Verifying {len(pooled_queries)} queries across models...")
+
+            async def round3_for_model(model: str) -> tuple[str, list[QueryAnswer]]:
+                """Run Round 3 for a single model."""
+                research_context = ""
+                if model in model_research:
+                    _, search_content = model_research[model]
+                    research_context = search_content
+
+                answers = await self._answer_queries(
+                    model, query, pooled_queries, research_context, additional_context
+                )
+                return model, answers
+
+            round3_tasks = [round3_for_model(m) for m in self.mav_config.models if m in model_research]
+            round3_results = await asyncio.gather(*round3_tasks, return_exceptions=True)
+
+            # Collect Round 3 results
+            all_answers: dict[str, list[QueryAnswer]] = {}  # query_id -> list of answers
+            model_answers: dict[str, list[QueryAnswer]] = {}  # model -> its answers
+
+            for result in round3_results:
+                if isinstance(result, Exception):
+                    continue
+                model, answers = result
+                model_answers[model] = answers
+                for ans in answers:
+                    if ans.query_id not in all_answers:
+                        all_answers[ans.query_id] = []
+                    all_answers[ans.query_id].append(ans)
+
+            # Build model_data_list for reporting
+            for model in self.mav_config.models:
+                sanitized = self._sanitize_model_name(model)
+                understanding = model_research.get(model, (None, ""))[0]
+                search_content = model_research.get(model, (None, ""))[1]
+                queries_from_model = [q for q, m in all_raw_queries if m == model]
+
+                model_data_list.append(MAVModelData(
+                    model=model,
+                    sanitized_model=sanitized,
+                    understanding=understanding,
+                    queries_generated=queries_from_model,
+                    answers=model_answers.get(model, []),
+                    search_content=search_content if isinstance(search_content, str) else "",
+                ))
+
+            self._emit_log("INFO", "MAV", f"Round 3 complete: {len(model_answers)} models responded")
+
+            # ─── ROUND 4: Per-Query Consensus ───────────────────────
+            self._emit_log("INFO", "MAV", "Round 4: Computing consensus on answers...")
+            effective_n_models = len([r for r in round3_results if not isinstance(r, Exception)])
+            consensus_results: list[QueryConsensusResult] = []
+            total_pooled = len(pooled_queries)
+            consensus_log_interval = max(1, total_pooled // 5)  # Log every ~20%
+
+            for idx, pq in enumerate(pooled_queries):
+                # Log progress periodically during consensus computation
+                if idx % consensus_log_interval == 0 or idx == total_pooled - 1:
+                    self._emit_log("INFO", "MAV", f"Computing consensus... ({idx + 1}/{total_pooled})")
+                query_answers = all_answers.get(pq.id, [])
+                result = self._compute_query_consensus(
+                    pq, query_answers, self.mav_config.answer_threshold, effective_n_models
+                )
+                consensus_results.append(result)
+
+            # Separate verified vs unverified
+            verified_results = [r for r in consensus_results if r.consensus_reached]
+            unverified_results = [r for r in consensus_results if not r.consensus_reached]
+
+            self._emit_log("INFO", "MAV", f"Round 4 complete: {len(verified_results)}/{len(pooled_queries)} queries reached consensus")
+
+            # Build report
+            report = MAVQueryPoolReport(
+                total_queries_generated=total_queries_generated,
+                queries_after_dedup=len(pooled_queries),
+                queries_with_consensus=len(verified_results),
+                queries_without_consensus=len(unverified_results),
+                per_query_results=consensus_results,
+                threshold_used=self.mav_config.answer_threshold,
+            )
+
+            # Check consensus rate
+            consensus_rate = len(verified_results) / len(pooled_queries) if pooled_queries else 0
+
+            if consensus_rate < self.mav_config.min_verification_rate and len(pooled_queries) > 0:
+                # Fallback: use union of all answers (deduplicated)
+                report.used_fallback = True
+                all_answer_texts = []
+                for pq in pooled_queries:
+                    for ans in all_answers.get(pq.id, []):
+                        if ans.response.lower().strip() != "unknown":
+                            all_answer_texts.append(ans.response)
+
+                deduped = self._deduplicate_items(all_answer_texts, 0.80)
+
+                # Classify the union fallback answers
+                # Create pseudo-results for classification
+                pseudo_results = []
+                for i, text in enumerate(deduped):
+                    pseudo_results.append(QueryConsensusResult(
+                        query_id=f"fallback_{i}",
+                        query="",
+                        answers=[],
+                        consensus_reached=True,
+                        consensus_answer=text,
+                        agreeing_models=[],
+                        pairwise_similarities={},
+                        agreement_count=0,
+                    ))
+
+                classified = await self._classify_verified_answers(pseudo_results, query)
+                context = SubjectContext(
+                    subject=query,
+                    features=classified["characteristics"],
+                    pros=classified["positives"],
+                    cons=classified["negatives"],
+                    use_cases=classified["use_cases"],
+                    mav_verified=False,
+                )
+
+                return MAVResult(
+                    context=context,
+                    model_data=model_data_list,
+                    total_facts_extracted=total_queries_generated,
+                    facts_verified=len(deduped),
+                    facts_rejected=total_queries_generated - len(deduped),
+                    query_pool_report=report,
+                )
+
+            # ─── POST-CONSENSUS: Classification ─────────────────────
+            self._emit_log("INFO", "SIL", "Classifying verified facts into categories...")
+            classified = await self._classify_verified_answers(verified_results, query)
+
+            n_features = len(classified.get("characteristics", []))
+            n_pros = len(classified.get("positives", []))
+            n_cons = len(classified.get("negatives", []))
+            self._emit_log("INFO", "SIL", f"Classification complete: {n_features} features, {n_pros} pros, {n_cons} cons")
+
+            context = SubjectContext(
+                subject=query,
+                features=classified["characteristics"],
+                pros=classified["positives"],
+                cons=classified["negatives"],
+                use_cases=classified["use_cases"],
+                mav_verified=True,
+            )
+
+            self._emit_log("INFO", "SIL", "Subject intelligence gathering complete")
+            return MAVResult(
+                context=context,
+                model_data=model_data_list,
+                total_facts_extracted=len(pooled_queries),
+                facts_verified=len(verified_results),
+                facts_rejected=len(unverified_results),
+                query_pool_report=report,
+            )
 
         # Fallback: Single model extraction without MAV
+        return await self._single_model_fallback(query, additional_context)
+
+    async def _single_model_fallback(
+        self,
+        query: str,
+        additional_context: Optional[str] = None,
+    ) -> MAVResult:
+        """Fallback to single model extraction when MAV cannot run."""
         fallback_model = (
             self.mav_config.models[0]
             if self.mav_config.models
             else "anthropic/claude-sonnet-4"
         )
 
-        extraction = await self._gather_with_model(fallback_model, query)
+        try:
+            understanding, search_content = await self._research_subject(
+                fallback_model, query, additional_context
+            )
+            queries = await self._generate_factual_queries(
+                fallback_model, query, search_content, additional_context
+            )
 
-        return SubjectContext(
-            subject=query,
-            features=extraction.characteristics,
-            pros=extraction.positives,
-            cons=extraction.negatives,
-            use_cases=extraction.use_cases,
-            availability=extraction.availability,
-            mav_verified=False,
-            search_sources=extraction.sources,
-        )
+            # Answer the queries with the single model
+            pooled = [FactualQuery(id=f"q{i+1}", query=q, source_model=fallback_model) for i, q in enumerate(queries)]
+            answers = await self._answer_queries(
+                fallback_model, query, pooled, search_content, additional_context
+            )
 
-    async def verify_with_mav(
-        self,
-        claims: list[str],
-        models: Optional[list[str]] = None,
-    ) -> list[str]:
-        """
-        Verify claims using Multi-Agent Verification (MAV).
+            # Classify answers directly (no consensus needed)
+            pseudo_results = []
+            for ans in answers:
+                if ans.response.lower().strip() != "unknown":
+                    pq = next((q for q in pooled if q.id == ans.query_id), None)
+                    pseudo_results.append(QueryConsensusResult(
+                        query_id=ans.query_id,
+                        query=pq.query if pq else "",
+                        answers=[ans],
+                        consensus_reached=True,
+                        consensus_answer=ans.response,
+                        agreeing_models=[fallback_model],
+                        pairwise_similarities={},
+                        agreement_count=1,
+                    ))
 
-        Uses 2/3 majority voting across multiple LLMs to verify
-        factual claims with semantic similarity threshold τ.
+            classified = await self._classify_verified_answers(pseudo_results, query)
 
-        Args:
-            claims: List of claims to verify
-            models: Optional list of 3 model IDs to use (overrides config)
+            context = SubjectContext(
+                subject=query,
+                features=classified["characteristics"],
+                pros=classified["positives"],
+                cons=classified["negatives"],
+                use_cases=classified["use_cases"],
+                mav_verified=False,
+            )
 
-        Returns:
-            List of verified claims (those passing MAV)
-        """
-        from cera.llm.mav import MultiAgentVerification
+            model_data = MAVModelData(
+                model=fallback_model,
+                sanitized_model=self._sanitize_model_name(fallback_model),
+                understanding=understanding,
+                queries_generated=queries,
+                answers=answers,
+                search_content=search_content,
+            )
 
-        mav_models = models or self.mav_config.models
-
-        if not mav_models or len(mav_models) != 3:
-            # Skip MAV if not properly configured
-            return claims
-
-        mav = MultiAgentVerification(
-            api_key=self.api_key,
-            models=mav_models,
-            similarity_threshold=self.mav_config.similarity_threshold,
-        )
-
-        return await mav.filter_verified(claims)
+            return MAVResult(
+                context=context,
+                model_data=[model_data],
+                total_facts_extracted=len(queries),
+                facts_verified=len(pseudo_results),
+                facts_rejected=0,
+            )
+        except Exception:
+            # Complete failure - return empty context
+            context = SubjectContext(
+                subject=query,
+                features=[],
+                pros=[],
+                cons=[],
+                use_cases=[],
+                mav_verified=False,
+            )
+            return MAVResult(
+                context=context,
+                model_data=[],
+                total_facts_extracted=0,
+                facts_verified=0,
+                facts_rejected=0,
+            )

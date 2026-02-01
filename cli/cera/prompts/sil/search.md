@@ -1,20 +1,31 @@
-Search the web for factual information about "{subject}".
+You have web search capabilities. Research "{subject}" using the web.
 
-## Subject Type
-{subject_type}
+Search for information about: {queries}
 
-## Relevant Aspects to Research
-{relevant_aspects}
+After researching, extract facts in this EXACT JSON format:
+{{
+  "characteristics": ["key attribute 1", "key attribute 2", ...],
+  "positives": ["thing reviewers praise 1", "thing reviewers praise 2", ...],
+  "negatives": ["thing reviewers complain about 1", "thing reviewers complain about 2", ...],
+  "use_cases": ["typical use case 1", "typical use case 2", ...],
+  "availability": "price/availability info or null"
+}}
 
-## Search Queries to Execute
-{search_queries}
+IMPORTANT:
+- characteristics: Key attributes relevant to this specific subject (5-10 items)
+  Think: What defines this? What are its main features/specs/properties?
 
-Execute these searches and gather factual information. Focus on:
-- Official specifications and features
-- Verified user reviews and experiences
-- Pricing and availability information
-- Common praise points (what people like)
-- Common complaints (what people dislike)
-- Typical use cases and scenarios
+- positives: Things people praise in reviews (5-10 items)
+  Think: What do satisfied customers highlight? What works well?
 
-Return comprehensive search results that will help generate authentic reviews.
+- negatives: Things people complain about in reviews (3-5 items)
+  Think: What are common complaints? What disappoints people?
+
+- use_cases: Typical scenarios where this is used/experienced (3-5 items)
+  Think: When/why/how do people use or interact with this?
+
+- availability: Price range, where to buy/find, variants available
+
+- Only include information you found through web search
+- Be specific and factual
+- Return ONLY valid JSON, no other text

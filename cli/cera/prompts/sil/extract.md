@@ -1,27 +1,32 @@
-Based on the search results below, extract factual information about "{subject}".
+Extract factual information from these search results about "{subject}".
 
-## Search Results
-{search_results}
+SEARCH RESULTS:
+{search_content}
 
-## Extraction Requirements
-Extract and categorize the information into these categories:
-
-1. **Characteristics**: Key attributes, specifications, ingredients, materials, etc.
-2. **Positives**: Things reviewers typically praise about this subject
-3. **Negatives**: Things reviewers typically complain about
-4. **Use Cases**: When, where, or how this subject is typically used
-5. **Availability**: Price range, where to buy, variants available
-
-Return your extraction as JSON in this exact format:
-```json
+Extract facts in this EXACT JSON format:
 {{
-  "characteristics": ["char1", "char2", "char3"],
-  "positives": ["positive1", "positive2", "positive3"],
-  "negatives": ["negative1", "negative2"],
-  "use_cases": ["use_case1", "use_case2"],
-  "availability": "price and availability summary"
+  "characteristics": ["key attribute 1", "key attribute 2", ...],
+  "positives": ["thing reviewers praise 1", "thing reviewers praise 2", ...],
+  "negatives": ["thing reviewers complain about 1", "thing reviewers complain about 2", ...],
+  "use_cases": ["typical use case 1", "typical use case 2", ...],
+  "availability": "price/availability info or null"
 }}
-```
 
-Be factual and specific. Only include information that is supported by the search results.
-Do not make up or assume information that wasn't found.
+IMPORTANT:
+- characteristics: Key attributes relevant to this specific subject (5-10 items)
+  Think: What defines this? What are its main features/specs/properties?
+
+- positives: Things people praise in reviews (5-10 items)
+  Think: What do satisfied customers highlight? What works well?
+
+- negatives: Things people complain about in reviews (3-5 items)
+  Think: What are common complaints? What disappoints people?
+
+- use_cases: Typical scenarios where this is used/experienced (3-5 items)
+  Think: When/why/how do people use or interact with this?
+
+- availability: Price range, where to buy/find, variants available
+
+- Only include information found in the search results
+- Be specific and factual
+- Return ONLY valid JSON, no other text
