@@ -10,12 +10,26 @@ import json
 import asyncio
 import os
 
+from cera.logging import configure_logging
+
 app = typer.Typer(
     name="cera",
     help="CERA - Context-Engineered Reviews Architecture for synthetic ABSA dataset generation",
     add_completion=False,
 )
 console = Console()
+
+
+@app.callback()
+def main_callback(
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Enable debug-level structured logging",
+    ),
+):
+    """CERA - Context-Engineered Reviews Architecture."""
+    configure_logging(debug=verbose)
 
 
 @app.command()
