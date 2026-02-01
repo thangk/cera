@@ -57,6 +57,8 @@ services:
     volumes:
       - ./output:/app/output
       - ./configs:/app/configs
+      - ./jobs:/app/jobs  # Persist job files (AML prompts, reports, datasets)
+      - ./cli/cera/config/custom-aspect-categories:/app/cera/config/custom-aspect-categories  # Persist extracted presets
     depends_on:
       convex:
         condition: service_healthy

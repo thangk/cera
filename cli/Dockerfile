@@ -13,8 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml README.md ./
 COPY cera/ ./cera/
 
+# Install PyTorch CPU-only (smaller than full GPU build)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 # Install Python dependencies
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e ".[ml,search]"
+
+# Pre-download sentence-transformers model for MAV similarity
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 # Create directories for volumes
 RUN mkdir -p /app/output /app/configs
