@@ -1,0 +1,2 @@
+# This file ensures the jobs directory exists for Docker volume mounting
+# Job files (contexts, AML prompts, reports, datasets) are stored here
