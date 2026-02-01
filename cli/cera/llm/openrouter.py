@@ -1,7 +1,30 @@
 """OpenRouter Client - Provider-agnostic LLM access."""
 
+from dataclasses import dataclass
 from typing import Optional, AsyncIterator
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+
+from cera.logging import get_logger
+
+logger = get_logger("cera.llm.openrouter")
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Check if an exception is retryable (429, 500, 502, 503)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503)
+    return False
+
+
+@dataclass
+class ChatResponse:
+    """Response from an OpenRouter chat completion."""
+
+    content: str
+    usage: Optional[dict] = None  # {prompt_tokens, completion_tokens, total_tokens}
+    model: Optional[str] = None  # actual model used
+    id: Optional[str] = None  # generation ID
 
 
 # Models that support the :online suffix for web search
@@ -121,16 +144,28 @@ class OpenRouterClient:
         "deepseek-r1": "deepseek/deepseek-r1",
     }
 
-    def __init__(self, api_key: str, site_url: str = "", site_name: str = "CERA"):
+    def __init__(self, api_key: str, site_url: str = "", site_name: str = "CERA", usage_tracker=None):
         self.api_key = api_key
         self.site_url = site_url
         self.site_name = site_name
+        self.usage_tracker = usage_tracker
         self.client = httpx.AsyncClient()
 
     def _get_model_id(self, model: str) -> str:
         """Get full model ID from short name or return as-is."""
         return self.MODELS.get(model, model)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception(_is_retryable),
+        before_sleep=lambda retry_state: logger.warning(
+            "llm_retry",
+            attempt=retry_state.attempt_number,
+            wait=retry_state.next_action.sleep,
+            error=str(retry_state.outcome.exception()),
+        ),
+    )
     async def chat(
         self,
         messages: list[dict],
@@ -174,7 +209,85 @@ class OpenRouterClient:
         response.raise_for_status()
 
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+
+        # Record usage if tracker is available
+        if self.usage_tracker:
+            usage = data.get("usage")
+            if usage:
+                from cera.llm.usage import LLMUsage
+                self.usage_tracker.record(LLMUsage(
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    model=model_id,
+                ))
+
+        logger.debug("llm_call", model=model_id, tokens=data.get("usage", {}).get("total_tokens"))
+
+        return content
+
+    async def chat_with_usage(
+        self,
+        messages: list[dict],
+        model: str = "claude-sonnet-4",
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> ChatResponse:
+        """
+        Send a chat completion request and return full response with usage data.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            model: Model name (short or full)
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+
+        Returns:
+            ChatResponse with content, usage, model, and generation ID
+        """
+        model_id = self._get_model_id(model)
+
+        response = await self.client.post(
+            f"{self.BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "HTTP-Referer": self.site_url,
+                "X-Title": self.site_name,
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model_id,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            timeout=120.0,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage")
+        gen_id = data.get("id")
+        actual_model = data.get("model", model_id)
+
+        # Record usage if tracker is available
+        if self.usage_tracker and usage:
+            from cera.llm.usage import LLMUsage
+            self.usage_tracker.record(LLMUsage(
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+                model=actual_model,
+            ))
+
+        return ChatResponse(
+            content=content,
+            usage=usage,
+            model=actual_model,
+            id=gen_id,
+        )
 
     async def generate_review(
         self,

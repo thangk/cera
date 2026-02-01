@@ -1,27 +1,17 @@
-You are a fact-checker verifying claims about "{subject}".
-
-## Claim to Verify
-{claim}
+You are a fact-checker. Answer questions accurately and concisely.
 
 ## Context
 {context}
 
+## Claim to Verify
+Is this claim accurate? "{claim}"
+
 ## Instructions
 Determine if this claim is accurate based on your knowledge and the provided context.
 
-Respond with:
+Respond with a brief explanation of whether the claim is accurate, including:
 1. Whether the claim is TRUE, FALSE, or UNCERTAIN
-2. A brief explanation of your reasoning
+2. Key evidence supporting your conclusion
 3. Any caveats or conditions that affect the accuracy
 
-Return your response as JSON:
-```json
-{{
-  "verdict": "TRUE" | "FALSE" | "UNCERTAIN",
-  "confidence": 0.0-1.0,
-  "reasoning": "Brief explanation of why you reached this verdict",
-  "caveats": ["Any conditions or caveats that apply"]
-}}
-```
-
-Be conservative - if you're not sure, say UNCERTAIN rather than guessing.
+Be conservative - if you're not sure, acknowledge the uncertainty rather than guessing.

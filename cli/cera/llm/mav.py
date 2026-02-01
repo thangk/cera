@@ -4,6 +4,8 @@ from typing import Optional
 from dataclasses import dataclass
 import asyncio
 
+from cera.prompts import load_and_format
+
 
 @dataclass
 class MAVResult:
@@ -41,22 +43,39 @@ class MultiAgentVerification:
         self.api_key = api_key
         self.models = models or self.DEFAULT_MODELS
         self.similarity_threshold = similarity_threshold
+        self._similarity_model = None  # Lazy-loaded model cache
+
+    def _get_similarity_model(self):
+        """Lazy-load and cache the SentenceTransformer model."""
+        if self._similarity_model is None:
+            import os
+            import logging
+
+            # Suppress progress bars and verbose logging
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+
+            from sentence_transformers import SentenceTransformer
+
+            self._similarity_model = SentenceTransformer(
+                "all-MiniLM-L6-v2", device="cpu"
+            )
+        return self._similarity_model
 
     async def _query_model(
-        self, model: str, prompt: str, context: str
+        self, model: str, claim: str, context: str
     ) -> str:
         """Query a single model."""
         from .openrouter import OpenRouterClient
 
+        # Load and format the verification prompt
+        prompt = load_and_format("mav", "verify", claim=claim, context=context)
+
         async with OpenRouterClient(self.api_key) as client:
             messages = [
                 {
-                    "role": "system",
-                    "content": "You are a fact-checker. Answer questions accurately and concisely.",
-                },
-                {
                     "role": "user",
-                    "content": f"Context: {context}\n\nQuestion: {prompt}",
+                    "content": prompt,
                 },
             ]
             return await client.chat(messages, model=model, temperature=0.0)
@@ -69,10 +88,12 @@ class MultiAgentVerification:
         to simple word overlap.
         """
         try:
-            from sentence_transformers import SentenceTransformer, util
+            from sentence_transformers import util
 
-            model = SentenceTransformer("all-MiniLM-L6-v2")
-            embeddings = model.encode([text1, text2])
+            model = self._get_similarity_model()  # Use cached model
+            embeddings = model.encode(
+                [text1, text2], convert_to_tensor=True, show_progress_bar=False
+            )
             similarity = util.cos_sim(embeddings[0], embeddings[1])
             return float(similarity[0][0])
         except ImportError:
@@ -125,11 +146,9 @@ class MultiAgentVerification:
         Returns:
             MAVResult with verification outcome
         """
-        prompt = f"Is this claim accurate? '{claim}' Answer with a brief explanation."
-
         # Query all models in parallel
         tasks = [
-            self._query_model(model, prompt, context) for model in self.models
+            self._query_model(model, claim, context) for model in self.models
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
