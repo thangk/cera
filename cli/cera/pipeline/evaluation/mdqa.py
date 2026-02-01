@@ -323,8 +323,8 @@ class MultiDimensionalQualityAssessment:
                 from sentence_transformers import SentenceTransformer, util
 
                 model = SentenceTransformer("all-MiniLM-L6-v2", device=self._device)
-                gen_embeddings = model.encode(generated, convert_to_tensor=True)
-                ref_embeddings = model.encode(references, convert_to_tensor=True)
+                gen_embeddings = model.encode(generated, convert_to_tensor=True, show_progress_bar=False)
+                ref_embeddings = model.encode(references, convert_to_tensor=True, show_progress_bar=False)
 
                 # Compute cosine similarity for each pair
                 similarities = util.cos_sim(gen_embeddings, ref_embeddings)

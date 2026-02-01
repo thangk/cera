@@ -19,6 +19,10 @@ from cera.pipeline.generation.noise import NoiseInjector, create_noise_pipeline
 from cera.pipeline.evaluation.mdqa import MultiDimensionalQualityAssessment, MDQAMetrics
 from cera.models.config import CeraConfig
 from cera.models.output import Review, ReviewerInfo, ReviewMetadata, AspectSentiment, Dataset, DatasetMetrics
+from cera.llm.usage import UsageTracker
+from cera.logging import get_logger
+
+logger = get_logger("cera.pipeline.executor")
 
 
 class PipelineExecutor:
@@ -51,6 +55,7 @@ class PipelineExecutor:
         self.api_key = api_key
         self.console = console or Console()
         self.progress_callback = progress_callback
+        self.usage_tracker = UsageTracker()
 
         # Initialize components
         # Build MAV config if provided in subject_profile
@@ -63,7 +68,7 @@ class PipelineExecutor:
                 similarity_threshold=mav.similarity_threshold,
             )
 
-        self.sil = SubjectIntelligenceLayer(api_key, mav_config=mav_config)
+        self.sil = SubjectIntelligenceLayer(api_key, mav_config=mav_config, usage_tracker=self.usage_tracker)
         self.rgm = ReviewerGenerationModule(
             age_range=tuple(config.reviewer_profile.age_range),
             sex_distribution={
@@ -71,7 +76,7 @@ class PipelineExecutor:
                 "female": config.reviewer_profile.sex_distribution.female,
                 "unspecified": config.reviewer_profile.sex_distribution.unspecified,
             },
-            audience_contexts=config.reviewer_profile.audience_context,
+            additional_context=config.reviewer_profile.additional_context,
         )
         self.acm = AttributesCompositionModule(
             polarity={
@@ -91,6 +96,7 @@ class PipelineExecutor:
             api_key=api_key,
             provider=config.generation.provider,
             model=config.generation.model,
+            usage_tracker=self.usage_tracker,
         )
 
         # Create noise injector
@@ -124,19 +130,22 @@ class PipelineExecutor:
         self.console.print("\n[bold cyan]Phase 1: Composition[/bold cyan]")
         self.console.print("[dim]  SIL[/dim] Gathering subject intelligence...")
 
-        subject_ctx = await self.sil.gather_intelligence(
+        mav_result = await self.sil.gather_intelligence(
             query=self.config.subject_profile.query,
             region=self.config.subject_profile.region,
-            category=self.config.subject_profile.category,
-            feature_count=self.config.subject_profile.feature_count,
+            domain=self.config.subject_profile.domain,
             sentiment_depth=self.config.subject_profile.sentiment_depth,
-            context_scope=self.config.subject_profile.context_scope,
+            additional_context=getattr(self.config.subject_profile, 'additional_context', None),
         )
+        subject_ctx = mav_result.context
         mav_status = "[green]MAV verified[/green]" if subject_ctx.mav_verified else "[yellow]single-model[/yellow]"
         self.console.print(f"[green]  OK[/green] Subject: {subject_ctx.subject} ({mav_status})")
         self.console.print(f"[dim]     Features: {len(subject_ctx.features)} | Pros: {len(subject_ctx.pros)} | Cons: {len(subject_ctx.cons)}[/dim]")
         if subject_ctx.search_sources:
             self.console.print(f"[dim]     Sources: {len(subject_ctx.search_sources)} web pages[/dim]")
+        if mav_result.query_pool_report:
+            report = mav_result.query_pool_report
+            self.console.print(f"[dim]     MAV: {report.queries_with_consensus}/{report.queries_after_dedup} queries reached consensus[/dim]")
 
         self._update_progress(15, "composition")
 
@@ -245,6 +254,14 @@ class PipelineExecutor:
 
         self.console.print(f"[green]  OK[/green] Noise applied (typo_rate={self.config.attributes_profile.noise.typo_rate:.1%})")
 
+        # Display token usage summary
+        if self.usage_tracker.total_tokens > 0:
+            self.console.print(
+                f"[dim]     Tokens: {self.usage_tracker.total_prompt_tokens:,} in / "
+                f"{self.usage_tracker.total_completion_tokens:,} out "
+                f"({self.usage_tracker.call_count} calls)[/dim]"
+            )
+
         return noisy_reviews
 
     async def _run_evaluation_phase(self, reviews: list[GeneratedReview]) -> MDQAMetrics:
@@ -296,7 +313,7 @@ class PipelineExecutor:
                 "reviewer": {
                     "age": review.reviewer_age,
                     "sex": review.reviewer_sex,
-                    "audience_context": review.audience_context,
+                    "additional_context": review.additional_context,
                 },
                 "metadata": {
                     "model": review.model,
@@ -318,14 +335,14 @@ class PipelineExecutor:
             "id": dataset_id,
             "name": f"{self.config.subject_profile.query} Reviews",
             "subject": self.config.subject_profile.query,
-            "category": self.config.subject_profile.category,
+            "domain": self.config.subject_profile.domain,
             "review_count": len(reviews),
             "metrics": metrics.to_dict() if metrics else None,
             "config": {
                 "subject_profile": {
                     "query": self.config.subject_profile.query,
                     "region": self.config.subject_profile.region,
-                    "category": self.config.subject_profile.category,
+                    "domain": self.config.subject_profile.domain,
                 },
                 "generation": {
                     "count": self.config.generation.count,
@@ -340,6 +357,10 @@ class PipelineExecutor:
             },
             "created_at": datetime.utcnow().isoformat(),
         }
+
+        # Add usage/cost data if available
+        if self.usage_tracker.total_tokens > 0:
+            metadata["usage"] = self.usage_tracker.summary_dict()
 
         metadata_path = output_dir / f"{dataset_id}.meta.json"
         with open(metadata_path, "w", encoding="utf-8") as f:
@@ -381,6 +402,17 @@ class PipelineExecutor:
             else:
                 self.console.print("\n[dim]Skipping evaluation (--skip-eval)[/dim]")
                 self._update_progress(95, "skipped_eval")
+
+            # Compute costs
+            cost_summary = None
+            if self.usage_tracker.total_tokens > 0:
+                try:
+                    await self.usage_tracker.fetch_pricing(self.api_key)
+                    cost_summary = self.usage_tracker.compute_cost()
+                    if cost_summary["total_cost_usd"] > 0:
+                        self.console.print(f"\n[dim]  Estimated cost: ${cost_summary['total_cost_usd']:.4f}[/dim]")
+                except Exception as e:
+                    logger.warning("pricing_fetch_failed", error=str(e))
 
             # Save output
             self._update_progress(98, "saving")

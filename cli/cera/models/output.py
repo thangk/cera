@@ -19,7 +19,7 @@ class ReviewerInfo(BaseModel):
 
     age: int
     sex: str
-    audience_context: str
+    additional_context: Optional[str] = None
 
 
 class AspectSentiment(BaseModel):

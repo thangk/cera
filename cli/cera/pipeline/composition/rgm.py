@@ -11,7 +11,7 @@ class ReviewerContext:
 
     sex: str
     age: int
-    audience_context: str
+    additional_context: Optional[str] = None
     style_ref: Optional[str] = None
 
 
@@ -27,7 +27,7 @@ class ReviewerGenerationModule:
         self,
         age_range: tuple[int, int] = (18, 65),
         sex_distribution: dict[str, float] = None,
-        audience_contexts: list[str] = None,
+        additional_context: Optional[str] = None,
     ):
         self.age_range = age_range
         self.sex_distribution = sex_distribution or {
@@ -35,7 +35,7 @@ class ReviewerGenerationModule:
             "female": 0.45,
             "unspecified": 0.10,
         }
-        self.audience_contexts = audience_contexts or ["general user"]
+        self.additional_context = additional_context
 
     def generate_profile(self) -> ReviewerContext:
         """
@@ -57,13 +57,10 @@ class ReviewerGenerationModule:
         # Sample age uniformly within range
         age = random.randint(self.age_range[0], self.age_range[1])
 
-        # Sample audience context
-        audience = random.choice(self.audience_contexts)
-
         return ReviewerContext(
             sex=sex,
             age=age,
-            audience_context=audience,
+            additional_context=self.additional_context,
         )
 
     def generate_profiles(self, count: int) -> list[ReviewerContext]:

@@ -15,7 +15,7 @@ class GeneratedReview:
     aspects: list[dict]
     reviewer_age: int
     reviewer_sex: str
-    audience_context: str
+    additional_context: str
     model: str
     temperature: float
     batch_id: int
@@ -30,10 +30,11 @@ class AuthenticityModelingLayer:
     controlled polarity distribution.
     """
 
-    def __init__(self, api_key: str, provider: str = "anthropic", model: str = "claude-sonnet-4"):
+    def __init__(self, api_key: str, provider: str = "anthropic", model: str = "claude-sonnet-4", usage_tracker=None):
         self.api_key = api_key
         self.provider = provider
         self.model = model
+        self.usage_tracker = usage_tracker
         self._client = None
 
     def _is_placeholder_mode(self) -> bool:
@@ -44,7 +45,7 @@ class AuthenticityModelingLayer:
         """Get or create the OpenRouter client."""
         if self._client is None:
             from cera.llm.openrouter import OpenRouterClient
-            self._client = OpenRouterClient(self.api_key)
+            self._client = OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker)
         return self._client
 
     def _determine_polarity(self, polarity_dist: dict) -> str:
@@ -93,7 +94,7 @@ Known cons: {', '.join(cons[:3]) if cons else 'minor issues'}"""
         subject = subject_context.get("subject", "Product")
         age = reviewer_context.get("age", 30)
         sex = reviewer_context.get("sex", "unspecified")
-        context = reviewer_context.get("audience_context", "general user")
+        context = reviewer_context.get("additional_context", "") or "general user"
 
         sentiment_guide = {
             "positive": "enthusiastic and satisfied, highlighting what you loved",
@@ -143,7 +144,7 @@ Write ONLY the review text. No labels, no quotation marks, no explanations."""
             review_text = self._generate_placeholder_review(
                 subject_context.get("subject", "Product"),
                 polarity,
-                reviewer_context.get("audience_context", "user"),
+                reviewer_context.get("additional_context", "") or "user",
             )
         else:
             # Real LLM generation via OpenRouter
@@ -160,7 +161,7 @@ Write ONLY the review text. No labels, no quotation marks, no explanations."""
             aspects=[],  # TODO: Extract aspects from generated text
             reviewer_age=reviewer_context.get("age", 30),
             reviewer_sex=reviewer_context.get("sex", "unspecified"),
-            audience_context=reviewer_context.get("audience_context", "general"),
+            additional_context=reviewer_context.get("additional_context", "") or "general",
             model=self.model,
             temperature=temperature,
             batch_id=batch_id,
@@ -200,7 +201,7 @@ Write ONLY the review text. No labels, no quotation marks, no explanations."""
             return self._generate_placeholder_review(
                 subject_context.get("subject", "Product"),
                 polarity,
-                reviewer_context.get("audience_context", "user"),
+                reviewer_context.get("additional_context", "") or "user",
             )
 
     def _generate_placeholder_review(

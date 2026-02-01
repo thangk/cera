@@ -7,15 +7,20 @@ from typing import Optional
 class MAVConfig(BaseModel):
     """Multi-Agent Verification configuration for SIL."""
 
-    enabled: bool = Field(default=True, description="Enable MAV verification (requires 3 models)")
+    enabled: bool = Field(default=True, description="Enable MAV verification (requires 2+ models)")
     models: list[str] = Field(
         default_factory=list,
-        min_length=1,
-        max_length=3,
-        description="Models for research. 1 model = no verification, 3 models = MAV (2/3 majority voting)",
+        min_length=2,
+        description="Models for research. 2+ models = MAV (ceil(2/3*N) majority voting)",
     )
     similarity_threshold: float = Field(
-        default=0.85, ge=0, le=1, description="Semantic similarity threshold (τ) for MAV"
+        default=0.85, ge=0, le=1, description="Query deduplication threshold"
+    )
+    answer_threshold: float = Field(
+        default=0.80, ge=0, le=1, description="Per-query answer consensus threshold"
+    )
+    max_queries: int = Field(
+        default=30, ge=5, le=100, description="Soft cap on pooled queries after deduplication"
     )
 
 
@@ -23,14 +28,13 @@ class SubjectProfile(BaseModel):
     """Subject configuration for review generation."""
 
     query: str = Field(..., description="Subject to research (e.g., 'iPhone 15 Pro')")
+    additional_context: Optional[str] = Field(default=None, description="Additional context about the subject (e.g., 'Limited edition with only 1000 units produced')")
     region: str = Field(default="united states", description="Geographic region")
-    category: str = Field(default="general", description="Product/service category")
+    domain: str = Field(default="general", description="Product/service domain (e.g., restaurant, laptop, hotel)")
+    aspect_categories: Optional[list[str]] = Field(default=None, description="Aspect categories for ABSA annotation (e.g., FOOD#QUALITY, SERVICE#GENERAL)")
     feature_count: str = Field(default="5-10", description="Range of features to extract")
     sentiment_depth: str = Field(
         default="praise and complain", description="Level of sentiment analysis"
-    )
-    context_scope: str = Field(
-        default="typical use cases", description="Scope of contextual information"
     )
     mav: Optional[MAVConfig] = Field(default=None, description="MAV configuration for SIL (required for web, optional for CLI)")
     custom_schema: Optional[dict] = Field(
@@ -54,10 +58,6 @@ class ReviewerProfile(BaseModel):
 
     age_range: tuple[int, int] = Field(default=(18, 65), description="Age range")
     sex_distribution: SexDistribution = Field(default_factory=SexDistribution)
-    audience_context: list[str] = Field(
-        default_factory=lambda: ["general user"],
-        description="Audience contexts for reviewer personas",
-    )
     additional_context: Optional[str] = Field(
         default=None,
         description="Additional context about typical reviewers (e.g., demographics, expectations, behaviors). Passed verbatim to generation prompt.",
@@ -106,12 +106,15 @@ class AttributesProfile(BaseModel):
 class GenerationConfig(BaseModel):
     """Generation settings."""
 
-    count: int = Field(default=1000, ge=1, description="Total reviews to generate")
+    count: int = Field(default=1000, ge=1, description="Target count (reviews or sentences based on count_mode)")
+    count_mode: str = Field(default="reviews", description="Count mode: 'reviews' or 'sentences'")
+    target_sentences: Optional[int] = Field(default=None, ge=1, description="Target sentence count (when count_mode='sentences')")
     batch_size: int = Field(default=50, ge=1, description="Reviews per batch")
     request_size: int = Field(default=5, ge=1, description="Parallel API requests")
     mode: str = Field(default="single-provider", description="Generation mode")
     provider: str = Field(default="anthropic", description="LLM provider")
     model: str = Field(default="claude-sonnet-4", description="Model name")
+    dataset_mode: str = Field(default="explicit", description="Dataset annotation mode: explicit, implicit, or both")
 
 
 class OutputConfig(BaseModel):
