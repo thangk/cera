@@ -173,6 +173,167 @@ class ContextExtractor:
         logger.info("reviewer_context_extracted", length=len(context))
         return context
 
+    async def extract_subject_query(
+        self,
+        reviews: list[str],
+        sample_count: Optional[int] = None,
+    ) -> str:
+        """
+        Extract a concise subject query from reviews.
+
+        Args:
+            reviews: List of review texts to analyze
+            sample_count: Optional number of reviews to sample (default: 25)
+
+        Returns:
+            Concise subject query (3-8 words)
+        """
+        sampled = self._sample_reviews(reviews, max_samples=sample_count or 25)
+        logger.info("extracting_subject_query", sample_count=len(sampled), total_reviews=len(reviews))
+
+        # Format reviews as JSON for the prompt
+        reviews_json = json.dumps(
+            [{"review": r} for r in sampled],
+            indent=2,
+            ensure_ascii=False
+        )
+
+        prompt = load_and_format(
+            "context_extractor", "subject_query",
+            reviews_json=reviews_json,
+        )
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.3,
+                max_tokens=50,  # Short response expected
+            )
+
+        # Clean up response - just the query, no quotes or extra text
+        query = response.strip().strip('"\'')
+
+        # Fallback if response is too long or empty
+        if not query or len(query) > 100:
+            query = "General product or service reviews"
+
+        logger.info("subject_query_extracted", query=query)
+        return query
+
+    async def extract_domain(
+        self,
+        reviews: list[str],
+        sample_count: Optional[int] = None,
+    ) -> dict:
+        """
+        Extract the domain/category from reviews.
+
+        Args:
+            reviews: List of review texts to analyze
+            sample_count: Optional number of reviews to sample (default: 25)
+
+        Returns:
+            Dict with 'value' (domain string) and 'confidence' (0.0-1.0)
+        """
+        sampled = self._sample_reviews(reviews, max_samples=sample_count or 25)
+        logger.info("extracting_domain", sample_count=len(sampled), total_reviews=len(reviews))
+
+        reviews_json = json.dumps(
+            [{"review": r} for r in sampled],
+            indent=2,
+            ensure_ascii=False
+        )
+
+        prompt = load_and_format(
+            "context_extractor", "domain",
+            reviews_json=reviews_json,
+        )
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.3,
+                max_tokens=100,
+            )
+
+        # Parse JSON response
+        try:
+            # Clean up response - remove markdown code blocks if present
+            clean_response = response.strip()
+            if clean_response.startswith("```"):
+                lines = clean_response.split("\n")
+                clean_response = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+
+            result = json.loads(clean_response)
+            domain = result.get("domain", "General")
+            confidence = float(result.get("confidence", 0.5))
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("domain_extraction_parse_error", response=response[:200])
+            domain = "General"
+            confidence = 0.3
+
+        logger.info("domain_extracted", domain=domain, confidence=confidence)
+        return {"value": domain, "confidence": confidence}
+
+    async def extract_region(
+        self,
+        reviews: list[str],
+        sample_count: Optional[int] = None,
+    ) -> dict:
+        """
+        Extract the geographic region from reviews.
+
+        Args:
+            reviews: List of review texts to analyze
+            sample_count: Optional number of reviews to sample (default: 25)
+
+        Returns:
+            Dict with 'value' (region string or None), 'confidence', and optional 'reason'
+        """
+        sampled = self._sample_reviews(reviews, max_samples=sample_count or 25)
+        logger.info("extracting_region", sample_count=len(sampled), total_reviews=len(reviews))
+
+        reviews_json = json.dumps(
+            [{"review": r} for r in sampled],
+            indent=2,
+            ensure_ascii=False
+        )
+
+        prompt = load_and_format(
+            "context_extractor", "region",
+            reviews_json=reviews_json,
+        )
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.3,
+                max_tokens=150,
+            )
+
+        # Parse JSON response
+        try:
+            clean_response = response.strip()
+            if clean_response.startswith("```"):
+                lines = clean_response.split("\n")
+                clean_response = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+
+            result = json.loads(clean_response)
+            region = result.get("region")  # Can be None
+            confidence = float(result.get("confidence", 0.0))
+            reason = result.get("reason")
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("region_extraction_parse_error", response=response[:200])
+            region = None
+            confidence = 0.0
+            reason = "Failed to parse LLM response"
+
+        logger.info("region_extracted", region=region, confidence=confidence)
+        return {"value": region, "confidence": confidence, "reason": reason}
+
     async def extract_both(
         self,
         reviews: list[str],
