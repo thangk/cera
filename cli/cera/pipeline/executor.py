@@ -320,9 +320,20 @@ class PipelineExecutor:
         # Extract texts for evaluation
         texts = [r.text for r in reviews]
 
+        # Create MDQA progress callback that maps 0-100 to overall 80-95 range
+        def mdqa_progress(mdqa_percent: int, metric_name: str):
+            # Map MDQA 0-100 to overall pipeline 80-95
+            overall_progress = 80 + int((mdqa_percent / 100) * 15)
+            self._update_progress(overall_progress, f"evaluation:{metric_name}")
+
+        # Create MDQA with progress callback for granular updates
+        mdqa_with_progress = MultiDimensionalQualityAssessment(
+            use_gpu=self.mdqa.use_gpu,
+            progress_callback=mdqa_progress,
+        )
+
         # Compute metrics (diversity metrics only since we don't have references)
-        self._update_progress(85, "evaluation")
-        metrics = self.mdqa.evaluate(texts)
+        metrics = mdqa_with_progress.evaluate(texts)
 
         self._update_progress(95, "evaluation")
 

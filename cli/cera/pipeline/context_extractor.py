@@ -311,7 +311,7 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=150,
+                max_tokens=200,  # Allow longer multi-region responses
             )
 
         # Parse JSON response
