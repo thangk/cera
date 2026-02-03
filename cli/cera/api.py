@@ -31,6 +31,8 @@ class MAVConfig(BaseModel):
     enabled: bool = False
     models: list[str] = []
     similarity_threshold: float = 0.85
+    answer_threshold: float = 0.80
+    max_queries: int = 30
 
 
 class SubjectProfile(BaseModel):
@@ -39,6 +41,7 @@ class SubjectProfile(BaseModel):
     domain: Optional[str] = None  # Product/service domain (e.g., restaurant, laptop, hotel)
     category: Optional[str] = None  # Deprecated: use 'domain' instead
     sentiment_depth: str
+    additional_context: Optional[str] = None  # Additional context about the subject
     mav: Optional[MAVConfig] = None
     aspect_categories: Optional[list[str]] = None
 
@@ -49,7 +52,7 @@ class SubjectProfile(BaseModel):
 
 
 class ReviewerProfile(BaseModel):
-    age_range: list[int]
+    age_range: Optional[list[int]] = None  # None when age ablation is disabled
     sex_distribution: dict[str, float]
     additional_context: Optional[str] = None
 
@@ -85,6 +88,7 @@ class GenerationConfig(BaseModel):
     model: str
     output_formats: Optional[list[str]] = None  # e.g., ["jsonl", "csv", "semeval_xml"]
     dataset_mode: str = "explicit"  # "explicit", "implicit", or "both"
+    total_runs: int = 1  # Number of times to run generation (for research variability assessment)
 
 
 class AblationConfig(BaseModel):
@@ -271,6 +275,7 @@ def save_job_config(
             "provider": config.generation.provider,
             "output_formats": getattr(config.generation, 'output_formats', ["semeval_xml"]),
             "dataset_mode": getattr(config.generation, 'dataset_mode', 'both'),
+            "total_runs": getattr(config.generation, 'total_runs', 1),
         }
 
     # Add ablation settings if provided
@@ -616,160 +621,88 @@ class ConvexClient:
         except Exception as e:
             print(f"Warning: Failed to create Convex dataset: {e}")
 
-
-async def execute_pipeline(
-    job_id: str,
-    job_name: str,
-    config: JobConfig,
-    api_key: str,
-    jobs_directory: str,
-    convex_url: Optional[str],
-    convex_token: Optional[str],
-):
-    """Execute the CERA pipeline."""
-    convex = None
-    if convex_url and convex_token:
-        convex = ConvexClient(convex_url, convex_token)
-
-    # Create job directory structure
-    job_paths = create_job_directory(jobs_directory, job_id, job_name)
-
-    try:
-        # Phase 1: Composition
-        if convex:
-            await convex.update_progress(job_id, 5, "composition")
-            await convex.add_log(job_id, "INFO", "composition", "Starting composition phase...")
-            await convex.add_log(job_id, "INFO", "composition", f"Job directory: {job_paths['root']}")
-
-        # SIL - Subject Intelligence Layer
-        if convex:
-            await convex.add_log(
-                job_id,
-                "INFO",
-                "composition",
-                f"[SIL] Gathering intelligence for: {config.subject_profile.query}",
+    async def update_current_run(self, job_id: str, current_run: int, total_runs: int):
+        """Update the current run number in Convex (for multi-run jobs)."""
+        try:
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:updateCurrentRun",
+                    "args": {
+                        "jobId": job_id,
+                        "currentRun": current_run,
+                        "totalRuns": total_runs,
+                    },
+                },
             )
-        await asyncio.sleep(2)  # Simulated delay
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to update current run in Convex: {e}")
 
-        # RGM - Reviewer Generation Module
-        if convex:
-            await convex.update_progress(job_id, 15, "composition")
-            await convex.add_log(
-                job_id,
-                "INFO",
-                "composition",
-                f"[RGM] Generating reviewer profiles (age: {config.reviewer_profile.age_range})",
+    async def update_actual_cost(self, job_id: str, actual_cost: dict):
+        """Update actual cost from usage tracker after job completion."""
+        try:
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:updateActualCost",
+                    "args": {"jobId": job_id, "actualCost": actual_cost},
+                },
             )
-        await asyncio.sleep(1)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to update actual cost in Convex: {e}")
 
-        # ACM - Attributes Composition Module
-        if convex:
-            await convex.update_progress(job_id, 25, "composition")
-            await convex.add_log(
-                job_id,
-                "INFO",
-                "composition",
-                f"[ACM] Composing attributes (polarity: {config.attributes_profile.polarity.positive:.0%} pos)",
+    async def save_per_run_metrics(
+        self, job_id: str, run: int, dataset_file: str, metrics: dict
+    ):
+        """Save evaluation metrics for a specific run (for multi-run jobs)."""
+        try:
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:savePerRunMetrics",
+                    "args": {
+                        "jobId": job_id,
+                        "run": run,
+                        "datasetFile": dataset_file,
+                        "metrics": metrics,
+                    },
+                },
             )
-        await asyncio.sleep(1)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to save per-run metrics in Convex: {e}")
 
-        # Phase 2: Generation
-        if convex:
-            await convex.update_progress(job_id, 30, "generation")
-            await convex.add_log(job_id, "INFO", "generation", "Starting generation phase...")
-
-        total_reviews = config.generation.count
-        batch_size = config.generation.batch_size
-        num_batches = (total_reviews + batch_size - 1) // batch_size
-
-        for i in range(num_batches):
-            batch_num = i + 1
-            progress = 30 + int((i / num_batches) * 40)
-
-            if convex:
-                await convex.update_progress(job_id, progress, "generation")
-                await convex.add_log(
-                    job_id,
-                    "INFO",
-                    "generation",
-                    f"[BATCH] Processing batch {batch_num}/{num_batches}...",
-                )
-
-            # Simulated batch processing
-            await asyncio.sleep(0.5)
-
-        # Noise injection
-        if convex:
-            await convex.update_progress(job_id, 75, "generation")
-            await convex.add_log(
-                job_id,
-                "INFO",
-                "generation",
-                f"[NOISE] Injecting noise (typo_rate: {config.attributes_profile.noise.typo_rate:.1%})",
+    async def save_average_metrics(self, job_id: str, average_metrics: dict):
+        """Save average metrics across all runs (for multi-run jobs)."""
+        try:
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:saveAverageMetrics",
+                    "args": {"jobId": job_id, "averageMetrics": average_metrics},
+                },
             )
-        await asyncio.sleep(1)
-
-        # Phase 3: Evaluation
-        if convex:
-            await convex.update_progress(job_id, 80, "evaluation")
-            await convex.add_log(job_id, "INFO", "evaluation", "Starting evaluation phase...")
-
-        # MDQA metrics
-        metrics = {
-            "bertscore": 0.87,
-            "distinct_1": 0.92,
-            "distinct_2": 0.65,
-            "self_bleu": 0.31,
-        }
-
-        if convex:
-            await convex.add_log(job_id, "INFO", "evaluation", "[MDQA] Computing BERTScore...")
-            await asyncio.sleep(1)
-            await convex.update_progress(job_id, 85, "evaluation")
-            await convex.add_log(job_id, "INFO", "evaluation", f"[MDQA] BERTScore: {metrics['bertscore']}")
-
-            await convex.add_log(job_id, "INFO", "evaluation", "[MDQA] Computing Distinct-n...")
-            await asyncio.sleep(1)
-            await convex.update_progress(job_id, 90, "evaluation")
-            await convex.add_log(
-                job_id,
-                "INFO",
-                "evaluation",
-                f"[MDQA] Distinct-1: {metrics['distinct_1']}, Distinct-2: {metrics['distinct_2']}",
-            )
-
-            await convex.add_log(job_id, "INFO", "evaluation", "[MDQA] Computing Self-BLEU...")
-            await asyncio.sleep(1)
-            await convex.update_progress(job_id, 95, "evaluation")
-            await convex.add_log(job_id, "INFO", "evaluation", f"[MDQA] Self-BLEU: {metrics['self_bleu']}")
-
-        # Complete - use the job's dataset directory
-        output_path = job_paths["dataset"]
-
-        if convex:
-            await convex.create_dataset(
-                job_id=job_id,
-                name=f"{config.subject_profile.query} Reviews",
-                subject=config.subject_profile.query,
-                domain=config.subject_profile.resolved_domain,
-                review_count=total_reviews,
-                metrics=metrics,
-                output_path=output_path,
-            )
-            await convex.add_log(
-                job_id,
-                "INFO",
-                "complete",
-                f"Pipeline completed successfully. Generated {total_reviews} reviews.",
-            )
-            await convex.complete_job(job_id)
-
-    except Exception as e:
-        error_msg = str(e)
-        if convex:
-            await convex.add_log(job_id, "ERROR", "error", f"Pipeline failed: {error_msg}")
-            await convex.fail_job(job_id, error_msg)
-        raise
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to save average metrics in Convex: {e}")
 
 
 async def execute_composition(
@@ -850,28 +783,18 @@ async def execute_composition(
         )
 
         # Initialize SIL with MAV config
-        # Create log callback that sends logs to Convex
-        async def sil_log_callback(level: str, phase: str, message: str):
+        # Create async log callback that sends logs to Convex (with optional progress)
+        async def sil_log_callback(level: str, phase: str, message: str, progress: int = None):
             if convex:
                 await convex.add_log(job_id, level, phase, message)
-
-        def sync_log_callback(level: str, phase: str, message: str):
-            """Synchronous wrapper for the async log callback."""
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(sil_log_callback(level, phase, message))
-                else:
-                    loop.run_until_complete(sil_log_callback(level, phase, message))
-            except Exception:
-                pass  # Silently ignore logging errors
+                if progress is not None:
+                    await convex.update_composition_progress(job_id, progress, phase)
 
         sil = SubjectIntelligenceLayer(
             api_key=api_key,
             mav_config=sil_mav_config,
             tavily_api_key=tavily_api_key,
-            log_callback=sync_log_callback if convex else None,
+            log_callback=sil_log_callback if convex else None,
         )
 
         if convex:
@@ -1079,19 +1002,28 @@ async def execute_composition(
         # ========================================
         # Phase 2: RGM - Reviewer Generation Module
         # ========================================
+        # Check ablation settings for age and sex
+        age_enabled = getattr(config.ablation, 'age_enabled', True) if config.ablation else True
+        sex_enabled = getattr(config.ablation, 'sex_enabled', True) if config.ablation else True
+
         if convex:
             await convex.update_composition_progress(job_id, 50, "RGM")
+            if age_enabled:
+                age_info = f"age: {config.reviewer_profile.age_range}"
+            else:
+                age_info = "age: disabled (ablation)"
             await convex.add_log(
                 job_id,
                 "INFO",
                 "RGM",
-                f"Generating reviewer profiles (age: {config.reviewer_profile.age_range})",
+                f"Generating reviewer profiles ({age_info})",
             )
 
         # Reviewers context contains ONLY the specs/distribution
+        # Respect ablation settings: None for age_range if disabled, 100% unspecified for sex if disabled
         reviewers_context = {
-            "age_range": config.reviewer_profile.age_range,
-            "sex_distribution": config.reviewer_profile.sex_distribution,
+            "age_range": config.reviewer_profile.age_range if age_enabled else None,
+            "sex_distribution": config.reviewer_profile.sex_distribution if sex_enabled else {"male": 0.0, "female": 0.0, "unspecified": 1.0},
             "additional_context": config.reviewer_profile.additional_context,
             "review_count": config.generation.count,
         }
@@ -1186,18 +1118,87 @@ async def health():
     return {"status": "healthy"}
 
 
+class ValidateApiKeyRequest(BaseModel):
+    apiKey: str
+
+
+@app.post("/api/validate/openrouter")
+async def validate_openrouter(request: ValidateApiKeyRequest):
+    """Validate OpenRouter API key by making a test request."""
+    if not request.apiKey:
+        return {"valid": False, "error": "No API key provided"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {request.apiKey}"},
+            )
+            if response.status_code == 200:
+                return {"valid": True}
+            elif response.status_code == 401:
+                return {"valid": False, "error": "Invalid API key"}
+            else:
+                return {"valid": False, "error": f"HTTP {response.status_code}"}
+    except httpx.TimeoutException:
+        return {"valid": False, "error": "Request timeout"}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
+@app.post("/api/validate/tavily")
+async def validate_tavily(request: ValidateApiKeyRequest):
+    """Validate Tavily API key by making a test request."""
+    if not request.apiKey:
+        return {"valid": False, "error": "No API key provided"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Tavily uses POST with api_key in body
+            response = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": request.apiKey,
+                    "query": "test",
+                    "max_results": 1,
+                },
+            )
+            if response.status_code == 200:
+                return {"valid": True}
+            elif response.status_code == 401 or response.status_code == 403:
+                return {"valid": False, "error": "Invalid API key"}
+            else:
+                # Check if error message indicates invalid key
+                try:
+                    data = response.json()
+                    if "error" in data:
+                        return {"valid": False, "error": data["error"]}
+                except Exception:
+                    pass
+                return {"valid": False, "error": f"HTTP {response.status_code}"}
+    except httpx.TimeoutException:
+        return {"valid": False, "error": "Request timeout"}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
 @app.post("/api/run-job")
 async def run_job(request: JobRequest, background_tasks: BackgroundTasks):
-    """Start a pipeline job in the background."""
+    """Start a pipeline job in the background (legacy endpoint - use /api/run-pipeline instead)."""
     background_tasks.add_task(
         execute_pipeline,
         request.jobId,
         request.jobName,
         request.config,
+        ["composition", "generation", "evaluation"],  # Default phases
         request.apiKey,
+        None,  # tavily_api_key
         request.jobsDirectory,
         request.convexUrl,
         request.convexToken,
+        None,  # evaluation_config
+        None,  # dataset_file
+        None,  # reused_from_job_dir
     )
     return {"status": "started", "jobId": request.jobId}
 
@@ -1363,29 +1364,19 @@ async def execute_composition_simple(
         max_queries=mav_max_queries,
     )
 
-    # Create log callback that sends SIL logs to Convex
-    async def sil_log_callback(level: str, phase: str, message: str):
+    # Create async log callback that sends SIL logs to Convex (with optional progress)
+    async def sil_log_callback(level: str, phase: str, message: str, progress: int = None):
         if convex:
             await convex.add_log(job_id, level, phase, message)
-
-    def sync_log_callback(level: str, phase: str, message: str):
-        """Synchronous wrapper for the async log callback."""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(sil_log_callback(level, phase, message))
-            else:
-                loop.run_until_complete(sil_log_callback(level, phase, message))
-        except Exception:
-            pass  # Silently ignore logging errors
+            if progress is not None:
+                await convex.update_composition_progress(job_id, progress, phase)
 
     # Initialize SIL with MAV config and log callback
     sil = SubjectIntelligenceLayer(
         api_key=api_key,
         mav_config=sil_mav_config,
         tavily_api_key=tavily_api_key,
-        log_callback=sync_log_callback if convex else None,
+        log_callback=sil_log_callback if convex else None,
     )
 
     # Gather intelligence (this runs MAV if enabled)
@@ -1583,11 +1574,16 @@ async def execute_composition_simple(
     # ========================================
     await log_progress("RGM", "Building reviewer specifications...", 60)
 
+    # Check ablation settings for age and sex
+    age_enabled = getattr(config.ablation, 'age_enabled', True) if config.ablation else True
+    sex_enabled = getattr(config.ablation, 'sex_enabled', True) if config.ablation else True
+
     # Reviewers context contains ONLY the specs/distribution, not per-review assignments
     # Per-review assignments are generated during the generation phase
+    # Respect ablation settings: None for age_range if disabled, 100% unspecified for sex if disabled
     reviewers_context = {
-        "age_range": config.reviewer_profile.age_range,
-        "sex_distribution": config.reviewer_profile.sex_distribution,
+        "age_range": config.reviewer_profile.age_range if age_enabled else None,
+        "sex_distribution": config.reviewer_profile.sex_distribution if sex_enabled else {"male": 0.0, "female": 0.0, "unspecified": 1.0},
         "additional_context": config.reviewer_profile.additional_context,
         "review_count": config.generation.count,
     }
@@ -1597,7 +1593,11 @@ async def execute_composition_simple(
     with open(reviewers_context_path, "w") as f:
         json.dump(reviewers_context, f, indent=2)
 
-    await log_progress("RGM", f"Reviewer specs configured (age: {config.reviewer_profile.age_range})", 75)
+    if age_enabled:
+        age_info = f"age: {config.reviewer_profile.age_range}"
+    else:
+        age_info = "age: disabled (ablation)"
+    await log_progress("RGM", f"Reviewer specs configured ({age_info})", 75)
 
     # ========================================
     # Phase 3: ACM - Attributes Composition Module
@@ -1917,10 +1917,10 @@ async def convert_format(request: ConvertFormatRequest):
 
     elif request.source_format == "xml":
         # Parse SemEval XML
-        review_blocks = re.findall(r'<Review\s+rid="([^"]*)">(.*?)</Review>', request.content, re.DOTALL)
+        review_blocks = re.findall(r'<Review\s[^>]*rid="([^"]*)"[^>]*>(.*?)</Review>', request.content, re.DOTALL)
         for rid, block in review_blocks:
             sentences = []
-            sent_blocks = re.findall(r'<sentence\s+id="([^"]*)">(.*?)</sentence>', block, re.DOTALL)
+            sent_blocks = re.findall(r'<sentence\s[^>]*id="([^"]*)"[^>]*>(.*?)</sentence>', block, re.DOTALL)
             if sent_blocks:
                 for sid, sblock in sent_blocks:
                     text_match = re.search(r'<text>(.*?)</text>', sblock, re.DOTALL)
@@ -1933,8 +1933,9 @@ async def convert_format(request: ConvertFormatRequest):
                         target = re.search(r'target="([^"]*)"', attrs)
                         cat = re.search(r'category="([^"]*)"', attrs)
                         pol = re.search(r'polarity="([^"]*)"', attrs)
-                        frm = re.search(r'from="([^"]*)"', attrs)
-                        to = re.search(r'to="([^"]*)"', attrs)
+                        # Support both standard (from/to) and hotel format (target_from/target_to)
+                        frm = re.search(r'\bfrom="([^"]*)"', attrs) or re.search(r'target_from="([^"]*)"', attrs)
+                        to = re.search(r'\bto="([^"]*)"', attrs) or re.search(r'target_to="([^"]*)"', attrs)
                         opinions.append({
                             "target": target.group(1) if target else "NULL",
                             "category": cat.group(1) if cat else "",
@@ -2063,6 +2064,313 @@ async def convert_explicit_to_implicit(request: ConvertExplicitToImplicitRequest
         raise HTTPException(status_code=400, detail=f"Unsupported format: {fmt}")
 
     return {"content": output, "format": fmt}
+
+
+class MergeDatasetsRequest(BaseModel):
+    contents: list[str]
+    format: str  # jsonl, csv, xml
+
+
+@app.post("/api/merge-datasets")
+async def merge_datasets(request: MergeDatasetsRequest):
+    """Merge multiple datasets of the same format into one."""
+    import csv as csv_module
+    import io
+    import json
+    import re
+
+    if len(request.contents) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 files required to merge")
+
+    fmt = request.format
+    all_reviews = []
+
+    for content in request.contents:
+        if fmt == "jsonl":
+            for line in content.strip().split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    all_reviews.append(json.loads(line))
+                except Exception:
+                    continue
+
+        elif fmt == "csv":
+            reader = csv_module.DictReader(io.StringIO(content))
+            review_map = {}
+            for row in reader:
+                rid = row.get("review_id", "0")
+                sid = row.get("sentence_id", f"{rid}:0")
+                if rid not in review_map:
+                    review_map[rid] = {"id": rid, "sentences": {}}
+                if sid not in review_map[rid]["sentences"]:
+                    review_map[rid]["sentences"][sid] = {"id": sid, "text": row.get("text", ""), "opinions": []}
+                review_map[rid]["sentences"][sid]["opinions"].append({
+                    "target": row.get("target", "NULL"),
+                    "category": row.get("category", ""),
+                    "polarity": row.get("polarity", "neutral"),
+                    "from": int(row.get("from", 0)),
+                    "to": int(row.get("to", 0)),
+                })
+            for rid, rdata in review_map.items():
+                all_reviews.append({"id": rid, "sentences": list(rdata["sentences"].values())})
+
+        elif fmt == "xml":
+            review_blocks = re.findall(r'<Review\s[^>]*rid="([^"]*)"[^>]*>(.*?)</Review>', content, re.DOTALL)
+            for rid, block in review_blocks:
+                sentences = []
+                sent_blocks = re.findall(r'<sentence\s[^>]*id="([^"]*)"[^>]*>(.*?)</sentence>', block, re.DOTALL)
+                for sid, sblock in sent_blocks:
+                    text_match = re.search(r'<text>(.*?)</text>', sblock, re.DOTALL)
+                    text = text_match.group(1) if text_match else ""
+                    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+                    opinions = []
+                    for op_match in re.finditer(r'<Opinion\s+([^/]*)/>', sblock):
+                        attrs = op_match.group(1)
+                        target = re.search(r'target="([^"]*)"', attrs)
+                        cat = re.search(r'category="([^"]*)"', attrs)
+                        pol = re.search(r'polarity="([^"]*)"', attrs)
+                        # Support both standard (from/to) and hotel format (target_from/target_to)
+                        frm = re.search(r'\bfrom="([^"]*)"', attrs) or re.search(r'target_from="([^"]*)"', attrs)
+                        to = re.search(r'\bto="([^"]*)"', attrs) or re.search(r'target_to="([^"]*)"', attrs)
+                        opinions.append({
+                            "target": target.group(1) if target else "NULL",
+                            "category": cat.group(1) if cat else "",
+                            "polarity": pol.group(1) if pol else "neutral",
+                            "from": int(frm.group(1)) if frm else 0,
+                            "to": int(to.group(1)) if to else 0,
+                        })
+                    sentences.append({"id": sid, "text": text, "opinions": opinions})
+                all_reviews.append({"id": rid, "sentences": sentences})
+
+    if not all_reviews:
+        raise HTTPException(status_code=400, detail="No reviews parsed from source files")
+
+    # Re-assign unique IDs to avoid duplicates
+    for i, review in enumerate(all_reviews):
+        review["id"] = str(i + 1)
+        for j, sent in enumerate(review.get("sentences", [])):
+            sent["id"] = f"{review['id']}:{j}"
+
+    # Output in the same format
+    output = ""
+    if fmt == "jsonl":
+        lines = [json.dumps(r, ensure_ascii=False) for r in all_reviews]
+        output = "\n".join(lines) + "\n"
+
+    elif fmt == "csv":
+        sio = io.StringIO()
+        writer = csv_module.writer(sio)
+        writer.writerow(["review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"])
+        for review in all_reviews:
+            for sent in review.get("sentences", []):
+                for op in sent.get("opinions", []):
+                    writer.writerow([
+                        review["id"],
+                        sent.get("id", ""),
+                        sent["text"],
+                        op.get("target", "NULL"),
+                        op.get("category", ""),
+                        op.get("polarity", "neutral"),
+                        op.get("from", 0),
+                        op.get("to", 0),
+                    ])
+        output = sio.getvalue()
+
+    elif fmt == "xml":
+        xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', '<Reviews>']
+        for review in all_reviews:
+            xml_lines.append(f'  <Review rid="{review["id"]}">')
+            xml_lines.append('    <sentences>')
+            for sent in review.get("sentences", []):
+                text_escaped = sent["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                xml_lines.append(f'      <sentence id="{sent.get("id", "")}">')
+                xml_lines.append(f'        <text>{text_escaped}</text>')
+                xml_lines.append('        <Opinions>')
+                for op in sent.get("opinions", []):
+                    target_escaped = op.get("target", "NULL").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                    xml_lines.append(f'          <Opinion target="{target_escaped}" category="{op.get("category", "")}" polarity="{op.get("polarity", "neutral")}" from="{op.get("from", 0)}" to="{op.get("to", 0)}" />')
+                xml_lines.append('        </Opinions>')
+                xml_lines.append('      </sentence>')
+            xml_lines.append('    </sentences>')
+            xml_lines.append('  </Review>')
+        xml_lines.append('</Reviews>')
+        output = "\n".join(xml_lines) + "\n"
+
+    return {
+        "content": output,
+        "format": fmt,
+        "total_records": len(all_reviews),
+        "files_merged": len(request.contents),
+    }
+
+
+class SubsampleDatasetRequest(BaseModel):
+    content: str
+    format: str  # jsonl, csv, xml
+    mode: str  # "equal" or "custom"
+    num_splits: int | None = 2
+    split_sizes: list[int] | None = None
+
+
+@app.post("/api/subsample-dataset")
+async def subsample_dataset(request: SubsampleDatasetRequest):
+    """Split a dataset into smaller non-overlapping subsets."""
+    import csv as csv_module
+    import io
+    import json
+    import random
+    import re
+
+    content = request.content
+    fmt = request.format
+
+    # Parse the dataset
+    reviews = []
+
+    if fmt == "jsonl":
+        for line in content.strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                reviews.append(json.loads(line))
+            except Exception:
+                continue
+
+    elif fmt == "csv":
+        reader = csv_module.DictReader(io.StringIO(content))
+        review_map = {}
+        for row in reader:
+            rid = row.get("review_id", "0")
+            sid = row.get("sentence_id", f"{rid}:0")
+            if rid not in review_map:
+                review_map[rid] = {"id": rid, "sentences": {}}
+            if sid not in review_map[rid]["sentences"]:
+                review_map[rid]["sentences"][sid] = {"id": sid, "text": row.get("text", ""), "opinions": []}
+            review_map[rid]["sentences"][sid]["opinions"].append({
+                "target": row.get("target", "NULL"),
+                "category": row.get("category", ""),
+                "polarity": row.get("polarity", "neutral"),
+                "from": int(row.get("from", 0)),
+                "to": int(row.get("to", 0)),
+            })
+        for rid, rdata in review_map.items():
+            reviews.append({"id": rid, "sentences": list(rdata["sentences"].values())})
+
+    elif fmt == "xml":
+        review_blocks = re.findall(r'<Review\s[^>]*rid="([^"]*)"[^>]*>(.*?)</Review>', content, re.DOTALL)
+        for rid, block in review_blocks:
+            sentences = []
+            sent_blocks = re.findall(r'<sentence\s[^>]*id="([^"]*)"[^>]*>(.*?)</sentence>', block, re.DOTALL)
+            for sid, sblock in sent_blocks:
+                text_match = re.search(r'<text>(.*?)</text>', sblock, re.DOTALL)
+                text = text_match.group(1) if text_match else ""
+                text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+                opinions = []
+                for op_match in re.finditer(r'<Opinion\s+([^/]*)/>', sblock):
+                    attrs = op_match.group(1)
+                    target = re.search(r'target="([^"]*)"', attrs)
+                    cat = re.search(r'category="([^"]*)"', attrs)
+                    pol = re.search(r'polarity="([^"]*)"', attrs)
+                    # Support both standard (from/to) and hotel format (target_from/target_to)
+                    frm = re.search(r'\bfrom="([^"]*)"', attrs) or re.search(r'target_from="([^"]*)"', attrs)
+                    to = re.search(r'\bto="([^"]*)"', attrs) or re.search(r'target_to="([^"]*)"', attrs)
+                    opinions.append({
+                        "target": target.group(1) if target else "NULL",
+                        "category": cat.group(1) if cat else "",
+                        "polarity": pol.group(1) if pol else "neutral",
+                        "from": int(frm.group(1)) if frm else 0,
+                        "to": int(to.group(1)) if to else 0,
+                    })
+                sentences.append({"id": sid, "text": text, "opinions": opinions})
+            reviews.append({"id": rid, "sentences": sentences})
+
+    if not reviews:
+        raise HTTPException(status_code=400, detail="No reviews parsed from content")
+
+    total_records = len(reviews)
+
+    # Shuffle for random distribution
+    random.shuffle(reviews)
+
+    # Determine split sizes
+    if request.mode == "equal":
+        num_splits = request.num_splits or 2
+        base_size = total_records // num_splits
+        remainder = total_records % num_splits
+        sizes = [base_size + (1 if i < remainder else 0) for i in range(num_splits)]
+    else:  # custom
+        sizes = request.split_sizes or [100, 100]
+        if sum(sizes) > total_records:
+            raise HTTPException(status_code=400, detail=f"Requested {sum(sizes)} records but only {total_records} available")
+
+    # Create splits
+    splits = []
+    offset = 0
+    for i, size in enumerate(sizes):
+        split_reviews = reviews[offset:offset + size]
+        offset += size
+
+        # Re-assign IDs within split
+        for j, review in enumerate(split_reviews):
+            review["id"] = str(j + 1)
+            for k, sent in enumerate(review.get("sentences", [])):
+                sent["id"] = f"{review['id']}:{k}"
+
+        # Serialize to format
+        if fmt == "jsonl":
+            split_content = "\n".join([json.dumps(r, ensure_ascii=False) for r in split_reviews]) + "\n"
+
+        elif fmt == "csv":
+            sio = io.StringIO()
+            writer = csv_module.writer(sio)
+            writer.writerow(["review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"])
+            for review in split_reviews:
+                for sent in review.get("sentences", []):
+                    for op in sent.get("opinions", []):
+                        writer.writerow([
+                            review["id"],
+                            sent.get("id", ""),
+                            sent["text"],
+                            op.get("target", "NULL"),
+                            op.get("category", ""),
+                            op.get("polarity", "neutral"),
+                            op.get("from", 0),
+                            op.get("to", 0),
+                        ])
+            split_content = sio.getvalue()
+
+        elif fmt == "xml":
+            xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', '<Reviews>']
+            for review in split_reviews:
+                xml_lines.append(f'  <Review rid="{review["id"]}">')
+                xml_lines.append('    <sentences>')
+                for sent in review.get("sentences", []):
+                    text_escaped = sent["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                    xml_lines.append(f'      <sentence id="{sent.get("id", "")}">')
+                    xml_lines.append(f'        <text>{text_escaped}</text>')
+                    xml_lines.append('        <Opinions>')
+                    for op in sent.get("opinions", []):
+                        target_escaped = op.get("target", "NULL").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                        xml_lines.append(f'          <Opinion target="{target_escaped}" category="{op.get("category", "")}" polarity="{op.get("polarity", "neutral")}" from="{op.get("from", 0)}" to="{op.get("to", 0)}" />')
+                    xml_lines.append('        </Opinions>')
+                    xml_lines.append('      </sentence>')
+                xml_lines.append('    </sentences>')
+                xml_lines.append('  </Review>')
+            xml_lines.append('</Reviews>')
+            split_content = "\n".join(xml_lines) + "\n"
+
+        splits.append({
+            "name": f"split-{i + 1}",
+            "content": split_content,
+            "count": len(split_reviews),
+        })
+
+    return {
+        "splits": splits,
+        "format": fmt,
+        "total_records": total_records,
+    }
 
 
 class ExportRequest(BaseModel):
@@ -2196,6 +2504,7 @@ async def execute_generation(
     api_key: str,
     convex_url: Optional[str],
     convex_token: Optional[str],
+    should_complete_job: bool = True,  # Set to False when called from pipeline (evaluation will complete)
 ) -> dict:
     """
     Execute the GENERATION phase of the CERA pipeline.
@@ -2257,8 +2566,10 @@ async def execute_generation(
         # ========================================
 
         # RGM for generating reviewer profiles
+        # age_range can be None if age ablation is disabled
+        age_range = reviewers_context.get("age_range")
         rgm = ReviewerGenerationModule(
-            age_range=tuple(reviewers_context["age_range"]),
+            age_range=tuple(age_range) if age_range else None,
             sex_distribution=reviewers_context["sex_distribution"],
             additional_context=reviewers_context.get("additional_context"),
         )
@@ -3021,11 +3332,15 @@ Requirements:
             if malformed_count > 0:
                 await convex.add_log(job_id, "WARN", "Summary", f"Malformed JSON: {malformed_count} reviews fell back to plain text")
 
-            # Polarity breakdown of actual generated reviews
+            # Polarity breakdown of actual generated reviews (from sentences)
             pol_counts = {"positive": 0, "neutral": 0, "negative": 0}
             for r in reviews:
-                pol = r["assigned"]["polarity"]
-                pol_counts[pol] = pol_counts.get(pol, 0) + 1
+                # Count sentence-level polarities from structured data
+                for sent in r.get("sentences", []):
+                    for op in sent.get("opinions", []):
+                        pol = op.get("polarity", "").lower()
+                        if pol in pol_counts:
+                            pol_counts[pol] += 1
 
             await convex.add_log(
                 job_id, "INFO", "Summary",
@@ -3034,7 +3349,9 @@ Requirements:
             await convex.add_log(job_id, "INFO", "Summary", f"Output: {dataset_path}")
             await convex.add_log(job_id, "INFO", "Summary", "=" * 40)
 
-            await convex.complete_job(job_id)
+            # Only complete job if this is a standalone generation (not part of pipeline)
+            if should_complete_job:
+                await convex.complete_job(job_id)
 
         print(f"[Generation] Complete! {generated_count} reviews saved to {dataset_path} in {elapsed_str}")
 
@@ -3213,10 +3530,15 @@ async def create_contexts_only(request: CreateContextsOnlyRequest):
         request.jobsDirectory, request.jobId, request.jobName
     )
 
+    # Check ablation settings for age and sex
+    age_enabled = getattr(request.config.ablation, 'age_enabled', True) if request.config.ablation else True
+    sex_enabled = getattr(request.config.ablation, 'sex_enabled', True) if request.config.ablation else True
+
     # RGM: Save reviewer context (just the distribution specs)
+    # Respect ablation settings: None for age_range if disabled, 100% unspecified for sex if disabled
     reviewers_context = {
-        "age_range": request.config.reviewer_profile.age_range,
-        "sex_distribution": request.config.reviewer_profile.sex_distribution,
+        "age_range": request.config.reviewer_profile.age_range if age_enabled else None,
+        "sex_distribution": request.config.reviewer_profile.sex_distribution if sex_enabled else {"male": 0.0, "female": 0.0, "unspecified": 1.0},
         "additional_context": request.config.reviewer_profile.additional_context,
         "review_count": request.config.generation.count if request.config.generation else 1000,
     }
@@ -3256,11 +3578,25 @@ async def create_contexts_only(request: CreateContextsOnlyRequest):
     }
 
 
+class HeuristicConfig(BaseModel):
+    """Configuration for heuristic (baseline) prompting method."""
+    prompt: str
+    useFormatPrompt: Optional[bool] = True  # Whether to append format instructions
+    formatPrompt: Optional[str] = None  # Custom format prompt (ABSA JSON instructions)
+    targetMode: str  # "reviews" or "sentences"
+    targetValue: int
+    reviewsPerBatch: int
+    avgSentencesPerReview: int
+    model: str
+    outputFormat: str  # "semeval_xml", "jsonl", "csv"
+    totalRuns: int = 1  # Number of times to run generation (for research variability assessment)
+
+
 class PipelineRequest(BaseModel):
     """Request to run the full pipeline (selected phases sequentially)."""
     jobId: str
     jobName: str
-    config: JobConfig
+    config: Optional[JobConfig] = None  # Optional for heuristic method (which doesn't use CERA config)
     phases: list[str]  # ["composition", "generation", "evaluation"]
     apiKey: str
     tavilyApiKey: Optional[str] = None
@@ -3270,12 +3606,518 @@ class PipelineRequest(BaseModel):
     evaluationConfig: Optional[dict] = None
     datasetFile: Optional[str] = None  # For EVAL-only jobs
     reusedFromJobDir: Optional[str] = None  # Source job directory for composition reuse
+    # Heuristic method fields (RQ1 baseline)
+    method: str = "cera"  # "cera" or "heuristic"
+    heuristicConfig: Optional[HeuristicConfig] = None
+
+
+async def execute_heuristic_pipeline(
+    job_id: str,
+    job_name: str,
+    heuristic_config: HeuristicConfig,
+    api_key: str,
+    jobs_directory: str,
+    convex_url: Optional[str],
+    convex_token: Optional[str],
+    evaluation_config: Optional[dict],
+):
+    """
+    Execute heuristic (baseline) pipeline for RQ1 comparison.
+
+    Unlike CERA, this skips composition and uses direct LLM prompting.
+    - No SIL (web search grounding)
+    - No MAV (multi-agent verification)
+    - No RGM (demographic sampling)
+    - No noise injection
+    - Just batched LLM calls with prompt template
+    """
+    import json
+    import math
+    import re
+    from pathlib import Path
+
+    convex = None
+    if convex_url and convex_token:
+        convex = ConvexClient(convex_url, convex_token)
+
+    try:
+        # Create job directory
+        job_paths = create_job_directory(jobs_directory, job_id, job_name)
+
+        # Multi-run support
+        total_runs = heuristic_config.totalRuns if heuristic_config.totalRuns else 1
+        all_run_metrics = []  # Collect metrics from each run for averaging
+
+        if convex:
+            if total_runs > 1:
+                await convex.add_log(job_id, "INFO", "Heuristic", f"Starting heuristic generation pipeline ({total_runs} runs)...")
+            else:
+                await convex.add_log(job_id, "INFO", "Heuristic", "Starting heuristic generation pipeline...")
+
+        # Calculate total reviews and batches
+        if heuristic_config.targetMode == "reviews":
+            total_reviews = heuristic_config.targetValue
+        else:  # sentences mode
+            total_reviews = math.ceil(heuristic_config.targetValue / heuristic_config.avgSentencesPerReview)
+
+        total_batches = math.ceil(total_reviews / heuristic_config.reviewsPerBatch)
+
+        if convex:
+            await convex.add_log(job_id, "INFO", "Heuristic", f"Target: {total_reviews} reviews in {total_batches} batches")
+
+        # Inject variables into prompt template
+        prompt = heuristic_config.prompt
+        prompt = prompt.replace("{review_count}", str(heuristic_config.reviewsPerBatch))
+        prompt = prompt.replace("{avg_sentences}", str(heuristic_config.avgSentencesPerReview))
+        # Calculate sentence count for this batch (reviews_per_batch * avg_sentences)
+        batch_sentence_count = heuristic_config.reviewsPerBatch * heuristic_config.avgSentencesPerReview
+        prompt = prompt.replace("{sentence_count}", str(batch_sentence_count))
+
+        # Append JSON format instructions for ABSA format (if enabled)
+        use_format_prompt = heuristic_config.useFormatPrompt if heuristic_config.useFormatPrompt is not None else True
+
+        if use_format_prompt:
+            # Use custom format prompt if provided, otherwise use default
+            if heuristic_config.formatPrompt:
+                prompt += "\n\n" + heuristic_config.formatPrompt
+            else:
+                # Default ABSA format instructions
+                prompt += """
+
+Return your response as a JSON array with ABSA (Aspect-Based Sentiment Analysis) format.
+Each review should have sentences, and each sentence should have aspect-level opinions.
+
+Structure:
+[
+  {
+    "sentences": [
+      {
+        "text": "The food was delicious and fresh.",
+        "opinions": [
+          {"target": "food", "category": "FOOD#QUALITY", "polarity": "positive", "from": 4, "to": 8}
+        ]
+      },
+      {
+        "text": "However, the service was quite slow.",
+        "opinions": [
+          {"target": "service", "category": "SERVICE#GENERAL", "polarity": "negative", "from": 13, "to": 20}
+        ]
+      }
+    ]
+  },
+  ...
+]
+
+Rules:
+- "text": The sentence text (non-empty string)
+- "target": The aspect term as it appears in the text (exact substring)
+- "category": Use categories mentioned in the prompt above
+- "polarity": One of "positive", "negative", "neutral"
+- "from": Character offset where target starts in the text (0-indexed)
+- "to": Character offset where target ends (exclusive)
+
+Important:
+- The "from" and "to" must be accurate character positions for the target substring
+- A sentence can have multiple opinions about different aspects
+- A sentence can have zero opinions if it's neutral/general
+Return ONLY the JSON array, no other text, no markdown code blocks."""
+
+        # Multi-run loop
+        for current_run in range(1, total_runs + 1):
+            # Update run progress in Convex
+            if convex and total_runs > 1:
+                await convex.update_current_run(job_id, current_run, total_runs)
+                await convex.add_log(job_id, "INFO", "Heuristic", f"Starting run {current_run}/{total_runs}...")
+                # Reset progress for this run
+                await convex.run_mutation("jobs:updateHeuristicProgress", {
+                    "jobId": job_id,
+                    "currentBatch": 0,
+                    "totalBatches": total_batches,
+                    "reviewsCollected": 0,
+                })
+
+            all_reviews = []
+
+            # Batch generation loop
+            for batch_num in range(1, total_batches + 1):
+                if convex:
+                    await convex.add_log(job_id, "INFO", "Heuristic", f"Generating batch {batch_num}/{total_batches}...")
+                    await convex.run_mutation("jobs:updateHeuristicProgress", {
+                        "jobId": job_id,
+                        "currentBatch": batch_num,
+                        "totalBatches": total_batches,
+                        "reviewsCollected": len(all_reviews),
+                    })
+
+                # Call LLM
+                retries = 0
+                max_retries = 3
+                batch_reviews = []
+
+                while retries < max_retries:
+                    try:
+                        from cera.llm.openrouter import OpenRouterClient
+
+                        llm = OpenRouterClient(api_key=api_key)
+                        content = await llm.chat(
+                            model=heuristic_config.model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.8,
+                            max_tokens=8192,
+                        )
+
+                        # Try to extract JSON array from response
+                        # Remove markdown code blocks if present
+                        content = re.sub(r'```json\s*', '', content)
+                        content = re.sub(r'```\s*', '', content)
+                        content = content.strip()
+
+                        print(f"[Heuristic] Batch {batch_num} raw content length: {len(content)}")
+                        print(f"[Heuristic] Batch {batch_num} content preview: {content[:500]}...")
+
+                        batch_reviews = json.loads(content)
+
+                        if not isinstance(batch_reviews, list):
+                            raise ValueError("Response is not a JSON array")
+
+                        print(f"[Heuristic] Batch {batch_num} parsed {len(batch_reviews)} reviews")
+                        break  # Success
+
+                    except (json.JSONDecodeError, ValueError, KeyError) as e:
+                        retries += 1
+                        print(f"[Heuristic] Batch {batch_num} parse error: {str(e)[:200]}")
+                        print(f"[Heuristic] Content was: {content[:300] if 'content' in dir() else 'N/A'}...")
+                        if convex:
+                            await convex.add_log(job_id, "WARN", "Heuristic", f"Batch {batch_num} parse error (retry {retries}/{max_retries}): {str(e)[:100]}")
+                        if retries >= max_retries:
+                            if convex:
+                                await convex.add_log(job_id, "ERROR", "Heuristic", f"Batch {batch_num} failed after {max_retries} retries")
+                            batch_reviews = []
+
+                # Add batch reviews with IDs (handle both simple and ABSA formats)
+                for i, review in enumerate(batch_reviews):
+                    review_id = f"{job_id}-{len(all_reviews):05d}"
+
+                    # Check if review is in ABSA format (has sentences) or simple format (has text)
+                    if "sentences" in review:
+                        # ABSA format - keep as-is with proper structure
+                        all_reviews.append({
+                            "id": review_id,
+                            "sentences": review.get("sentences", []),
+                            "method": "heuristic",
+                            "batch": batch_num,
+                        })
+                    else:
+                        # Simple format - convert to ABSA-like structure for compatibility
+                        text = review.get("text", "")
+                        polarity = review.get("polarity", "neutral")
+                        all_reviews.append({
+                            "id": review_id,
+                            "sentences": [{
+                                "text": text,
+                                "opinions": [{
+                                    "target": "NULL",
+                                    "category": "RESTAURANT#GENERAL",
+                                    "polarity": polarity,
+                                    "from": 0,
+                                    "to": 0,
+                                }]
+                            }],
+                            "method": "heuristic",
+                            "batch": batch_num,
+                        })
+
+            if convex:
+                if total_runs > 1:
+                    await convex.add_log(job_id, "INFO", "Heuristic", f"Run {current_run}/{total_runs} complete. Reviews: {len(all_reviews)}")
+                else:
+                    await convex.add_log(job_id, "INFO", "Heuristic", f"Generation complete. Total reviews: {len(all_reviews)}")
+                await convex.run_mutation("jobs:completeHeuristicGeneration", {
+                    "jobId": job_id,
+                    "reviewsCollected": len(all_reviews),
+                })
+
+            # Save dataset in both explicit and implicit formats
+            dataset_dir = Path(job_paths["dataset"])
+
+            # Run suffix for multi-run
+            run_suffix = f"-run{current_run}" if total_runs > 1 else ""
+
+            def save_absa_dataset(reviews, mode_suffix: str, implicit: bool = False):
+                """Save dataset in ABSA format, optionally converting to implicit (NULL targets)."""
+                output_format = heuristic_config.outputFormat
+
+                # Create copies for implicit if needed
+                if implicit:
+                    import copy
+                    reviews = copy.deepcopy(reviews)
+                    for review in reviews:
+                        for sentence in review.get("sentences", []):
+                            for opinion in sentence.get("opinions", []):
+                                opinion["target"] = "NULL"
+                                opinion["from"] = 0
+                                opinion["to"] = 0
+
+                # Full suffix includes mode and optional run number
+                full_suffix = f"{mode_suffix}{run_suffix}"
+
+                # Save JSONL (always, for internal use)
+                jsonl_path = dataset_dir / f"reviews-{full_suffix}.jsonl"
+                with open(jsonl_path, "w") as f:
+                    for review in reviews:
+                        f.write(json.dumps(review, ensure_ascii=False) + "\n")
+
+                # Save in requested format
+                if output_format == "csv":
+                    import csv as csv_module
+                    csv_path = dataset_dir / f"reviews-{full_suffix}.csv"
+                    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                        writer = csv_module.DictWriter(f, fieldnames=[
+                            "review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"
+                        ])
+                        writer.writeheader()
+                        for review in reviews:
+                            for s_idx, sentence in enumerate(review.get("sentences", [])):
+                                for opinion in sentence.get("opinions", []):
+                                    writer.writerow({
+                                        "review_id": review["id"],
+                                        "sentence_id": f"{review['id']}_{s_idx}",
+                                        "text": sentence.get("text", ""),
+                                        "target": opinion.get("target", "NULL"),
+                                        "category": opinion.get("category", ""),
+                                        "polarity": opinion.get("polarity", "neutral"),
+                                        "from": opinion.get("from", 0),
+                                        "to": opinion.get("to", 0),
+                                    })
+
+                elif output_format == "semeval_xml":
+                    xml_path = dataset_dir / f"reviews-{full_suffix}.xml"
+                    xml_content = ['<?xml version="1.0" encoding="UTF-8"?>', '<Reviews>']
+                    for review in reviews:
+                        xml_content.append(f'  <Review rid="{review["id"]}">')
+                        xml_content.append('    <sentences>')
+                        for s_idx, sentence in enumerate(review.get("sentences", [])):
+                            sent_id = f"{review['id']}:{s_idx}"
+                            xml_content.append(f'      <sentence id="{sent_id}">')
+                            xml_content.append(f'        <text>{escape_xml(sentence.get("text", ""))}</text>')
+                            xml_content.append('        <Opinions>')
+                            for opinion in sentence.get("opinions", []):
+                                target = escape_xml(opinion.get("target", "NULL"))
+                                category = opinion.get("category", "")
+                                polarity = opinion.get("polarity", "neutral")
+                                from_pos = opinion.get("from", 0)
+                                to_pos = opinion.get("to", 0)
+                                xml_content.append(
+                                    f'          <Opinion target="{target}" category="{category}" '
+                                    f'polarity="{polarity}" from="{from_pos}" to="{to_pos}"/>'
+                                )
+                            xml_content.append('        </Opinions>')
+                            xml_content.append('      </sentence>')
+                        xml_content.append('    </sentences>')
+                        xml_content.append('  </Review>')
+                    xml_content.append('</Reviews>')
+                    with open(xml_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(xml_content))
+
+            # Save explicit version (with real targets and offsets)
+            save_absa_dataset(all_reviews, "explicit", implicit=False)
+
+            # Save implicit version (targets=NULL, from=0, to=0)
+            save_absa_dataset(all_reviews, "implicit", implicit=True)
+
+            if convex:
+                await convex.add_log(job_id, "INFO", "Heuristic", f"Dataset saved to {dataset_dir}")
+
+            # ========================================
+            # Run MDQA Evaluation for this run (if configured)
+            # ========================================
+            if evaluation_config and evaluation_config.get("metrics"):
+                if convex:
+                    if current_run == 1:
+                        await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
+                    if total_runs > 1:
+                        await convex.add_log(job_id, "INFO", "MDQA", f"Evaluating run {current_run}/{total_runs}...")
+                    else:
+                        await convex.add_log(job_id, "INFO", "MDQA", "Starting evaluation...")
+
+                metrics_result = {}
+                # Extract all sentence texts from ABSA format reviews
+                review_texts = []
+                for r in all_reviews:
+                    for sentence in r.get("sentences", []):
+                        if sentence.get("text"):
+                            review_texts.append(sentence["text"])
+
+                selected_metrics = evaluation_config.get("metrics", [])
+
+                # Check for reference dataset (for Lexical/Semantic metrics)
+                reference_texts = []
+                reference_metrics_enabled = evaluation_config.get("reference_metrics_enabled", False)
+                reference_required_metrics = {"bleu", "rouge_l", "bertscore", "moverscore"}
+
+                if reference_metrics_enabled:
+                    # Look for reference dataset file in the dataset directory
+                    reference_files = list(dataset_dir.glob("reference_*"))
+                    if reference_files:
+                        reference_file = reference_files[0]
+                        reference_texts, ref_stats = load_texts_from_file(str(reference_file), return_stats=True)
+                        if reference_texts:
+                            print(f"[Heuristic MDQA] Loaded {ref_stats['reviews']} reviews ({ref_stats['sentences']} sentences) from {reference_file.name}")
+                            if convex and current_run == 1:
+                                await convex.add_log(job_id, "INFO", "MDQA", f"Using reference: {reference_file.name} ({ref_stats['reviews']} reviews)")
+                        else:
+                            print(f"[Heuristic MDQA] Warning: Reference file found but empty: {reference_file}")
+                            if convex and current_run == 1:
+                                await convex.add_log(job_id, "WARN", "MDQA", f"Reference file empty: {reference_file.name}")
+                    else:
+                        print("[Heuristic MDQA] Warning: reference_metrics_enabled but no reference file found")
+                        if convex and current_run == 1:
+                            await convex.add_log(job_id, "WARN", "MDQA", "No reference file found - skipping Lexical/Semantic metrics")
+
+                # Filter out reference-requiring metrics if no reference is available
+                use_reference = len(reference_texts) > 0
+                if not use_reference:
+                    skipped = [m for m in selected_metrics if m in reference_required_metrics]
+                    if skipped and current_run == 1:
+                        print(f"[Heuristic MDQA] Skipping metrics (no reference): {', '.join(skipped)}")
+                    selected_metrics = [m for m in selected_metrics if m not in reference_required_metrics]
+
+                if convex and current_run == 1:
+                    await convex.add_log(job_id, "INFO", "MDQA", f"Computing metrics: {', '.join(selected_metrics)}")
+
+                # Compute Lexical metrics (require reference)
+                if use_reference:
+                    if "bleu" in selected_metrics:
+                        metrics_result["bleu"] = compute_bleu_with_reference(review_texts, reference_texts)
+                    if "rouge_l" in selected_metrics:
+                        metrics_result["rouge_l"] = compute_rouge_l_with_reference(review_texts, reference_texts)
+
+                # Compute Semantic metrics (require reference)
+                if use_reference:
+                    if "bertscore" in selected_metrics:
+                        metrics_result["bertscore"] = compute_bertscore_with_reference(review_texts, reference_texts)
+                    if "moverscore" in selected_metrics:
+                        metrics_result["moverscore"] = compute_moverscore_with_reference(review_texts, reference_texts)
+
+                # Compute Diversity metrics (always available)
+                if "distinct_1" in selected_metrics:
+                    metrics_result["distinct_1"] = compute_distinct_n(review_texts, 1)
+                if "distinct_2" in selected_metrics:
+                    metrics_result["distinct_2"] = compute_distinct_n(review_texts, 2)
+                if "self_bleu" in selected_metrics:
+                    metrics_result["self_bleu"] = compute_self_bleu(review_texts)
+
+                # Convert numpy types to Python floats for JSON serialization
+                def ensure_python_float(val):
+                    if val is None:
+                        return None
+                    try:
+                        return float(val)
+                    except (TypeError, ValueError):
+                        return val
+
+                metrics_result = {k: ensure_python_float(v) for k, v in metrics_result.items()}
+
+                # Save per-run metrics
+                metrics_suffix = f"-run{current_run}" if total_runs > 1 else ""
+                metrics_path = Path(job_paths["metrics"]) / f"mdqa_metrics{metrics_suffix}.json"
+                with open(metrics_path, "w") as f:
+                    json.dump(metrics_result, f, indent=2)
+
+                # Collect metrics for averaging
+                all_run_metrics.append(metrics_result)
+
+                # Save per-run metrics to Convex for multi-run
+                if total_runs > 1 and convex:
+                    try:
+                        per_run_metrics = {
+                            k: float(round(float(v), 6))
+                            for k, v in metrics_result.items()
+                            if v is not None and k in ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                        }
+                        await convex.run_mutation("jobs:savePerRunMetrics", {
+                            "jobId": job_id,
+                            "run": current_run,
+                            "datasetFile": f"reviews-explicit{run_suffix}.jsonl",
+                            "metrics": per_run_metrics,
+                        })
+                    except Exception as e:
+                        print(f"[Heuristic] Warning: Could not save run {current_run} metrics: {e}")
+
+        # End of multi-run loop
+
+        # ========================================
+        # Compute average metrics (for multi-run)
+        # ========================================
+        if total_runs > 1 and len(all_run_metrics) > 1 and evaluation_config and evaluation_config.get("metrics"):
+            import numpy as np
+
+            avg_metrics = {}
+            for key in all_run_metrics[0].keys():
+                values = [m.get(key) for m in all_run_metrics if m.get(key) is not None]
+                if values:
+                    try:
+                        values_array = np.array([float(v) for v in values])
+                        avg_metrics[key] = float(round(np.mean(values_array), 6))
+                        avg_metrics[f"{key}_std"] = float(round(np.std(values_array), 6))
+                    except (TypeError, ValueError):
+                        avg_metrics[key] = values[0]
+
+            if convex:
+                await convex.run_mutation("jobs:setEvaluationMetrics", {
+                    "jobId": job_id,
+                    "evaluationMetrics": avg_metrics,
+                })
+                await convex.add_log(job_id, "INFO", "MDQA", f"Evaluation complete - averaged {len(all_run_metrics)} runs.")
+
+            # Save average metrics to file
+            avg_metrics_path = Path(job_paths["metrics"]) / "mdqa_metrics_average.json"
+            with open(avg_metrics_path, "w") as f:
+                json.dump(avg_metrics, f, indent=2)
+
+        elif len(all_run_metrics) == 1:
+            # Single run - store metrics directly
+            if convex:
+                await convex.run_mutation("jobs:setEvaluationMetrics", {
+                    "jobId": job_id,
+                    "evaluationMetrics": all_run_metrics[0],
+                })
+                await convex.add_log(job_id, "INFO", "MDQA", f"Evaluation complete: {len(all_run_metrics[0])} metrics computed")
+
+        # Mark job as completed
+        if convex:
+            await convex.run_mutation("jobs:complete", {"jobId": job_id})
+            if total_runs > 1:
+                await convex.add_log(job_id, "INFO", "Heuristic", f"Pipeline complete! ({total_runs} runs)")
+            else:
+                await convex.add_log(job_id, "INFO", "Heuristic", "Pipeline complete!")
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Heuristic pipeline failed: {str(e)}"
+        print(f"[Heuristic] Error: {error_msg}")
+        print(traceback.format_exc())
+        if convex:
+            await convex.run_mutation("jobs:setFailed", {
+                "jobId": job_id,
+                "error": error_msg,
+            })
+
+
+def escape_xml(text: str) -> str:
+    """Escape special XML characters."""
+    return (text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;"))
 
 
 async def execute_pipeline(
     job_id: str,
     job_name: str,
-    config: JobConfig,
+    config: Optional[JobConfig],  # Optional for heuristic method
     phases: list[str],
     api_key: str,
     tavily_api_key: Optional[str],
@@ -3285,6 +4127,8 @@ async def execute_pipeline(
     evaluation_config: Optional[dict],
     dataset_file: Optional[str],
     reused_from_job_dir: Optional[str] = None,
+    method: str = "cera",
+    heuristic_config: Optional[HeuristicConfig] = None,
 ):
     """Execute selected pipeline phases sequentially."""
     from pathlib import Path
@@ -3292,6 +4136,22 @@ async def execute_pipeline(
     convex = None
     if convex_url and convex_token:
         convex = ConvexClient(convex_url, convex_token)
+
+    # ========================================
+    # HEURISTIC METHOD (RQ1 Baseline)
+    # ========================================
+    if method == "heuristic" and heuristic_config:
+        await execute_heuristic_pipeline(
+            job_id=job_id,
+            job_name=job_name,
+            heuristic_config=heuristic_config,
+            api_key=api_key,
+            jobs_directory=jobs_directory,
+            convex_url=convex_url,
+            convex_token=convex_token,
+            evaluation_config=evaluation_config,
+        )
+        return  # Heuristic pipeline is complete
 
     try:
         # Get or create job directory
@@ -3367,27 +4227,82 @@ async def execute_pipeline(
                 await convex.add_log(job_id, "INFO", "SIL", "Composition phase complete.")
 
         # ========================================
-        # Phase 2: GENERATION (AML)
+        # Phase 2: GENERATION (AML) - with multi-run support
         # ========================================
         gen_result = None
+        all_run_metrics = []  # Collect metrics from each run for averaging
+        total_runs = config.generation.total_runs if config and config.generation else 1
+
         if "generation" in phases:
+            # Check if job was terminated during composition
+            if convex:
+                job_status = await convex.get_job(job_id)
+                if job_status and job_status.get("status") == "terminated":
+                    print(f"[Pipeline] Job was terminated - skipping generation phase")
+                    await convex.add_log(job_id, "INFO", "Pipeline", "Job terminated - generation phase skipped")
+                    return
+
             if convex:
                 await convex.update_progress(job_id, 30, "AML")
-                await convex.add_log(job_id, "INFO", "AML", "Starting generation phase...")
+                if total_runs > 1:
+                    await convex.add_log(job_id, "INFO", "AML", f"Starting generation phase ({total_runs} runs)...")
+                else:
+                    await convex.add_log(job_id, "INFO", "AML", "Starting generation phase...")
                 # Update status to running
                 await convex.run_mutation("jobs:startGeneration", {"id": job_id})
 
-            gen_result = await execute_generation(
-                job_id=job_id,
-                job_dir=job_paths["root"],
-                config=config,
-                api_key=api_key,
-                convex_url=convex_url,
-                convex_token=convex_token,
-            )
+            # Multi-run loop
+            for current_run in range(1, total_runs + 1):
+                # Update run progress in Convex
+                if convex and total_runs > 1:
+                    await convex.update_current_run(job_id, current_run, total_runs)
+                    await convex.add_log(job_id, "INFO", "AML", f"Starting run {current_run}/{total_runs}...")
+                    # Reset progress for this run
+                    await convex.update_progress(job_id, 30, "AML")
+
+                # Check for termination between runs
+                if convex and current_run > 1:
+                    job_status = await convex.get_job(job_id)
+                    if job_status and job_status.get("status") == "terminated":
+                        print(f"[Pipeline] Job was terminated - stopping at run {current_run-1}")
+                        await convex.add_log(job_id, "INFO", "Pipeline", f"Job terminated after run {current_run-1}")
+                        break
+
+                gen_result = await execute_generation(
+                    job_id=job_id,
+                    job_dir=job_paths["root"],
+                    config=config,
+                    api_key=api_key,
+                    convex_url=convex_url,
+                    convex_token=convex_token,
+                    should_complete_job=False,  # Pipeline handles completion after evaluation
+                )
+
+                # For multi-run: save dataset with run suffix
+                if total_runs > 1 and gen_result and gen_result.get("reviews"):
+                    import shutil
+                    from pathlib import Path
+                    dataset_dir = Path(job_paths["dataset"])
+
+                    # Helper to rename files with run suffix
+                    def rename_with_run_suffix(pattern_base: str, extension: str):
+                        """Rename files like reviews{suffix}.ext to reviews-runN{suffix}.ext"""
+                        for f in dataset_dir.glob(f"{pattern_base}*{extension}"):
+                            # Extract suffix (e.g., "-explicit" from "reviews-explicit.xml")
+                            suffix = f.stem.replace(pattern_base, "")
+                            new_name = f"{pattern_base}-run{current_run}{suffix}{extension}"
+                            shutil.move(str(f), str(dataset_dir / new_name))
+
+                    # Rename all dataset files (JSONL, CSV, XML)
+                    rename_with_run_suffix("reviews", ".jsonl")
+                    rename_with_run_suffix("reviews", ".csv")
+                    rename_with_run_suffix("reviews", ".xml")
 
             if convex:
-                await convex.add_log(job_id, "INFO", "AML", "Generation phase complete.")
+                if total_runs > 1:
+                    await convex.add_log(job_id, "INFO", "AML", f"Generation phase complete ({total_runs} runs).")
+                else:
+                    await convex.add_log(job_id, "INFO", "AML", "Generation phase complete.")
 
             # Compute and store conformity report
             if convex and gen_result and gen_result.get("reviews"):
@@ -3467,44 +4382,133 @@ async def execute_pipeline(
                     print(f"[Pipeline] Warning: Could not compute conformity: {e}")
 
         # ========================================
-        # Phase 3: EVALUATION (MDQA)
+        # Phase 3: EVALUATION (MDQA) - with multi-run support
         # ========================================
         if "evaluation" in phases:
+            # Check if job was terminated during generation
+            if convex:
+                job_status = await convex.get_job(job_id)
+                if job_status and job_status.get("status") == "terminated":
+                    print(f"[Pipeline] Job was terminated - skipping evaluation phase")
+                    await convex.add_log(job_id, "INFO", "Pipeline", "Job terminated - evaluation phase skipped")
+                    return
+
             if convex:
                 await convex.update_progress(job_id, 80, "MDQA")
                 await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
-                await convex.add_log(job_id, "INFO", "MDQA", "Starting evaluation phase...")
+                if total_runs > 1:
+                    await convex.add_log(job_id, "INFO", "MDQA", f"Starting evaluation phase ({total_runs} runs)...")
+                else:
+                    await convex.add_log(job_id, "INFO", "MDQA", "Starting evaluation phase...")
 
-            eval_metrics = await execute_evaluation(
-                job_id=job_id,
-                job_paths=job_paths,
-                evaluation_config=evaluation_config,
-                dataset_file=dataset_file,
-                convex=convex,
-                reviews_data=gen_result.get("reviews") if gen_result else None,
-            )
+            # For multi-run: evaluate each run's dataset and collect metrics
+            if total_runs > 1 and "generation" in phases:
+                import numpy as np
+                from pathlib import Path
+                dataset_dir = Path(job_paths["dataset"])
 
-            if convex:
-                await convex.add_log(job_id, "INFO", "MDQA", "Evaluation phase complete.")
-                # Store evaluation metrics in Convex
-                if eval_metrics:
-                    try:
-                        # Ensure all metrics are Python floats for JSON serialization
-                        serializable_metrics = {}
-                        for k, v in eval_metrics.items():
-                            if v is not None:
+                for eval_run in range(1, total_runs + 1):
+                    # Find any dataset file for this run (JSONL, CSV, or XML - prefer explicit if available)
+                    run_dataset_file = None
+                    for pattern in [
+                        f"reviews-run{eval_run}.jsonl",
+                        f"reviews-run{eval_run}-explicit.jsonl",
+                        f"reviews-run{eval_run}.csv",
+                        f"reviews-run{eval_run}-explicit.csv",
+                        f"reviews-run{eval_run}-explicit.xml",
+                        f"reviews-run{eval_run}.xml",
+                    ]:
+                        candidate = dataset_dir / pattern
+                        if candidate.exists():
+                            run_dataset_file = candidate
+                            break
+
+                    if run_dataset_file:
+                        if convex:
+                            await convex.update_current_run(job_id, eval_run, total_runs)
+                            await convex.add_log(job_id, "INFO", "MDQA", f"Evaluating run {eval_run}/{total_runs} ({run_dataset_file.name})...")
+
+                        eval_metrics = await execute_evaluation(
+                            job_id=job_id,
+                            job_paths=job_paths,
+                            evaluation_config=evaluation_config,
+                            dataset_file=str(run_dataset_file),
+                            convex=convex,
+                            reviews_data=None,  # Load from file
+                        )
+
+                        if eval_metrics:
+                            all_run_metrics.append(eval_metrics)
+                            # Save per-run metrics to Convex
+                            if convex:
                                 try:
-                                    serializable_metrics[k] = float(round(float(v), 6))
-                                except (TypeError, ValueError):
-                                    serializable_metrics[k] = v
-                            else:
-                                serializable_metrics[k] = None
+                                    per_run_metrics = {
+                                        k: float(round(float(v), 6))
+                                        for k, v in eval_metrics.items()
+                                        if v is not None and k in ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                                    }
+                                    await convex.run_mutation("jobs:savePerRunMetrics", {
+                                        "jobId": job_id,
+                                        "run": eval_run,
+                                        "datasetFile": f"reviews-run{eval_run}.jsonl",
+                                        "metrics": per_run_metrics,
+                                    })
+                                except Exception as e:
+                                    print(f"[Pipeline] Warning: Could not save run {eval_run} metrics: {e}")
+
+                # Compute average metrics with standard deviation
+                if len(all_run_metrics) > 1 and convex:
+                    avg_metrics = {}
+                    for key in all_run_metrics[0].keys():
+                        values = [m.get(key) for m in all_run_metrics if m.get(key) is not None]
+                        if values:
+                            try:
+                                values_array = np.array([float(v) for v in values])
+                                avg_metrics[key] = float(round(np.mean(values_array), 6))
+                                avg_metrics[f"{key}_std"] = float(round(np.std(values_array), 6))
+                            except (TypeError, ValueError):
+                                avg_metrics[key] = values[0]
+
+                    try:
                         await convex.run_mutation("jobs:setEvaluationMetrics", {
                             "jobId": job_id,
-                            "evaluationMetrics": serializable_metrics,
+                            "evaluationMetrics": avg_metrics,
                         })
+                        await convex.add_log(job_id, "INFO", "MDQA", f"Evaluation complete - averaged {len(all_run_metrics)} runs.")
                     except Exception as e:
-                        print(f"[Pipeline] Warning: Could not store eval metrics: {e}")
+                        print(f"[Pipeline] Warning: Could not store multi-run metrics: {e}")
+            else:
+                # Single run evaluation (original behavior)
+                eval_metrics = await execute_evaluation(
+                    job_id=job_id,
+                    job_paths=job_paths,
+                    evaluation_config=evaluation_config,
+                    dataset_file=dataset_file,
+                    convex=convex,
+                    reviews_data=gen_result.get("reviews") if gen_result else None,
+                )
+
+                if convex:
+                    await convex.add_log(job_id, "INFO", "MDQA", "Evaluation phase complete.")
+                    # Store evaluation metrics in Convex
+                    if eval_metrics:
+                        try:
+                            # Ensure all metrics are Python floats for JSON serialization
+                            serializable_metrics = {}
+                            for k, v in eval_metrics.items():
+                                if v is not None:
+                                    try:
+                                        serializable_metrics[k] = float(round(float(v), 6))
+                                    except (TypeError, ValueError):
+                                        serializable_metrics[k] = v
+                                else:
+                                    serializable_metrics[k] = None
+                            await convex.run_mutation("jobs:setEvaluationMetrics", {
+                                "jobId": job_id,
+                                "evaluationMetrics": serializable_metrics,
+                            })
+                        except Exception as e:
+                            print(f"[Pipeline] Warning: Could not store eval metrics: {e}")
 
         # ========================================
         # Complete
@@ -3522,20 +4526,26 @@ async def execute_pipeline(
             await convex.fail_job(job_id, error_msg)
 
 
-def load_texts_from_file(file_path: str) -> list[str]:
+def load_texts_from_file(file_path: str, return_stats: bool = False) -> list[str] | tuple[list[str], dict]:
     """
-    Load review texts from a dataset file (JSONL, CSV, or TXT).
+    Load review texts from a dataset file (JSONL, CSV, XML, or TXT).
 
-    Returns a list of plain text strings extracted from the file.
+    Args:
+        file_path: Path to the dataset file
+        return_stats: If True, returns (texts, stats_dict) with review and sentence counts
+
+    Returns:
+        List of plain text strings, or tuple of (texts, stats) if return_stats=True
     """
     from pathlib import Path
     import json
 
     path = Path(file_path)
     texts = []
+    sentence_count = 0
 
     if not path.exists():
-        return texts
+        return (texts, {"reviews": 0, "sentences": 0}) if return_stats else texts
 
     if str(path).endswith(".jsonl"):
         with open(path, encoding="utf-8") as f:
@@ -3545,12 +4555,17 @@ def load_texts_from_file(file_path: str) -> list[str]:
                     try:
                         r = json.loads(line)
                         text = r.get("review_text") or r.get("text") or r.get("review") or ""
-                        if not text:
-                            sentences = r.get("sentences", [])
-                            if sentences:
-                                text = " ".join(s.get("text", "") for s in sentences if s.get("text"))
+                        sentences = r.get("sentences", [])
+                        if not text and sentences:
+                            text = " ".join(s.get("text", "") for s in sentences if s.get("text"))
                         if text:
                             texts.append(text)
+                            # Count sentences from structured data or estimate from text
+                            if sentences:
+                                sentence_count += len(sentences)
+                            else:
+                                # Rough estimate: split on sentence-ending punctuation
+                                sentence_count += max(1, text.count('.') + text.count('!') + text.count('?'))
                     except json.JSONDecodeError:
                         continue
 
@@ -3562,6 +4577,27 @@ def load_texts_from_file(file_path: str) -> list[str]:
                 text = row.get("review_text") or row.get("text") or row.get("review") or ""
                 if text and text not in texts:  # Dedupe since CSV has per-opinion rows
                     texts.append(text)
+                    sentence_count += max(1, text.count('.') + text.count('!') + text.count('?'))
+
+    elif str(path).endswith(".xml"):
+        # Parse SemEval-style XML format
+        import xml.etree.ElementTree as ET
+        try:
+            tree = ET.parse(path)
+            root = tree.getroot()
+            for review_elem in root.findall('.//Review'):
+                # Collect all sentence texts for this review
+                review_sentences = []
+                for sent_elem in review_elem.findall('.//sentence'):
+                    text_elem = sent_elem.find('text')
+                    if text_elem is not None and text_elem.text:
+                        review_sentences.append(text_elem.text.strip())
+                        sentence_count += 1
+                # Join all sentences into one review text
+                if review_sentences:
+                    texts.append(" ".join(review_sentences))
+        except ET.ParseError:
+            pass  # Silently fail on malformed XML
 
     elif str(path).endswith(".txt"):
         with open(path, encoding="utf-8") as f:
@@ -3569,6 +4605,7 @@ def load_texts_from_file(file_path: str) -> list[str]:
                 line = line.strip()
                 if line:
                     texts.append(line)
+                    sentence_count += max(1, line.count('.') + line.count('!') + line.count('?'))
 
     else:
         # Try to parse as plain text (one review per line)
@@ -3577,7 +4614,10 @@ def load_texts_from_file(file_path: str) -> list[str]:
                 line = line.strip()
                 if line:
                     texts.append(line)
+                    sentence_count += max(1, line.count('.') + line.count('!') + line.count('?'))
 
+    if return_stats:
+        return texts, {"reviews": len(texts), "sentences": sentence_count}
     return texts
 
 
@@ -3684,11 +4724,11 @@ async def execute_evaluation(
 
         if reference_files:
             reference_file = reference_files[0]  # Use first reference file found
-            reference_texts = load_texts_from_file(str(reference_file))
+            reference_texts, ref_stats = load_texts_from_file(str(reference_file), return_stats=True)
             if reference_texts:
-                print(f"[Evaluation] Loaded {len(reference_texts)} reference texts from {reference_file.name}")
+                print(f"[Evaluation] Loaded {ref_stats['reviews']} reviews ({ref_stats['sentences']} sentences) from {reference_file.name}")
                 if convex:
-                    await convex.add_log(job_id, "INFO", "MDQA", f"Using reference dataset: {reference_file.name} ({len(reference_texts)} reviews)")
+                    await convex.add_log(job_id, "INFO", "MDQA", f"Using reference dataset: {reference_file.name} ({ref_stats['reviews']} reviews, {ref_stats['sentences']} sentences)")
             else:
                 print(f"[Evaluation] Warning: Reference file found but no texts extracted: {reference_file}")
                 if convex:
@@ -3853,13 +4893,61 @@ def compute_self_bleu(texts: list[str], sample_size: int = 100) -> float:
     return total_bleu / count if count > 0 else 0.0
 
 
+# =============================================================================
+# Cached SentenceTransformer model for MDQA metrics (same optimization as MAV)
+# =============================================================================
+_mdqa_st_model = None
+
+
+def _get_mdqa_st_model():
+    """Lazy-load and cache the SentenceTransformer model for MDQA metrics."""
+    global _mdqa_st_model
+    if _mdqa_st_model is None:
+        import os
+        import sys
+        import logging
+        import warnings
+        from io import StringIO
+
+        # Suppress all progress bars and verbose logging
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+        logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+        logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        logging.getLogger("safetensors").setLevel(logging.ERROR)
+        warnings.filterwarnings("ignore", category=FutureWarning)
+
+        from sentence_transformers import SentenceTransformer
+
+        # Temporarily redirect stderr to suppress progress bar output
+        old_stderr = sys.stderr
+        sys.stderr = StringIO()
+        try:
+            # Try to load from cache without network check
+            try:
+                _mdqa_st_model = SentenceTransformer(
+                    "all-MiniLM-L6-v2", device="cpu", local_files_only=True
+                )
+            except Exception:
+                # Fallback: download if not cached
+                _mdqa_st_model = SentenceTransformer(
+                    "all-MiniLM-L6-v2", device="cpu"
+                )
+        finally:
+            sys.stderr = old_stderr
+        print("[MDQA] SentenceTransformer model loaded and cached")
+    return _mdqa_st_model
+
+
 def compute_bertscore_avg(texts: list[str]) -> float:
     """Compute average BERTScore F1 between consecutive pairs. Returns 0 if dependencies unavailable."""
     try:
-        from sentence_transformers import SentenceTransformer, util
+        from sentence_transformers import util
         import numpy as np
 
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        model = _get_mdqa_st_model()
         embeddings = model.encode(texts[:100], convert_to_tensor=True, show_progress_bar=False)  # Limit for speed
 
         # Compute average cosine similarity between all pairs
@@ -3965,7 +5053,6 @@ def compute_moverscore_avg(texts: list[str], sample_size: int = 50) -> float:
     import random
 
     try:
-        from sentence_transformers import SentenceTransformer
         import numpy as np
 
         if len(texts) < 2:
@@ -3973,7 +5060,7 @@ def compute_moverscore_avg(texts: list[str], sample_size: int = 50) -> float:
 
         sampled = texts if len(texts) <= sample_size else random.sample(texts, sample_size)
 
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        model = _get_mdqa_st_model()
 
         # Get word-level embeddings by encoding individual sentences
         # For MoverScore, we compute word-level alignment between pairs
@@ -4131,7 +5218,7 @@ def compute_bertscore_with_reference(generated: list[str], references: list[str]
     import random
 
     try:
-        from sentence_transformers import SentenceTransformer, util
+        from sentence_transformers import util
         import numpy as np
 
         if not generated or not references:
@@ -4140,7 +5227,7 @@ def compute_bertscore_with_reference(generated: list[str], references: list[str]
         gen_sampled = generated if len(generated) <= sample_size else random.sample(generated, sample_size)
         ref_sampled = references if len(references) <= sample_size else random.sample(references, sample_size)
 
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        model = _get_mdqa_st_model()
 
         # Encode all texts
         gen_embeddings = model.encode(gen_sampled, convert_to_tensor=True, show_progress_bar=False)
@@ -4169,7 +5256,6 @@ def compute_moverscore_with_reference(generated: list[str], references: list[str
     import random
 
     try:
-        from sentence_transformers import SentenceTransformer
         import numpy as np
 
         if not generated or not references:
@@ -4178,7 +5264,7 @@ def compute_moverscore_with_reference(generated: list[str], references: list[str
         gen_sampled = generated if len(generated) <= sample_size else random.sample(generated, sample_size)
         ref_sampled = references if len(references) <= sample_size else random.sample(references, sample_size)
 
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        model = _get_mdqa_st_model()
 
         total_score = 0.0
         count = 0
@@ -4227,8 +5313,10 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
     Start the full pipeline (selected phases) in the background.
 
     Runs composition, generation, and/or evaluation sequentially based on selected phases.
+    For heuristic method, skips composition and uses direct LLM prompting.
     """
     print(f"[API] Starting pipeline for job: {request.jobId}")
+    print(f"[API] Method: {request.method}")
     print(f"[API] Selected phases: {request.phases}")
 
     background_tasks.add_task(
@@ -4245,8 +5333,10 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
         request.evaluationConfig,
         request.datasetFile,
         request.reusedFromJobDir,
+        request.method,
+        request.heuristicConfig,
     )
-    return {"status": "started", "jobId": request.jobId, "phases": request.phases}
+    return {"status": "started", "jobId": request.jobId, "phases": request.phases, "method": request.method}
 
 
 class UploadDatasetRequest(BaseModel):
@@ -4421,12 +5511,15 @@ async def read_dataset(request: ReadDatasetRequest):
                 text = text_elem.text if text_elem is not None else ""
                 opinions = []
                 for op_elem in sent_elem.findall('.//Opinion'):
+                    # Support both standard (from/to) and hotel format (target_from/target_to)
+                    from_val = op_elem.get('from') or op_elem.get('target_from') or '0'
+                    to_val = op_elem.get('to') or op_elem.get('target_to') or '0'
                     opinions.append({
                         "target": op_elem.get('target', 'NULL'),
                         "category": op_elem.get('category', ''),
                         "polarity": op_elem.get('polarity', ''),
-                        "from": int(op_elem.get('from', 0)),
-                        "to": int(op_elem.get('to', 0)),
+                        "from": int(from_val),
+                        "to": int(to_val),
                     })
                 sentences.append({"id": sid, "text": text, "opinions": opinions})
             reviews.append({"id": rid, "sentences": sentences, "metadata": {}})
@@ -4640,3 +5733,609 @@ async def extract_context(request: ExtractContextRequest):
         return ExtractContextResponse(
             error=f"Context extraction failed: {str(e)}"
         )
+
+
+# ============================================================================
+# Reference Dataset Extraction (RDE) Endpoint
+# ============================================================================
+
+class DomainConfidence(BaseModel):
+    """Domain inference with confidence score."""
+    value: Optional[str] = None
+    confidence: float = 0.0
+    reason: Optional[str] = None
+
+
+class RegionConfidence(BaseModel):
+    """Region inference with confidence score."""
+    value: Optional[str] = None
+    confidence: float = 0.0
+    reason: Optional[str] = None
+
+
+class SexDistributionResult(BaseModel):
+    """Sex distribution extracted from explicit text patterns."""
+    male: float = 0.0
+    female: float = 0.0
+    unknown: float = 1.0
+    detected_count: int = 0  # How many reviews had explicit sex mentions
+
+
+class NoiseAnalysis(BaseModel):
+    """Noise analysis results from reference dataset."""
+    typo_rate: float = 0.0
+    has_colloquialisms: bool = False
+    sample_size: int = 0
+
+
+class ReviewLengthStats(BaseModel):
+    """Review length statistics."""
+    avg_sentences: float = 0.0
+    min_sentences: int = 0
+    max_sentences: int = 0
+    suggested_range: list[int] = [2, 5]
+
+
+class PolarityDistribution(BaseModel):
+    """Polarity distribution from reference dataset."""
+    positive: float = 0.0
+    neutral: float = 0.0
+    negative: float = 0.0
+
+
+class ExtractRefContextRequest(BaseModel):
+    """Request model for comprehensive reference dataset extraction."""
+    reviews: list[dict]  # Full review objects with sentences and opinions
+    model: str  # LLM model for extraction
+    apiKey: str  # OpenRouter API key
+    sampleCount: int = 25  # Sample size for LLM extraction
+
+
+class ExtractRefContextResponse(BaseModel):
+    """Response model for comprehensive reference dataset extraction."""
+    # LLM-extracted context
+    subject_query: Optional[str] = None
+    additional_context: Optional[str] = None
+    reviewer_context: Optional[str] = None
+
+    # Inferred values with confidence
+    domain: Optional[DomainConfidence] = None
+    region: Optional[RegionConfidence] = None
+
+    # Statistics from reference dataset
+    polarity: Optional[PolarityDistribution] = None
+    sex_distribution: Optional[SexDistributionResult] = None
+    noise: Optional[NoiseAnalysis] = None
+    review_length: Optional[ReviewLengthStats] = None
+
+    # Aspect categories
+    aspect_categories: list[str] = []
+
+    # Metadata
+    sample_count: int = 0
+    total_reviews: int = 0
+    error: Optional[str] = None
+
+
+def _load_sex_patterns() -> dict:
+    """Load sex detection patterns from config file."""
+    patterns_path = Path(__file__).parent / "config" / "sex-patterns.json"
+    try:
+        with open(patterns_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[RDE] Warning: Could not load sex patterns: {e}")
+        return {"male": [], "female": []}
+
+
+def _detect_sex_from_text(text: str, patterns: dict) -> Optional[str]:
+    """Detect sex from explicit patterns in text."""
+    text_lower = text.lower()
+
+    for pattern in patterns.get("male", []):
+        if pattern in text_lower:
+            return "male"
+
+    for pattern in patterns.get("female", []):
+        if pattern in text_lower:
+            return "female"
+
+    return None
+
+
+def _analyze_sex_distribution(reviews: list[dict], patterns: dict) -> SexDistributionResult:
+    """Analyze sex distribution from explicit text patterns."""
+    male_count = 0
+    female_count = 0
+    unknown_count = 0
+
+    for review in reviews:
+        # Get all text from the review
+        all_text = ""
+        if "sentences" in review:
+            for sentence in review["sentences"]:
+                if isinstance(sentence, dict) and "text" in sentence:
+                    all_text += " " + sentence["text"]
+        elif "text" in review:
+            all_text = review["text"]
+
+        sex = _detect_sex_from_text(all_text, patterns)
+        if sex == "male":
+            male_count += 1
+        elif sex == "female":
+            female_count += 1
+        else:
+            unknown_count += 1
+
+    total = male_count + female_count + unknown_count
+    if total == 0:
+        return SexDistributionResult()
+
+    return SexDistributionResult(
+        male=round(male_count / total, 2),
+        female=round(female_count / total, 2),
+        unknown=round(unknown_count / total, 2),
+        detected_count=male_count + female_count,
+    )
+
+
+def _analyze_polarity_distribution(reviews: list[dict]) -> PolarityDistribution:
+    """Analyze document-level polarity distribution."""
+    positive_count = 0
+    neutral_count = 0
+    negative_count = 0
+
+    for review in reviews:
+        # Count polarities per review (document-level via majority voting)
+        review_polarities = {"positive": 0, "neutral": 0, "negative": 0}
+
+        if "sentences" in review:
+            for sentence in review["sentences"]:
+                if isinstance(sentence, dict) and "opinions" in sentence:
+                    for opinion in sentence["opinions"]:
+                        polarity = opinion.get("polarity", "").lower()
+                        if polarity in review_polarities:
+                            review_polarities[polarity] += 1
+
+        # Document-level polarity is the majority
+        max_polarity = max(review_polarities, key=review_polarities.get)
+        if review_polarities[max_polarity] > 0:
+            if max_polarity == "positive":
+                positive_count += 1
+            elif max_polarity == "neutral":
+                neutral_count += 1
+            elif max_polarity == "negative":
+                negative_count += 1
+
+    total = positive_count + neutral_count + negative_count
+    if total == 0:
+        return PolarityDistribution()
+
+    return PolarityDistribution(
+        positive=round(positive_count / total, 2),
+        neutral=round(neutral_count / total, 2),
+        negative=round(negative_count / total, 2),
+    )
+
+
+def _analyze_review_length(reviews: list[dict]) -> ReviewLengthStats:
+    """Analyze review length statistics (sentences per review)."""
+    sentence_counts = []
+
+    for review in reviews:
+        if "sentences" in review:
+            sentence_counts.append(len(review["sentences"]))
+        else:
+            sentence_counts.append(1)
+
+    if not sentence_counts:
+        return ReviewLengthStats()
+
+    avg = sum(sentence_counts) / len(sentence_counts)
+    min_val = min(sentence_counts)
+    max_val = max(sentence_counts)
+
+    # Suggest a range based on the distribution
+    suggested_min = max(1, int(avg - 1))
+    suggested_max = min(10, int(avg + 2))
+
+    return ReviewLengthStats(
+        avg_sentences=round(avg, 1),
+        min_sentences=min_val,
+        max_sentences=max_val,
+        suggested_range=[suggested_min, suggested_max],
+    )
+
+
+def _extract_aspect_categories(reviews: list[dict]) -> list[str]:
+    """Extract unique aspect categories from reviews."""
+    categories = set()
+
+    for review in reviews:
+        if "sentences" in review:
+            for sentence in review["sentences"]:
+                if isinstance(sentence, dict) and "opinions" in sentence:
+                    for opinion in sentence["opinions"]:
+                        if "category" in opinion and opinion["category"]:
+                            categories.add(opinion["category"])
+
+    return sorted(list(categories))
+
+
+def _infer_domain_from_categories(categories: list[str]) -> DomainConfidence:
+    """Infer domain from aspect categories."""
+    if not categories:
+        return DomainConfidence(reason="No categories found")
+
+    category_str = " ".join(categories).upper()
+
+    # Restaurant indicators
+    restaurant_keywords = ["FOOD", "SERVICE", "AMBIANCE", "PRICE", "DRINKS", "LOCATION"]
+    restaurant_score = sum(1 for kw in restaurant_keywords if kw in category_str)
+
+    # Laptop/Electronics indicators
+    laptop_keywords = ["LAPTOP", "DISPLAY", "SCREEN", "KEYBOARD", "BATTERY", "SUPPORT",
+                       "OS", "SOFTWARE", "HARDWARE", "MEMORY", "GRAPHICS", "PORTS"]
+    laptop_score = sum(1 for kw in laptop_keywords if kw in category_str)
+
+    # Phone/Electronics indicators
+    phone_keywords = ["PHONE", "CAMERA", "BATTERY", "SCREEN", "DISPLAY", "PERFORMANCE"]
+    phone_score = sum(1 for kw in phone_keywords if kw in category_str)
+
+    # Hotel indicators
+    hotel_keywords = ["ROOM", "STAFF", "LOCATION", "CLEANLINESS", "VALUE", "AMENITIES"]
+    hotel_score = sum(1 for kw in hotel_keywords if kw in category_str)
+
+    scores = {
+        "Restaurant": restaurant_score,
+        "Laptop": laptop_score,
+        "Electronics": phone_score,
+        "Hotel": hotel_score,
+    }
+
+    if max(scores.values()) == 0:
+        return DomainConfidence(value="General", confidence=0.3, reason="No domain-specific categories detected")
+
+    best_domain = max(scores, key=scores.get)
+    total_keywords = len(restaurant_keywords) + len(laptop_keywords) + len(phone_keywords) + len(hotel_keywords)
+    confidence = min(1.0, scores[best_domain] / 5)  # Normalize to 0-1
+
+    return DomainConfidence(
+        value=best_domain,
+        confidence=round(confidence, 2),
+    )
+
+
+def _infer_region_from_text(reviews: list[dict]) -> RegionConfidence:
+    """Infer region from text patterns (currency, spellings, place names)."""
+    all_text = ""
+    for review in reviews:
+        if "sentences" in review:
+            for sentence in review["sentences"]:
+                if isinstance(sentence, dict) and "text" in sentence:
+                    all_text += " " + sentence["text"]
+
+    all_text_lower = all_text.lower()
+
+    # Currency indicators
+    has_pound = "£" in all_text
+    has_euro = "€" in all_text
+    has_dollar = "$" in all_text
+
+    # British English spellings
+    british_spellings = ["colour", "favour", "honour", "flavour", "centre", "theatre", "metre"]
+    british_count = sum(1 for word in british_spellings if word in all_text_lower)
+
+    # American English spellings
+    american_spellings = ["color", "favor", "honor", "flavor", "center", "theater", "meter"]
+    american_count = sum(1 for word in american_spellings if word in all_text_lower)
+
+    # Calculate scores
+    scores = {
+        "UK": (5 if has_pound else 0) + british_count * 2,
+        "Europe": 5 if has_euro else 0,
+        "US/Canada": (2 if has_dollar else 0) + american_count * 2,
+    }
+
+    max_score = max(scores.values())
+    if max_score < 2:
+        return RegionConfidence(
+            value=None,
+            confidence=0.0,
+            reason="under 50% certainty threshold"
+        )
+
+    best_region = max(scores, key=scores.get)
+    confidence = min(1.0, max_score / 10)
+
+    if confidence < 0.5:
+        return RegionConfidence(
+            value=None,
+            confidence=round(confidence, 2),
+            reason="under 50% certainty threshold"
+        )
+
+    return RegionConfidence(
+        value=best_region,
+        confidence=round(confidence, 2),
+    )
+
+
+def _analyze_noise(reviews: list[dict], sample_size: int = 100) -> NoiseAnalysis:
+    """Analyze noise level (typos, colloquialisms) in reviews."""
+    try:
+        from spellchecker import SpellChecker
+        spell = SpellChecker()
+    except ImportError:
+        print("[RDE] Warning: pyspellchecker not installed, skipping noise analysis")
+        return NoiseAnalysis(sample_size=0)
+
+    # Colloquialism patterns
+    colloquial_patterns = [
+        r"\bgonna\b", r"\bwanna\b", r"\bgotta\b", r"\bkinda\b", r"\bsorta\b",
+        r"\bcuz\b", r"\bcause\b", r"\btho\b", r"\bthough\b", r"\byeah\b",
+        r"\bnope\b", r"\byup\b", r"\byep\b", r"\bbtw\b", r"\bimo\b",
+        r"\bomg\b", r"\blol\b", r"\bbrb\b", r"\bidk\b", r"\bfyi\b",
+    ]
+
+    word_count = 0
+    typo_count = 0
+    has_colloquialisms = False
+    sampled_reviews = reviews[:sample_size]
+
+    for review in sampled_reviews:
+        text = ""
+        if "sentences" in review:
+            for sentence in review["sentences"]:
+                if isinstance(sentence, dict) and "text" in sentence:
+                    text += " " + sentence["text"]
+        elif "text" in review:
+            text = review["text"]
+
+        # Check for colloquialisms
+        if not has_colloquialisms:
+            for pattern in colloquial_patterns:
+                if re.search(pattern, text, re.IGNORECASE):
+                    has_colloquialisms = True
+                    break
+
+        # Count typos
+        words = re.findall(r'\b[a-zA-Z]+\b', text)
+        word_count += len(words)
+        misspelled = spell.unknown(words)
+        typo_count += len(misspelled)
+
+    typo_rate = typo_count / word_count if word_count > 0 else 0
+
+    return NoiseAnalysis(
+        typo_rate=round(typo_rate, 4),
+        has_colloquialisms=has_colloquialisms,
+        sample_size=len(sampled_reviews),
+    )
+
+
+@app.post("/api/extract-ref-context", response_model=ExtractRefContextResponse)
+async def extract_ref_context(request: ExtractRefContextRequest):
+    """
+    Comprehensive reference dataset extraction for auto-filling COMPOSITION settings.
+
+    This endpoint analyzes a reference dataset to extract:
+    - Subject query and additional context (LLM-generated)
+    - Domain and region inference with confidence scores
+    - Polarity distribution
+    - Sex distribution (from explicit text patterns)
+    - Noise analysis (typo rate, colloquialisms)
+    - Aspect categories
+    - Review length statistics
+
+    The extracted data is used to auto-fill the COMPOSITION step with appropriate values.
+    """
+    from cera.pipeline.context_extractor import ContextExtractor
+
+    if not request.reviews:
+        return ExtractRefContextResponse(error="No reviews provided")
+
+    try:
+        print(f"[RDE] Starting reference dataset extraction from {len(request.reviews)} reviews")
+        print(f"[RDE] Using model: {request.model}")
+
+        total_reviews = len(request.reviews)
+
+        # Load sex patterns
+        sex_patterns = _load_sex_patterns()
+
+        # 1. Extract aspect categories (no LLM needed)
+        print("[RDE] Step 1/6: Extracting aspect categories...")
+        aspect_categories = _extract_aspect_categories(request.reviews)
+        print(f"[RDE] Found {len(aspect_categories)} unique categories")
+
+        # 2. Analyze polarity distribution (no LLM needed)
+        print("[RDE] Step 2/6: Analyzing polarity distribution...")
+        polarity = _analyze_polarity_distribution(request.reviews)
+        print(f"[RDE] Polarity: +{polarity.positive} n{polarity.neutral} -{polarity.negative}")
+
+        # 3. Analyze sex distribution (no LLM needed)
+        print("[RDE] Step 3/6: Analyzing sex distribution...")
+        sex_distribution = _analyze_sex_distribution(request.reviews, sex_patterns)
+        print(f"[RDE] Sex: m{sex_distribution.male} f{sex_distribution.female} u{sex_distribution.unknown}")
+
+        # 4. Analyze noise (no LLM needed)
+        print("[RDE] Step 4/6: Analyzing noise levels...")
+        noise = _analyze_noise(request.reviews, sample_size=100)
+        print(f"[RDE] Noise: {noise.typo_rate:.2%} typos, colloquialisms={noise.has_colloquialisms}")
+
+        # 5. Analyze review length (no LLM needed)
+        print("[RDE] Step 5/6: Analyzing review lengths...")
+        review_length = _analyze_review_length(request.reviews)
+        print(f"[RDE] Length: avg {review_length.avg_sentences} sentences")
+
+        # 6. LLM-based extraction for subject context, reviewer context, domain, region, and query
+        print("[RDE] Step 6/6: LLM extraction...")
+        extractor = ContextExtractor(
+            api_key=request.apiKey,
+            model=request.model,
+        )
+
+        # Convert reviews to text strings for the extractor
+        review_texts = []
+        for review in request.reviews:
+            if "sentences" in review:
+                text = " ".join(
+                    s["text"] for s in review["sentences"]
+                    if isinstance(s, dict) and "text" in s
+                )
+                if text:
+                    review_texts.append(text)
+
+        sample_count = max(10, min(50, request.sampleCount))
+        actual_sample = min(len(review_texts), sample_count)
+
+        subject_context = await extractor.extract_subject_context(
+            review_texts, sample_count=sample_count
+        )
+        print(f"[RDE] Subject context extracted ({len(subject_context)} chars)")
+
+        reviewer_context = await extractor.extract_reviewer_context(
+            review_texts, sample_count=sample_count
+        )
+        print(f"[RDE] Reviewer context extracted ({len(reviewer_context)} chars)")
+
+        # Generate a concise subject query via LLM
+        subject_query = await extractor.extract_subject_query(
+            review_texts, sample_count=sample_count
+        )
+        print(f"[RDE] Subject query extracted: {subject_query}")
+
+        # Extract domain via LLM
+        domain_result = await extractor.extract_domain(
+            review_texts, sample_count=sample_count
+        )
+        domain = DomainConfidence(
+            value=domain_result.get("value"),
+            confidence=domain_result.get("confidence", 0.0),
+        )
+        print(f"[RDE] Domain extracted: {domain.value} ({domain.confidence:.0%})")
+
+        # Extract region via LLM
+        region_result = await extractor.extract_region(
+            review_texts, sample_count=sample_count
+        )
+        region = RegionConfidence(
+            value=region_result.get("value"),
+            confidence=region_result.get("confidence", 0.0),
+            reason=region_result.get("reason"),
+        )
+        print(f"[RDE] Region extracted: {region.value or 'Unknown'} ({region.confidence:.0%})")
+
+        print("[RDE] Reference dataset extraction complete")
+
+        return ExtractRefContextResponse(
+            subject_query=subject_query,
+            additional_context=subject_context,
+            reviewer_context=reviewer_context,
+            domain=domain,
+            region=region,
+            polarity=polarity,
+            sex_distribution=sex_distribution,
+            noise=noise,
+            review_length=review_length,
+            aspect_categories=aspect_categories,
+            sample_count=actual_sample,
+            total_reviews=total_reviews,
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return ExtractRefContextResponse(
+            error=f"Reference dataset extraction failed: {str(e)}"
+        )
+
+
+# ============================================================
+# Domain Pattern Management Endpoints
+# ============================================================
+
+class DomainPattern(BaseModel):
+    """A domain pattern for Quick Stats inference."""
+    name: str
+    keywords: list[str]
+
+
+class DomainPatternsResponse(BaseModel):
+    """Response containing all domain patterns."""
+    domains: list[DomainPattern]
+
+
+class UpdateDomainPatternsRequest(BaseModel):
+    """Request to update domain patterns."""
+    domains: list[DomainPattern]
+
+
+def _get_domain_patterns_path() -> Path:
+    """Get the path to the domain patterns file."""
+    return Path(__file__).parent / "config" / "domain-patterns.json"
+
+
+def _get_domain_patterns_defaults_path() -> Path:
+    """Get the path to the default domain patterns file."""
+    return Path(__file__).parent / "config" / "domain-patterns-defaults.json"
+
+
+@app.get("/api/domain-patterns")
+async def get_domain_patterns() -> DomainPatternsResponse:
+    """Get all domain patterns."""
+    patterns_path = _get_domain_patterns_path()
+
+    if not patterns_path.exists():
+        # Fall back to defaults if main file doesn't exist
+        patterns_path = _get_domain_patterns_defaults_path()
+
+    try:
+        with open(patterns_path, "r") as f:
+            data = json.load(f)
+            return DomainPatternsResponse(domains=data.get("domains", []))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read domain patterns: {str(e)}")
+
+
+@app.put("/api/domain-patterns")
+async def update_domain_patterns(request: UpdateDomainPatternsRequest) -> DomainPatternsResponse:
+    """Update domain patterns (replaces all patterns)."""
+    patterns_path = _get_domain_patterns_path()
+
+    try:
+        data = {
+            "_comment": "Domain inference patterns for Quick Stats. Each domain has keywords to match against aspect categories. This file can be edited via the UI.",
+            "domains": [{"name": d.name, "keywords": d.keywords} for d in request.domains]
+        }
+        with open(patterns_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        return DomainPatternsResponse(domains=request.domains)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update domain patterns: {str(e)}")
+
+
+@app.post("/api/domain-patterns/reset")
+async def reset_domain_patterns() -> DomainPatternsResponse:
+    """Reset domain patterns to defaults."""
+    defaults_path = _get_domain_patterns_defaults_path()
+    patterns_path = _get_domain_patterns_path()
+
+    try:
+        # Read defaults
+        with open(defaults_path, "r") as f:
+            defaults_data = json.load(f)
+
+        # Write to main file
+        data = {
+            "_comment": "Domain inference patterns for Quick Stats. Each domain has keywords to match against aspect categories. This file can be edited via the UI.",
+            "domains": defaults_data.get("domains", [])
+        }
+        with open(patterns_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        return DomainPatternsResponse(domains=defaults_data.get("domains", []))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reset domain patterns: {str(e)}")
