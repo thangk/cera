@@ -76,7 +76,46 @@ class MultiDimensionalQualityAssessment:
         self.use_gpu = use_gpu
         self._device = "cuda" if use_gpu else "cpu"
         self._bertscore_model = None
-        self._sentence_model = None
+        self._sentence_model = None  # Lazy-loaded and cached
+
+    def _get_sentence_model(self):
+        """Lazy-load and cache the SentenceTransformer model."""
+        if self._sentence_model is None:
+            import os
+            import sys
+            import logging
+            import warnings
+            from io import StringIO
+
+            # Suppress all progress bars and verbose logging
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+            logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+            logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+            logging.getLogger("transformers").setLevel(logging.ERROR)
+            logging.getLogger("safetensors").setLevel(logging.ERROR)
+            warnings.filterwarnings("ignore", category=FutureWarning)
+
+            from sentence_transformers import SentenceTransformer
+
+            # Temporarily redirect stderr to suppress progress bar output
+            old_stderr = sys.stderr
+            sys.stderr = StringIO()
+            try:
+                # Try to load from cache without network check
+                try:
+                    self._sentence_model = SentenceTransformer(
+                        "all-MiniLM-L6-v2", device=self._device, local_files_only=True
+                    )
+                except Exception:
+                    # Fallback: download if not cached
+                    self._sentence_model = SentenceTransformer(
+                        "all-MiniLM-L6-v2", device=self._device
+                    )
+            finally:
+                sys.stderr = old_stderr
+        return self._sentence_model
 
     def _tokenize(self, text: str) -> list[str]:
         """Simple whitespace tokenization."""
@@ -320,9 +359,9 @@ class MultiDimensionalQualityAssessment:
         except ImportError:
             # Fallback: Use sentence-transformers for semantic similarity
             try:
-                from sentence_transformers import SentenceTransformer, util
+                from sentence_transformers import util
 
-                model = SentenceTransformer("all-MiniLM-L6-v2", device=self._device)
+                model = self._get_sentence_model()
                 gen_embeddings = model.encode(generated, convert_to_tensor=True, show_progress_bar=False)
                 ref_embeddings = model.encode(references, convert_to_tensor=True, show_progress_bar=False)
 
