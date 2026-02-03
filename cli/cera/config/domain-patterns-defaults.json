@@ -1,0 +1,21 @@
+{
+  "_comment": "Default domain patterns. DO NOT EDIT - this is used for reset functionality.",
+  "domains": [
+    {
+      "name": "Restaurant",
+      "keywords": ["FOOD", "SERVICE", "AMBIANCE", "RESTAURANT", "DRINKS", "MENU", "PRICE"]
+    },
+    {
+      "name": "Laptop",
+      "keywords": ["LAPTOP", "DISPLAY", "KEYBOARD", "BATTERY", "PERFORMANCE", "DESIGN", "PORTABILITY"]
+    },
+    {
+      "name": "Electronics",
+      "keywords": ["PHONE", "CAMERA", "SOFTWARE", "HARDWARE", "SCREEN", "CONNECTIVITY"]
+    },
+    {
+      "name": "Hotel",
+      "keywords": ["ROOM", "CLEANLINESS", "LOCATION", "STAFF", "AMENITIES", "CHECK-IN"]
+    }
+  ]
+}
