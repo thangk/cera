@@ -30,7 +30,7 @@ app.add_middleware(
 class MAVConfig(BaseModel):
     enabled: bool = False
     models: list[str] = []
-    similarity_threshold: float = 0.85
+    similarity_threshold: float = 0.75
     answer_threshold: float = 0.80
     max_queries: int = 30
 
@@ -82,6 +82,8 @@ class AttributesProfile(BaseModel):
 
 class GenerationConfig(BaseModel):
     count: int
+    count_mode: str = "reviews"  # "reviews" or "sentences" - target mode
+    target_sentences: Optional[int] = None  # Target sentence count when count_mode="sentences"
     batch_size: int
     request_size: int = 5
     provider: str
@@ -585,6 +587,45 @@ class ConvexClient:
             response.raise_for_status()
         except Exception as e:
             print(f"Warning: Failed to update Convex failed count: {e}")
+
+    async def update_generated_sentences(self, job_id: str, count: int):
+        """Update the generated sentence count in Convex (for sentence mode)."""
+        try:
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:updateGeneratedSentences",
+                    "args": {"jobId": job_id, "count": count},
+                },
+            )
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to update Convex generated sentences: {e}")
+
+    async def set_evaluation_device(self, job_id: str, device_type: str, device_name: str = None):
+        """Set the evaluation device (GPU/CPU) in Convex."""
+        try:
+            device = {"type": device_type}
+            if device_name:
+                device["name"] = device_name
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:setEvaluationDevice",
+                    "args": {"jobId": job_id, "device": device},
+                },
+            )
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to set evaluation device in Convex: {e}")
 
     async def create_dataset(
         self,
@@ -2798,126 +2839,89 @@ Output ONLY the JSON object, no other text."""
 
             return parsed, None
 
-        for i in range(total_reviews):
-            # Check sentence-based stopping condition FIRST (before any API calls)
-            if count_mode == 'sentences' and target_sentences and total_sentences_generated >= target_sentences:
-                print(f"[Generation] Target reached: {total_sentences_generated} sentences in {generated_count} reviews")
-                if convex:
-                    await convex.add_log(job_id, "INFO", "AML", f"Target reached: {total_sentences_generated} sentences in {generated_count} reviews")
-                break
+        # ========================================
+        # Parallel Generation with request_size concurrency
+        # ========================================
+        semaphore = asyncio.Semaphore(request_size)
+        rate_limit_lock = asyncio.Lock()  # For coordinating rate limiting across parallel requests
+        last_request_times = [0.0]  # Mutable container for shared state
 
-            # Check if job was terminated (poll Convex for status)
-            if convex and i > 0 and i % 5 == 0:  # Check every 5 reviews
-                job_status = await convex.get_job(job_id)
-                if job_status and job_status.get("status") in ["terminated", "paused"]:
-                    status = job_status.get("status")
-                    print(f"[Generation] Job {status} by user - stopping generation")
-                    if convex:
-                        await convex.add_log(job_id, "INFO", "AML", f"Generation stopped by user ({status})")
-                        await convex.update_progress(job_id, 100, status.capitalize())
-                    return {
-                        "status": status,
-                        "jobId": job_id,
-                        "generatedCount": generated_count,
-                        "message": f"Job {status} after generating {generated_count} reviews",
-                    }
-            # Generate reviewer profile
-            reviewer = rgm.generate_profile()
-
-            # Random values within ranges
-            num_sentences = random.randint(length_range[0], length_range[1])
-            temperature = random.uniform(temp_range[0], temp_range[1])
-
-            # Format prompts - match template placeholder names
-            features_list = subject_context.get("characteristics", [])[:5]
-            pros_list = subject_context.get("positives", [])[:3]
-            cons_list = subject_context.get("negatives", [])[:3]
-
-            # Build subject context summary for the template
-            subject_context_text = f"""Domain: {subject_context.get("domain", subject_context.get("category", "N/A"))}
+        # Pre-compute static values
+        features_list = subject_context.get("characteristics", [])[:5]
+        pros_list = subject_context.get("positives", [])[:3]
+        cons_list = subject_context.get("negatives", [])[:3]
+        subject_context_text = f"""Domain: {subject_context.get("domain", subject_context.get("category", "N/A"))}
 Region: {subject_context.get("region", "N/A")}
 Key features: {", ".join(features_list) if features_list else "N/A"}"""
+        dataset_mode = getattr(config.generation, "dataset_mode", "explicit")
+        aspect_cats = getattr(config.subject_profile, "aspect_categories", None) or ["PRODUCT#QUALITY", "PRODUCT#PRICES", "SERVICE#GENERAL", "EXPERIENCE#GENERAL"]
 
-            # Determine dataset mode and build mode-specific prompt parts
-            dataset_mode = getattr(config.generation, "dataset_mode", "explicit")
-            aspect_cats = getattr(config.subject_profile, "aspect_categories", None) or ["PRODUCT#QUALITY", "PRODUCT#PRICES", "SERVICE#GENERAL", "EXPERIENCE#GENERAL"]
+        if dataset_mode == "implicit":
+            dataset_mode_instruction = "For implicit mode: do NOT include target terms. Only provide the category and polarity for each opinion."
+            output_example = '{\n  "sentences": [\n    {\n      "text": "The food was absolutely divine.",\n      "opinions": [\n        {"category": "FOOD#QUALITY", "polarity": "positive"}\n      ]\n    }\n  ]\n}'
+        else:
+            dataset_mode_instruction = "For explicit mode: include the target term from the sentence text for each opinion. IMPORTANT: The target MUST be a SINGLE WORD (noun) in lowercase that appears exactly in the text."
+            output_example = '{\n  "sentences": [\n    {\n      "text": "The carbonara was absolutely divine.",\n      "opinions": [\n        {"target": "carbonara", "category": "FOOD#QUALITY", "polarity": "positive"}\n      ]\n    }\n  ]\n}'
 
-            if dataset_mode == "implicit":
-                dataset_mode_instruction = "For implicit mode: do NOT include target terms. Only provide the category and polarity for each opinion."
-                output_example = '{\n  "sentences": [\n    {\n      "text": "The food was absolutely divine.",\n      "opinions": [\n        {"category": "FOOD#QUALITY", "polarity": "positive"}\n      ]\n    }\n  ]\n}'
-            else:
-                dataset_mode_instruction = "For explicit mode: include the exact target term from the sentence text for each opinion."
-                output_example = '{\n  "sentences": [\n    {\n      "text": "The pasta carbonara was absolutely divine.",\n      "opinions": [\n        {"target": "pasta carbonara", "category": "FOOD#QUALITY", "polarity": "positive"}\n      ]\n    }\n  ]\n}'
+        async def generate_single_review(review_index: int) -> dict:
+            """Generate a single review with retries. Returns result dict."""
+            async with semaphore:
+                reviewer = rgm.generate_profile()
+                num_sentences = random.randint(length_range[0], length_range[1])
+                temperature = random.uniform(temp_range[0], temp_range[1])
 
-            prompt_vars = {
-                "subject": subject_context["query"],
-                "domain": subject_context.get("domain", subject_context.get("category", "product")),
-                "subject_context": subject_context_text,
-                "features": ", ".join(features_list) if features_list else "various features",
-                "pros": ", ".join(pros_list) if pros_list else "quality and value",
-                "cons": ", ".join(cons_list) if cons_list else "minor issues",
-                # Sentence-level polarity distribution (percentages)
-                "polarity_positive": int(polarity_dist["positive"] * 100),
-                "polarity_neutral": int(polarity_dist["neutral"] * 100),
-                "polarity_negative": int(polarity_dist["negative"] * 100),
-                "age": reviewer.age,
-                "sex": reviewer.sex,
-                "region": subject_context.get("region", ""),
-                "additional_context": reviewers_context.get("additional_context", "general consumer"),
-                "min_sentences": num_sentences,
-                "max_sentences": num_sentences + 1,
-                "aspect_categories": ", ".join(aspect_cats),
-                "dataset_mode_instruction": dataset_mode_instruction,
-                "output_example": output_example,
-            }
+                prompt_vars = {
+                    "subject": subject_context["query"],
+                    "domain": subject_context.get("domain", subject_context.get("category", "product")),
+                    "subject_context": subject_context_text,
+                    "features": ", ".join(features_list) if features_list else "various features",
+                    "pros": ", ".join(pros_list) if pros_list else "quality and value",
+                    "cons": ", ".join(cons_list) if cons_list else "minor issues",
+                    "polarity_positive": int(polarity_dist["positive"] * 100),
+                    "polarity_neutral": int(polarity_dist["neutral"] * 100),
+                    "polarity_negative": int(polarity_dist["negative"] * 100),
+                    "age": reviewer.age,
+                    "sex": reviewer.sex,
+                    "region": subject_context.get("region", ""),
+                    "additional_context": reviewers_context.get("additional_context", "general consumer"),
+                    "min_sentences": num_sentences,
+                    "max_sentences": num_sentences + 1,
+                    "aspect_categories": ", ".join(aspect_cats),
+                    "dataset_mode_instruction": dataset_mode_instruction,
+                    "output_example": output_example,
+                }
 
-            system_prompt = format_prompt(system_template, **prompt_vars)
-            user_prompt = format_prompt(user_template, **prompt_vars)
+                system_prompt = format_prompt(system_template, **prompt_vars)
+                user_prompt = format_prompt(user_template, **prompt_vars)
 
-            # Save AML prompt file
-            aml_number = str(i + 1).zfill(digits)
-            aml_file = amls_path / f"aml-{aml_number}.md"
-            aml_content = f"""# AML Prompt {aml_number}
+                aml_number = str(review_index + 1).zfill(digits)
+                aml_file = amls_path / f"aml-{aml_number}.md"
+                aml_content = f"# AML Prompt {aml_number}\n\n## System Prompt\n{system_prompt}\n\n## User Prompt\n{user_prompt}\n"
+                aml_file.write_text(aml_content, encoding="utf-8")
 
-## Assigned Parameters
-- **Sentence Polarity Distribution**: {int(polarity_dist["positive"]*100)}% pos, {int(polarity_dist["neutral"]*100)}% neu, {int(polarity_dist["negative"]*100)}% neg
-- **Age**: {reviewer.age}
-- **Sex**: {reviewer.sex}
-- **Length**: {num_sentences}-{num_sentences + 1} sentences
+                review_text = None
+                parsed_review = None
+                validation_error = None
+                validation_retries = 0
+                local_error = False
+                local_malformed = False
+                local_error_msg = None
 
-## System Prompt
-{system_prompt}
+                for retry in range(MAX_RETRIES + MAX_VALIDATION_RETRIES):
+                    try:
+                        async with rate_limit_lock:
+                            elapsed_since_last = time.time() - last_request_times[0]
+                            if elapsed_since_last < REQUEST_DELAY:
+                                await asyncio.sleep(REQUEST_DELAY - elapsed_since_last)
+                            last_request_times[0] = time.time()
 
-## User Prompt
-{user_prompt}
-"""
-            aml_file.write_text(aml_content, encoding="utf-8")
+                        messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ]
 
-            # Generate review via LLM with rate limiting, retry, and validation
-            review_text = None
-            parsed_review = None
-            validation_error = None
-            validation_retries = 0
-
-            for retry in range(MAX_RETRIES + MAX_VALIDATION_RETRIES):
-                try:
-                    # Rate limiting: wait if needed
-                    elapsed_since_last = time.time() - last_request_time
-                    if elapsed_since_last < REQUEST_DELAY:
-                        wait_time = REQUEST_DELAY - elapsed_since_last
-                        await asyncio.sleep(wait_time)
-
-                    last_request_time = time.time()
-
-                    # Build messages - add correction hint if this is a validation retry
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ]
-
-                    # If retrying due to validation failure, add correction context
-                    if validation_error and validation_retries > 0:
-                        correction_prompt = f"""Your previous response was invalid: {validation_error}
+                        if validation_error and validation_retries > 0:
+                            correction_prompt = f"""Your previous response was invalid: {validation_error}
 
 Please respond with ONLY a valid JSON object (no markdown fences, no extra text).
 The JSON must have this exact structure:
@@ -2938,192 +2942,193 @@ Requirements:
 - Polarity must be exactly "positive", "negative", or "neutral"
 {"- Every opinion must have 'target' (use 'NULL' for implicit aspects)" if dataset_mode == "explicit" else ""}
 """
-                        messages.append({"role": "assistant", "content": review_text})
-                        messages.append({"role": "user", "content": correction_prompt})
+                            messages.append({"role": "assistant", "content": review_text})
+                            messages.append({"role": "user", "content": correction_prompt})
 
-                    # chat() returns the content string directly, not a dict
-                    review_text = await llm.chat(
-                        model=model,
-                        messages=messages,
-                        temperature=temperature if validation_retries == 0 else max(0.3, temperature - 0.2),
-                        max_tokens=1500,
-                    )
+                        review_text = await llm.chat(
+                            model=model,
+                            messages=messages,
+                            temperature=temperature if validation_retries == 0 else max(0.3, temperature - 0.2),
+                            max_tokens=1500,
+                        )
 
-                    # Validate the response
-                    parsed_review, validation_error = validate_review_json(review_text, dataset_mode)
+                        parsed_review, validation_error = validate_review_json(review_text, dataset_mode)
 
-                    if parsed_review:
-                        # Valid response - exit retry loop
-                        break
-                    else:
-                        # Validation failed
-                        validation_retries += 1
-                        if validation_retries <= MAX_VALIDATION_RETRIES:
-                            print(f"[Generation] Review {i+1} validation failed: {validation_error} (retry {validation_retries}/{MAX_VALIDATION_RETRIES})")
-                            if convex and validation_retries == 1:
-                                await convex.add_log(job_id, "WARN", "AML", f"Review {i+1} malformed JSON, retrying...")
+                        if parsed_review:
+                            break
+                        else:
+                            validation_retries += 1
+                            if validation_retries <= MAX_VALIDATION_RETRIES:
+                                print(f"[Generation] Review {review_index+1} validation failed (retry {validation_retries})")
+                                continue
+                            else:
+                                local_malformed = True
+                                break
+
+                    except Exception as e:
+                        error_msg = str(e)
+                        is_rate_limit = "429" in error_msg or "rate" in error_msg.lower()
+
+                        if is_rate_limit and retry < MAX_RETRIES - 1:
+                            backoff_time = (2 ** retry) * 5
+                            print(f"[Generation] Rate limited on review {review_index+1}, waiting {backoff_time}s")
+                            await asyncio.sleep(backoff_time)
                             continue
                         else:
-                            # Exhausted validation retries - count as malformed
-                            malformed_count += 1
-                            print(f"[Generation] Review {i+1} validation failed after {MAX_VALIDATION_RETRIES} retries: {validation_error}")
-                            if convex and malformed_count <= 3:
-                                await convex.add_log(job_id, "WARN", "AML", f"Review {i+1} malformed after retries: {validation_error[:80]}")
+                            local_error = True
+                            local_error_msg = error_msg
+                            print(f"[Generation] Error generating review {review_index+1}: {error_msg}")
                             break
 
-                except Exception as e:
-                    error_msg = str(e)
+                return {
+                    "index": review_index,
+                    "aml_number": aml_number,
+                    "error": local_error,
+                    "malformed": local_malformed,
+                    "error_msg": local_error_msg,
+                    "reviewer": reviewer,
+                    "num_sentences": num_sentences,
+                    "temperature": temperature,
+                    "parsed_review": parsed_review,
+                    "review_text": review_text,
+                }
 
-                    # Check if it's a rate limit error (429)
-                    is_rate_limit = "429" in error_msg or "rate" in error_msg.lower() or "too many" in error_msg.lower()
+        # Process in batches for progress tracking
+        print(f"[Generation] Starting parallel generation with {request_size} concurrent requests")
+        if convex:
+            await convex.add_log(job_id, "INFO", "AML", f"Parallel generation: {request_size} concurrent requests")
 
-                    if is_rate_limit and retry < MAX_RETRIES - 1:
-                        # Exponential backoff for rate limits
-                        backoff_time = (2 ** retry) * 5  # 5s, 10s, 20s
-                        print(f"[Generation] Rate limited on review {i+1}, waiting {backoff_time}s (retry {retry+1}/{MAX_RETRIES})")
-                        if convex and retry == 0:
-                            await convex.add_log(job_id, "WARN", "AML", f"Rate limited, backing off {backoff_time}s...")
-                        await asyncio.sleep(backoff_time)
-                        continue
-                    else:
-                        # Non-rate-limit error or final retry
-                        error_count += 1
-                        last_error_msg = error_msg
-                        print(f"[Generation] Error generating review {i+1}: {error_msg}")
+        batch_start = 0
+        stop_generation = False
 
-                        # Log errors: first 3 errors individually, then summary
-                        if convex:
-                            if error_count <= 3:
-                                await convex.add_log(job_id, "ERROR", "AML", f"Review {i+1} failed: {error_msg[:150]}")
-                            elif error_count == 4:
-                                await convex.add_log(job_id, "WARN", "AML", "Multiple errors occurring, will show summary at end")
-                        break  # Exit retry loop on non-recoverable error
+        while batch_start < total_reviews and not stop_generation:
+            if convex and batch_start > 0:
+                job_status = await convex.get_job(job_id)
+                if job_status and job_status.get("status") in ["terminated", "paused"]:
+                    status = job_status.get("status")
+                    print(f"[Generation] Job {status} by user")
+                    await convex.update_progress(job_id, 100, status.capitalize())
+                    return {"status": status, "jobId": job_id, "generatedCount": generated_count}
 
-            # Process successful generation
-            if parsed_review:
-                # Successfully parsed and validated JSON
-                sentences = parsed_review["sentences"]
+            batch_end = min(batch_start + request_size, total_reviews)
+            tasks = [generate_single_review(i) for i in range(batch_start, batch_end)]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Compute character offsets for explicit mode targets
-                for sent in sentences:
-                    for opinion in sent.get("opinions", []):
-                        target = opinion.get("target")
-                        if target and target != "NULL":
-                            # Find target substring in sentence text
-                            text = sent.get("text", "")
-                            idx = text.lower().find(target.lower())
-                            if idx >= 0:
-                                opinion["from"] = idx
-                                opinion["to"] = idx + len(target)
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    error_count += 1
+                    continue
+
+                if result["error"]:
+                    error_count += 1
+                    last_error_msg = result["error_msg"]
+                    continue
+
+                if result["malformed"]:
+                    malformed_count += 1
+                    continue
+
+                parsed_review = result["parsed_review"]
+                if parsed_review:
+                    sentences = parsed_review["sentences"]
+                    for sent in sentences:
+                        for opinion in sent.get("opinions", []):
+                            target = opinion.get("target")
+                            if target and target != "NULL":
+                                target = target.strip()
+                                words = target.split()
+                                if len(words) > 1:
+                                    target = words[-1]
+                                target = target.lower()
+                                text = sent.get("text", "")
+                                idx = text.lower().find(target)
+                                if idx >= 0:
+                                    opinion["target"] = target
+                                    opinion["from"] = idx
+                                    opinion["to"] = idx + len(target)
+                                else:
+                                    opinion["target"] = "NULL"
+                                    opinion["from"] = 0
+                                    opinion["to"] = 0
                             else:
+                                opinion["target"] = "NULL"
                                 opinion["from"] = 0
                                 opinion["to"] = 0
-                        else:
-                            opinion["target"] = "NULL"
-                            opinion["from"] = 0
-                            opinion["to"] = 0
 
-                # Build full review text from sentences
-                full_text = " ".join(s["text"] for s in sentences)
-
-                reviews.append({
-                    "id": f"aml-{aml_number}",
-                    "review_text": full_text,
-                    "sentences": sentences,
-                    "assigned": {
-                        "polarity_distribution": {
-                            "positive": int(polarity_dist["positive"] * 100),
-                            "neutral": int(polarity_dist["neutral"] * 100),
-                            "negative": int(polarity_dist["negative"] * 100),
+                    full_text = " ".join(s["text"] for s in sentences)
+                    reviews.append({
+                        "id": f"aml-{result['aml_number']}",
+                        "review_text": full_text,
+                        "sentences": sentences,
+                        "assigned": {
+                            "polarity_distribution": {
+                                "positive": int(polarity_dist["positive"] * 100),
+                                "neutral": int(polarity_dist["neutral"] * 100),
+                                "negative": int(polarity_dist["negative"] * 100),
+                            },
+                            "age": result["reviewer"].age,
+                            "sex": result["reviewer"].sex,
+                            "num_sentences": result["num_sentences"],
+                            "temperature": round(result["temperature"], 2),
                         },
-                        "age": reviewer.age,
-                        "sex": reviewer.sex,
-                        "num_sentences": num_sentences,
-                        "temperature": round(temperature, 2),
-                    },
-                })
-                generated_count += 1
-                total_sentences_generated += len(sentences)
-            elif review_text and isinstance(review_text, str):
-                # Fallback: treat as plain text (no structured annotations)
-                # This happens when validation fails after all retries
-                review_text = review_text.strip()
-                reviews.append({
-                    "id": f"aml-{aml_number}",
-                    "review_text": review_text,
-                    "sentences": [],
-                    "assigned": {
-                        "polarity_distribution": {
-                            "positive": int(polarity_dist["positive"] * 100),
-                            "neutral": int(polarity_dist["neutral"] * 100),
-                            "negative": int(polarity_dist["negative"] * 100),
-                        },
-                        "age": reviewer.age,
-                        "sex": reviewer.sex,
-                        "num_sentences": num_sentences,
-                        "temperature": round(temperature, 2),
-                    },
-                })
-                generated_count += 1
-                # For fallback reviews, estimate sentences from assigned num_sentences
-                total_sentences_generated += num_sentences
+                    })
+                    generated_count += 1
+                    total_sentences_generated += len(sentences)
 
-            # Update progress after EVERY review for fluid UI updates
+                    if count_mode == 'sentences' and target_sentences and total_sentences_generated >= target_sentences:
+                        print(f"[Generation] Target reached: {total_sentences_generated} sentences")
+                        if convex:
+                            await convex.add_log(job_id, "INFO", "AML", f"Target reached: {total_sentences_generated} sentences")
+                        stop_generation = True
+                        break
+
+                elif result["review_text"]:
+                    reviews.append({
+                        "id": f"aml-{result['aml_number']}",
+                        "review_text": result["review_text"].strip(),
+                        "sentences": [],
+                        "assigned": {
+                            "polarity_distribution": {
+                                "positive": int(polarity_dist["positive"] * 100),
+                                "neutral": int(polarity_dist["neutral"] * 100),
+                                "negative": int(polarity_dist["negative"] * 100),
+                            },
+                            "age": result["reviewer"].age,
+                            "sex": result["reviewer"].sex,
+                            "num_sentences": result["num_sentences"],
+                            "temperature": round(result["temperature"], 2),
+                        },
+                    })
+                    generated_count += 1
+                    total_sentences_generated += result["num_sentences"]
+
+            # Update progress after batch
             elapsed = time.time() - start_time
-            # Calculate progress from 5-99% during generation
-            # 100% is set when job completes/fails
             if count_mode == 'sentences' and target_sentences:
-                # Progress based on sentences generated
                 progress_float = 5 + min(total_sentences_generated / target_sentences, 1.0) * 94
             else:
-                # Progress based on reviews generated
-                progress_float = 5 + (i + 1) / total_reviews * 94
-            progress = min(int(progress_float), 99)  # Cap at 99% until completion
+                progress_float = 5 + batch_end / total_reviews * 94
+            progress = min(int(progress_float), 99)
+            rate = generated_count / elapsed * 60 if elapsed > 0 else 0
 
-            # Calculate rate
-            rate = generated_count / elapsed * 60 if elapsed > 0 else 0  # reviews per minute
-
-            # Update Convex on every review for fluid progress bar
             if convex:
                 await convex.update_progress(job_id, progress, "AML")
                 await convex.update_generated_count(job_id, generated_count)
-                # Only update failed count if there are actual failures
+                # Update sentence count for sentence mode UI tracking
+                if count_mode == 'sentences':
+                    await convex.update_generated_sentences(job_id, total_sentences_generated)
                 if error_count > 0:
                     await convex.update_failed_count(job_id, error_count)
 
-            # Log detailed progress less frequently (every 10% or 10 reviews)
-            log_interval = max(1, min(total_reviews // 10, 10))
-            should_log = (i + 1) % log_interval == 0 or i == total_reviews - 1
+            elapsed_str = f"{int(elapsed)}s" if elapsed < 60 else f"{int(elapsed//60)}m {int(elapsed%60)}s"
+            print(f"[Generation] Progress: {generated_count}/{total_reviews} ({progress}%) | {rate:.1f}/min")
+            if convex:
+                await convex.add_log(job_id, "INFO", "AML", f"Progress: {generated_count}/{total_reviews} ({progress}%) | {elapsed_str} | {rate:.1f}/min")
 
-            if should_log and convex:
-                # Detailed progress log
-                elapsed_str = f"{int(elapsed)}s" if elapsed < 60 else f"{int(elapsed//60)}m {int(elapsed%60)}s"
-                if count_mode == 'sentences' and target_sentences:
-                    await convex.add_log(
-                        job_id, "INFO", "AML",
-                        f"Progress: {total_sentences_generated}/{target_sentences} sentences ({generated_count} reviews, {progress}%) | {elapsed_str} elapsed | {rate:.1f} reviews/min"
-                    )
-                else:
-                    await convex.add_log(
-                        job_id, "INFO", "AML",
-                        f"Progress: {generated_count}/{total_reviews} ({progress}%) | {elapsed_str} elapsed | {rate:.1f} reviews/min"
-                    )
+            batch_start = batch_end
 
-                # Log sample preview for first few successful reviews
-                if generated_count <= 3 and reviews:
-                    preview = reviews[-1]["review_text"][:80] + "..." if len(reviews[-1]["review_text"]) > 80 else reviews[-1]["review_text"]
-                    await convex.add_log(job_id, "INFO", "Sample", f'"{preview}"')
-
-                # Warn if error rate is climbing
-                current_error_rate = error_count / (i + 1) if i > 0 else 0
-                if current_error_rate > 0.2 and i > 10:
-                    await convex.add_log(job_id, "WARN", "AML", f"High error rate: {error_count}/{i+1} failed ({current_error_rate:.0%})")
-
-            if should_log:
-                if count_mode == 'sentences' and target_sentences:
-                    print(f"[Generation] Progress: {total_sentences_generated}/{target_sentences} sentences ({generated_count} reviews, {progress}%) | {rate:.1f}/min")
-                else:
-                    print(f"[Generation] Progress: {generated_count}/{total_reviews} ({progress}%) | {rate:.1f}/min")
+        # Sort reviews by ID to ensure consistent ordering
+        reviews.sort(key=lambda r: r["id"])
 
         # ========================================
         # Save dataset (always save JSONL + user-selected formats)
@@ -3134,6 +3139,9 @@ Requirements:
 
         # Get selected output formats (default to jsonl if none specified)
         output_formats = config.generation.output_formats or ["jsonl"]
+        # Always ensure JSONL is included (needed for conformity calculation and internal processing)
+        if "jsonl" not in output_formats:
+            output_formats = list(output_formats) + ["jsonl"]
         saved_formats = []
 
         # Determine dataset mode for export
@@ -3184,13 +3192,16 @@ Requirements:
                 with open(jsonl_path, "w", encoding="utf-8") as f:
                     for idx, review in enumerate(reviews_data):
                         sentences = build_review_sentences(review, mode)
+                        # Handle polarity - can be distribution object or single value
+                        assigned = review.get("assigned", {})
+                        polarity_data = assigned.get("polarity_distribution") or assigned.get("polarity", {})
                         jsonl_entry = {
                             "id": str(idx),
                             "sentences": [],
                             "metadata": {
-                                "assigned_polarity": review["assigned"]["polarity"],
-                                "age": review["assigned"]["age"],
-                                "sex": review["assigned"]["sex"],
+                                "assigned_polarity": polarity_data,
+                                "age": assigned.get("age"),
+                                "sex": assigned.get("sex"),
                             }
                         }
                         for s_idx, sent in enumerate(sentences):
@@ -3319,6 +3330,9 @@ Requirements:
         if convex:
             await convex.update_progress(job_id, 100, "Complete")
             await convex.update_generated_count(job_id, generated_count)
+            # Final sentence count update for sentence mode
+            if count_mode == 'sentences':
+                await convex.update_generated_sentences(job_id, total_sentences_generated)
 
             # Log summary statistics
             await convex.add_log(job_id, "INFO", "Summary", "=" * 40)
@@ -3654,6 +3668,18 @@ async def execute_heuristic_pipeline(
             else:
                 await convex.add_log(job_id, "INFO", "Heuristic", "Starting heuristic generation pipeline...")
 
+            # Early GPU/CPU detection - set immediately so UI shows the badge
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    device_name = torch.cuda.get_device_name(0)
+                    await convex.set_evaluation_device(job_id, "GPU", device_name)
+                    await convex.add_log(job_id, "INFO", "Heuristic", f"GPU detected: {device_name}")
+                else:
+                    await convex.set_evaluation_device(job_id, "CPU")
+            except ImportError:
+                await convex.set_evaluation_device(job_id, "CPU")
+
         # Calculate total reviews and batches
         if heuristic_config.targetMode == "reviews":
             total_reviews = heuristic_config.targetValue
@@ -3710,13 +3736,14 @@ Structure:
 
 Rules:
 - "text": The sentence text (non-empty string)
-- "target": The aspect term as it appears in the text (exact substring)
+- "target": MUST be a SINGLE WORD (noun) in lowercase that appears exactly in the text
 - "category": Use categories mentioned in the prompt above
 - "polarity": One of "positive", "negative", "neutral"
 - "from": Character offset where target starts in the text (0-indexed)
-- "to": Character offset where target ends (exclusive)
+- "to": Character offset where target ends (exclusive, NOT including any character after the word)
 
 Important:
+- The target MUST be a single lowercase word, NOT a phrase (e.g., "food" not "the food", "service" not "great service")
 - The "from" and "to" must be accurate character positions for the target substring
 - A sentence can have multiple opinions about different aspects
 - A sentence can have zero opinions if it's neutral/general
@@ -3827,6 +3854,36 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                             "batch": batch_num,
                         })
 
+            # Normalize targets: single-word, lowercase, fix offsets
+            for review in all_reviews:
+                for sentence in review.get("sentences", []):
+                    text = sentence.get("text", "")
+                    for opinion in sentence.get("opinions", []):
+                        target = opinion.get("target")
+                        if target and target != "NULL":
+                            # Strip whitespace
+                            target = target.strip()
+                            # If multi-word, extract the last word (typically the noun)
+                            words = target.split()
+                            if len(words) > 1:
+                                target = words[-1]
+                            # Lowercase
+                            target = target.lower()
+                            # Recalculate offsets
+                            idx = text.lower().find(target)
+                            if idx >= 0:
+                                opinion["target"] = target
+                                opinion["from"] = idx
+                                opinion["to"] = idx + len(target)
+                            else:
+                                opinion["target"] = "NULL"
+                                opinion["from"] = 0
+                                opinion["to"] = 0
+                        else:
+                            opinion["target"] = "NULL"
+                            opinion["from"] = 0
+                            opinion["to"] = 0
+
             if convex:
                 if total_runs > 1:
                     await convex.add_log(job_id, "INFO", "Heuristic", f"Run {current_run}/{total_runs} complete. Reviews: {len(all_reviews)}")
@@ -3935,6 +3992,23 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                 if convex:
                     if current_run == 1:
                         await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
+                        # Log and save GPU status (only on first run)
+                        device_type, device_name = get_mdqa_device_info()
+                        if device_type == "GPU":
+                            await convex.add_log(job_id, "INFO", "MDQA", f"Using GPU acceleration: {device_name}")
+                        else:
+                            await convex.add_log(job_id, "INFO", "MDQA", "Using CPU (no GPU detected)")
+                        # Save device info to job
+                        await convex.run_mutation("jobs:setEvaluationDevice", {
+                            "jobId": job_id,
+                            "device": {"type": device_type, "name": device_name or None},
+                        })
+                        # Log reference dataset status (only on first run)
+                        ref_enabled = evaluation_config.get("reference_metrics_enabled", False)
+                        if ref_enabled:
+                            await convex.add_log(job_id, "INFO", "MDQA", "Reference dataset: Enabled (Lexical + Semantic + Diversity)")
+                        else:
+                            await convex.add_log(job_id, "INFO", "MDQA", "Reference dataset: Not provided (Diversity metrics only)")
                     if total_runs > 1:
                         await convex.add_log(job_id, "INFO", "MDQA", f"Evaluating run {current_run}/{total_runs}...")
                     else:
@@ -4196,6 +4270,20 @@ async def execute_pipeline(
             })
             await convex.add_log(job_id, "INFO", "Pipeline", f"Starting pipeline with phases: {', '.join(phases)}")
 
+            # Early GPU/CPU detection - set immediately so UI shows the badge
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    device_name = torch.cuda.get_device_name(0)
+                    await convex.set_evaluation_device(job_id, "GPU", device_name)
+                    await convex.add_log(job_id, "INFO", "Pipeline", f"GPU detected: {device_name}")
+                else:
+                    await convex.set_evaluation_device(job_id, "CPU")
+                    await convex.add_log(job_id, "INFO", "Pipeline", "Running on CPU (no CUDA GPU available)")
+            except ImportError:
+                await convex.set_evaluation_device(job_id, "CPU")
+                await convex.add_log(job_id, "INFO", "Pipeline", "Running on CPU (PyTorch not available)")
+
         # ========================================
         # Phase 1: COMPOSITION (SIL + MAV)
         # ========================================
@@ -4231,7 +4319,84 @@ async def execute_pipeline(
         # ========================================
         gen_result = None
         all_run_metrics = []  # Collect metrics from each run for averaging
+        all_run_conformity = []  # Collect conformity from each run for averaging
         total_runs = config.generation.total_runs if config and config.generation else 1
+
+        # Helper function to calculate conformity from reviews (defined early so it's available in loop)
+        def calculate_conformity_from_reviews(reviews: list, job_config: JobConfig) -> dict:
+            """Calculate conformity metrics from a list of reviews."""
+            target_polarity = {
+                "positive": job_config.attributes_profile.polarity.positive / 100,
+                "neutral": job_config.attributes_profile.polarity.neutral / 100,
+                "negative": job_config.attributes_profile.polarity.negative / 100,
+            }
+            total_reviews = len(reviews)
+
+            # Count polarities at the OPINION level (sentence-level sentiment)
+            opinion_counts = {"positive": 0, "neutral": 0, "negative": 0}
+            total_opinions = 0
+            for r in reviews:
+                sentences = r.get("sentences", [])
+                for sentence in sentences:
+                    opinions = sentence.get("opinions", [])
+                    for opinion in opinions:
+                        pol = opinion.get("polarity", "").lower()
+                        if pol in opinion_counts:
+                            opinion_counts[pol] += 1
+                            total_opinions += 1
+
+            # Calculate actual sentence-level polarity distribution
+            if total_opinions > 0:
+                actual_polarity = {k: v / total_opinions for k, v in opinion_counts.items()}
+            else:
+                actual_polarity = target_polarity  # Fallback if no opinions found
+
+            # Total Variation Distance (TVD) for distribution comparison
+            polarity_diff = sum(abs(target_polarity[k] - actual_polarity.get(k, 0)) for k in target_polarity) / 2
+            polarity_conformity = round(1.0 - polarity_diff, 4)
+
+            # Length conformity
+            length_range = job_config.attributes_profile.length_range
+            in_range_count = 0
+            for r in reviews:
+                sentences = r.get("sentences", [])
+                sent_count = len(sentences)
+                if length_range[0] <= sent_count <= length_range[1]:
+                    in_range_count += 1
+            length_conformity = round(in_range_count / total_reviews, 4) if total_reviews > 0 else 0.0
+
+            # Noise conformity (based on whether noise was supposed to be applied)
+            noise_config = job_config.attributes_profile.noise
+            if noise_config.typo_rate > 0 or noise_config.colloquialism or noise_config.grammar_errors:
+                noise_conformity = 0.85  # Assume noise was applied if configured
+            else:
+                noise_conformity = 1.0  # No noise configured, so 100% conformity
+
+            # Validation conformity (check structure is valid)
+            valid_count = 0
+            for r in reviews:
+                if r.get("sentences") and len(r.get("sentences", [])) > 0:
+                    valid_count += 1
+            validation_conformity = round(valid_count / total_reviews, 4) if total_reviews > 0 else 0.0
+
+            # Temperature conformity (check if temperature was in range)
+            temp_range = getattr(job_config.attributes_profile, 'temp_range', [0.7, 0.9])
+            if not temp_range:
+                temp_range = [0.7, 0.9]
+            in_temp_range = 0
+            for r in reviews:
+                temp = r.get("assigned", {}).get("temperature")
+                if temp is not None and temp_range[0] <= temp <= temp_range[1]:
+                    in_temp_range += 1
+            temperature_conformity = round(in_temp_range / total_reviews, 4) if total_reviews > 0 else 1.0
+
+            return {
+                "polarity": polarity_conformity,
+                "length": length_conformity,
+                "noise": noise_conformity,
+                "validation": validation_conformity,
+                "temperature": temperature_conformity,
+            }
 
         if "generation" in phases:
             # Check if job was terminated during composition
@@ -4278,6 +4443,16 @@ async def execute_pipeline(
                     should_complete_job=False,  # Pipeline handles completion after evaluation
                 )
 
+                # Calculate conformity from in-memory reviews (before files are renamed)
+                if gen_result and gen_result.get("reviews"):
+                    try:
+                        run_conf = calculate_conformity_from_reviews(gen_result["reviews"], config)
+                        run_conf["run"] = current_run
+                        run_conf["reviewCount"] = len(gen_result["reviews"])
+                        all_run_conformity.append(run_conf)
+                    except Exception as e:
+                        print(f"[Pipeline] Warning: Could not calculate conformity for run {current_run}: {e}")
+
                 # For multi-run: save dataset with run suffix
                 if total_runs > 1 and gen_result and gen_result.get("reviews"):
                     import shutil
@@ -4287,7 +4462,11 @@ async def execute_pipeline(
                     # Helper to rename files with run suffix
                     def rename_with_run_suffix(pattern_base: str, extension: str):
                         """Rename files like reviews{suffix}.ext to reviews-runN{suffix}.ext"""
+                        import re
                         for f in dataset_dir.glob(f"{pattern_base}*{extension}"):
+                            # Skip files that already have a -runN suffix (from previous runs)
+                            if re.search(r'-run\d+', f.stem):
+                                continue
                             # Extract suffix (e.g., "-explicit" from "reviews-explicit.xml")
                             suffix = f.stem.replace(pattern_base, "")
                             new_name = f"{pattern_base}-run{current_run}{suffix}{extension}"
@@ -4304,82 +4483,190 @@ async def execute_pipeline(
                 else:
                     await convex.add_log(job_id, "INFO", "AML", "Generation phase complete.")
 
-            # Compute and store conformity report
-            if convex and gen_result and gen_result.get("reviews"):
-                try:
-                    reviews = gen_result["reviews"]
-                    # Polarity Conformity: compare SENTENCE-LEVEL polarity vs target distribution
-                    # The target distribution represents the desired mix of sentiments at the sentence/opinion level
-                    target_polarity = {
-                        "positive": config.attributes_profile.polarity.positive / 100,
-                        "neutral": config.attributes_profile.polarity.neutral / 100,
-                        "negative": config.attributes_profile.polarity.negative / 100,
-                    }
-                    total_reviews = len(reviews)
+            # Compute and store conformity report (with multi-run support)
+            # Helper function to calculate conformity from reviews
+            def calculate_conformity(reviews: list, config: JobConfig) -> dict:
+                """Calculate conformity metrics from a list of reviews."""
+                target_polarity = {
+                    "positive": config.attributes_profile.polarity.positive / 100,
+                    "neutral": config.attributes_profile.polarity.neutral / 100,
+                    "negative": config.attributes_profile.polarity.negative / 100,
+                }
+                total_reviews = len(reviews)
 
-                    # Count polarities at the OPINION level (sentence-level sentiment)
-                    opinion_counts = {"positive": 0, "neutral": 0, "negative": 0}
-                    total_opinions = 0
-                    for r in reviews:
-                        sentences = r.get("sentences", [])
-                        for sentence in sentences:
-                            opinions = sentence.get("opinions", [])
-                            for opinion in opinions:
-                                pol = opinion.get("polarity", "").lower()
-                                if pol in opinion_counts:
-                                    opinion_counts[pol] += 1
-                                    total_opinions += 1
+                # Count polarities at the OPINION level (sentence-level sentiment)
+                opinion_counts = {"positive": 0, "neutral": 0, "negative": 0}
+                total_opinions = 0
+                for r in reviews:
+                    sentences = r.get("sentences", [])
+                    for sentence in sentences:
+                        opinions = sentence.get("opinions", [])
+                        for opinion in opinions:
+                            pol = opinion.get("polarity", "").lower()
+                            if pol in opinion_counts:
+                                opinion_counts[pol] += 1
+                                total_opinions += 1
 
-                    # Calculate actual sentence-level polarity distribution
-                    if total_opinions > 0:
-                        actual_polarity = {k: v / total_opinions for k, v in opinion_counts.items()}
+                # Calculate actual sentence-level polarity distribution
+                if total_opinions > 0:
+                    actual_polarity = {k: v / total_opinions for k, v in opinion_counts.items()}
+                else:
+                    actual_polarity = target_polarity  # Fallback if no opinions found
+
+                # Total Variation Distance (TVD) for distribution comparison
+                polarity_diff = sum(abs(target_polarity[k] - actual_polarity.get(k, 0)) for k in target_polarity) / 2
+                polarity_conformity = round(1.0 - polarity_diff, 4)
+
+                # Length Conformity: fraction of reviews within target length range
+                length_range = config.attributes_profile.length_range
+                min_len, max_len = length_range[0], length_range[1]
+                within_range = 0
+                for r in reviews:
+                    num_sentences = len(r.get("sentences", []))
+                    if not num_sentences:
+                        num_sentences = (r.get("assigned") or {}).get("num_sentences", min_len)
+                    if min_len <= num_sentences <= max_len:
+                        within_range += 1
+                length_conformity = round(within_range / total_reviews, 4) if total_reviews > 0 else 1.0
+
+                # Noise Conformity
+                noise_config = config.attributes_profile.noise
+                if noise_config.typo_rate == 0 and not noise_config.colloquialism and not noise_config.grammar_errors:
+                    noise_conformity = 1.0
+                else:
+                    noise_conformity = 0.95 + (0.05 * (1 - noise_config.typo_rate))
+                    noise_conformity = round(min(noise_conformity, 1.0), 4)
+
+                # Validation Conformity
+                valid_json_count = sum(1 for r in reviews if r.get("sentences"))
+                validation_conformity = round(valid_json_count / total_reviews, 4) if total_reviews > 0 else 1.0
+
+                # Temperature Conformity: fraction of reviews with temperature within target range
+                temp_range = getattr(config.attributes_profile, "temperature_range", None) or [0.7, 0.9]
+                min_temp, max_temp = temp_range[0], temp_range[1]
+                temp_within_range = 0
+                temp_total = 0
+                for r in reviews:
+                    temp = r.get("temperature") or (r.get("assigned") or {}).get("temperature")
+                    if temp is not None:
+                        temp_total += 1
+                        if min_temp <= temp <= max_temp:
+                            temp_within_range += 1
+                temperature_conformity = round(temp_within_range / temp_total, 4) if temp_total > 0 else 1.0
+
+                return {
+                    "polarity": polarity_conformity,
+                    "length": length_conformity,
+                    "noise": noise_conformity,
+                    "validation": validation_conformity,
+                    "temperature": temperature_conformity,
+                }
+
+            # Helper to load reviews from JSONL file
+            def load_reviews_from_jsonl(filepath: Path) -> list:
+                """Load reviews from a JSONL file."""
+                reviews = []
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            reviews.append(json.loads(line))
+                return reviews
+
+            try:
+                from pathlib import Path
+                import numpy as np
+                reports_dir = Path(job_paths["reports"])
+                dataset_dir = Path(job_paths["dataset"])
+                reports_dir.mkdir(parents=True, exist_ok=True)
+
+                if total_runs > 1:
+                    # Multi-run: calculate conformity for each run
+                    per_run_conformity = []
+                    for run_num in range(1, total_runs + 1):
+                        # Find the JSONL file for this run
+                        run_file = None
+                        for pattern in [f"reviews-run{run_num}.jsonl", f"reviews-run{run_num}-explicit.jsonl"]:
+                            candidate = dataset_dir / pattern
+                            if candidate.exists():
+                                run_file = candidate
+                                break
+
+                        if run_file:
+                            run_reviews = load_reviews_from_jsonl(run_file)
+                            if run_reviews:
+                                run_conf = calculate_conformity(run_reviews, config)
+                                run_conf["run"] = run_num
+                                run_conf["reviewCount"] = len(run_reviews)
+                                per_run_conformity.append(run_conf)
+
+                    if per_run_conformity:
+                        # Calculate averages and std
+                        metrics = ["polarity", "length", "noise", "validation", "temperature"]
+                        avg_conformity = {}
+                        std_conformity = {}
+                        for metric in metrics:
+                            values = [r[metric] for r in per_run_conformity]
+                            avg_conformity[metric] = round(float(np.mean(values)), 4)
+                            std_conformity[metric] = round(float(np.std(values)), 4) if len(values) > 1 else 0.0
+
+                        # Save single consolidated conformity report
+                        conformity_report = {
+                            "runs": per_run_conformity,
+                            "average": avg_conformity,
+                            "std": std_conformity,
+                            "totalRuns": len(per_run_conformity),
+                            "isMultiRun": True,
+                        }
+                        report_path = reports_dir / "conformity-report.json"
+                        with open(report_path, "w", encoding="utf-8") as f:
+                            json.dump(conformity_report, f, indent=2)
+
+                        # Store averages in Convex
+                        if convex:
+                            await convex.run_mutation("jobs:setConformityReport", {
+                                "jobId": job_id,
+                                "conformityReport": avg_conformity,
+                            })
+
+                        print(f"[Pipeline] Conformity report saved to {report_path} ({len(per_run_conformity)} runs)")
+                else:
+                    # Single run: use gen_result reviews or load from file
+                    reviews = None
+                    if gen_result and gen_result.get("reviews"):
+                        reviews = gen_result["reviews"]
                     else:
-                        actual_polarity = target_polarity  # Fallback if no opinions found
+                        # Try to load from JSONL file
+                        for pattern in ["reviews.jsonl", "reviews-explicit.jsonl"]:
+                            candidate = dataset_dir / pattern
+                            if candidate.exists():
+                                reviews = load_reviews_from_jsonl(candidate)
+                                break
 
-                    # Total Variation Distance (TVD) for distribution comparison
-                    polarity_diff = sum(abs(target_polarity[k] - actual_polarity.get(k, 0)) for k in target_polarity) / 2
-                    polarity_conformity = round(1.0 - polarity_diff, 4)
+                    if reviews:
+                        conformity_report = calculate_conformity(reviews, config)
+                        conformity_report["reviewCount"] = len(reviews)
 
-                    # Length Conformity: fraction of reviews within target length range
-                    length_range = config.attributes_profile.length_range  # [min, max] sentences
-                    min_len, max_len = length_range[0], length_range[1]
-                    within_range = 0
-                    for r in reviews:
-                        num_sentences = len(r.get("sentences", []))
-                        if not num_sentences:
-                            num_sentences = (r.get("assigned") or {}).get("num_sentences", min_len)
-                        if min_len <= num_sentences <= max_len:
-                            within_range += 1
-                    length_conformity = round(within_range / total_reviews, 4) if total_reviews > 0 else 1.0
+                        # Save conformity report to file
+                        report_path = reports_dir / "conformity-report.json"
+                        with open(report_path, "w", encoding="utf-8") as f:
+                            json.dump(conformity_report, f, indent=2)
 
-                    # Noise Conformity: since noise is applied programmatically, it's near-perfect
-                    # Measure based on whether noise was requested and the generation succeeded
-                    noise_config = config.attributes_profile.noise
-                    if noise_config.typo_rate == 0 and not noise_config.colloquialism and not noise_config.grammar_errors:
-                        noise_conformity = 1.0  # No noise requested = perfect conformity
-                    else:
-                        # Noise was applied programmatically - assume high conformity
-                        # Slight variance from statistical application
-                        noise_conformity = 0.95 + (0.05 * (1 - noise_config.typo_rate))
-                        noise_conformity = round(min(noise_conformity, 1.0), 4)
+                        # Store in Convex
+                        if convex:
+                            await convex.run_mutation("jobs:setConformityReport", {
+                                "jobId": job_id,
+                                "conformityReport": {
+                                    "polarity": conformity_report["polarity"],
+                                    "length": conformity_report["length"],
+                                    "noise": conformity_report["noise"],
+                                    "validation": conformity_report["validation"],
+                                    "temperature": conformity_report["temperature"],
+                                },
+                            })
 
-                    # Validation Conformity: percentage of reviews with valid structured JSON
-                    # Reviews with empty sentences[] array fell back to plain text due to validation failure
-                    malformed_count = gen_result.get("malformedCount", 0)
-                    valid_json_count = sum(1 for r in reviews if r.get("sentences"))
-                    validation_conformity = round(valid_json_count / total_reviews, 4) if total_reviews > 0 else 1.0
-
-                    await convex.run_mutation("jobs:setConformityReport", {
-                        "jobId": job_id,
-                        "conformityReport": {
-                            "polarity": polarity_conformity,
-                            "length": length_conformity,
-                            "noise": noise_conformity,
-                            "validation": validation_conformity,
-                        },
-                    })
-                except Exception as e:
-                    print(f"[Pipeline] Warning: Could not compute conformity: {e}")
+                        print(f"[Pipeline] Conformity report saved to {report_path}")
+            except Exception as e:
+                print(f"[Pipeline] Warning: Could not compute conformity: {e}")
 
         # ========================================
         # Phase 3: EVALUATION (MDQA) - with multi-run support
@@ -4401,8 +4688,28 @@ async def execute_pipeline(
                 else:
                     await convex.add_log(job_id, "INFO", "MDQA", "Starting evaluation phase...")
 
+                # Log and save GPU status
+                device_type, device_name = get_mdqa_device_info()
+                if device_type == "GPU":
+                    await convex.add_log(job_id, "INFO", "MDQA", f"Using GPU acceleration: {device_name}")
+                else:
+                    await convex.add_log(job_id, "INFO", "MDQA", "Using CPU (no GPU detected)")
+                # Save device info to job
+                await convex.run_mutation("jobs:setEvaluationDevice", {
+                    "jobId": job_id,
+                    "device": {"type": device_type, "name": device_name or None},
+                })
+
+                # Log reference dataset status
+                ref_enabled = evaluation_config.get("reference_metrics_enabled", False) if evaluation_config else False
+                if ref_enabled:
+                    await convex.add_log(job_id, "INFO", "MDQA", "Reference dataset: Enabled (Lexical + Semantic + Diversity)")
+                else:
+                    await convex.add_log(job_id, "INFO", "MDQA", "Reference dataset: Not provided (Diversity metrics only)")
+
             # For multi-run: evaluate each run's dataset and collect metrics
-            if total_runs > 1 and "generation" in phases:
+            # Check if multi-run datasets exist (works for both generation+eval and eval-only reruns)
+            if total_runs > 1:
                 import numpy as np
                 from pathlib import Path
                 dataset_dir = Path(job_paths["dataset"])
@@ -4435,6 +4742,8 @@ async def execute_pipeline(
                             dataset_file=str(run_dataset_file),
                             convex=convex,
                             reviews_data=None,  # Load from file
+                            run_number=eval_run,  # Which run (for logging)
+                            save_files=False,  # Don't save per-run files, we'll consolidate at the end
                         )
 
                         if eval_metrics:
@@ -4456,27 +4765,106 @@ async def execute_pipeline(
                                 except Exception as e:
                                     print(f"[Pipeline] Warning: Could not save run {eval_run} metrics: {e}")
 
-                # Compute average metrics with standard deviation
-                if len(all_run_metrics) > 1 and convex:
+                # Compute average metrics with standard deviation and save consolidated files
+                if len(all_run_metrics) >= 1:
+                    import csv as csv_module
+
                     avg_metrics = {}
+                    std_metrics = {}
                     for key in all_run_metrics[0].keys():
                         values = [m.get(key) for m in all_run_metrics if m.get(key) is not None]
                         if values:
                             try:
                                 values_array = np.array([float(v) for v in values])
                                 avg_metrics[key] = float(round(np.mean(values_array), 6))
-                                avg_metrics[f"{key}_std"] = float(round(np.std(values_array), 6))
+                                std_metrics[key] = float(round(np.std(values_array), 6)) if len(values) > 1 else 0.0
                             except (TypeError, ValueError):
                                 avg_metrics[key] = values[0]
+                                std_metrics[key] = 0.0
 
-                    try:
-                        await convex.run_mutation("jobs:setEvaluationMetrics", {
-                            "jobId": job_id,
-                            "evaluationMetrics": avg_metrics,
-                        })
-                        await convex.add_log(job_id, "INFO", "MDQA", f"Evaluation complete - averaged {len(all_run_metrics)} runs.")
-                    except Exception as e:
-                        print(f"[Pipeline] Warning: Could not store multi-run metrics: {e}")
+                    # Store in Convex with std values
+                    combined_metrics = {**avg_metrics}
+                    for key, std_val in std_metrics.items():
+                        combined_metrics[f"{key}_std"] = std_val
+
+                    if convex:
+                        try:
+                            await convex.run_mutation("jobs:setEvaluationMetrics", {
+                                "jobId": job_id,
+                                "evaluationMetrics": combined_metrics,
+                            })
+                            await convex.add_log(job_id, "INFO", "MDQA", f"Evaluation complete - averaged {len(all_run_metrics)} runs.")
+                        except Exception as e:
+                            print(f"[Pipeline] Warning: Could not store multi-run metrics: {e}")
+
+                    # Save consolidated files (single file per category with run column)
+                    metric_categories = {
+                        "lexical": ["bleu", "rouge_l"],
+                        "semantic": ["bertscore", "moverscore"],
+                        "diversity": ["distinct_1", "distinct_2", "self_bleu"],
+                    }
+                    metric_descriptions = {
+                        "bleu": "N-gram overlap precision score",
+                        "rouge_l": "Longest common subsequence recall",
+                        "bertscore": "Contextual similarity using BERT embeddings",
+                        "moverscore": "Earth mover distance on word embeddings",
+                        "distinct_1": "Unique unigram ratio",
+                        "distinct_2": "Unique bigram ratio",
+                        "self_bleu": "Intra-corpus similarity (lower = more diverse)",
+                    }
+
+                    metrics_dir = dataset_dir.parent / "metrics"
+                    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Save consolidated CSV per category (long format with run column)
+                    for category, metric_names in metric_categories.items():
+                        csv_path = metrics_dir / f"{category}-metrics.csv"
+                        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                            writer = csv_module.writer(f)
+                            writer.writerow(["run", "metric", "score", "description"])
+                            # Write all runs
+                            for run_idx, run_metrics in enumerate(all_run_metrics, 1):
+                                for metric in metric_names:
+                                    val = run_metrics.get(metric)
+                                    if val is not None:
+                                        writer.writerow([run_idx, metric, f"{val:.6f}", metric_descriptions.get(metric, "")])
+                            # Write average row
+                            for metric in metric_names:
+                                val = avg_metrics.get(metric)
+                                if val is not None:
+                                    writer.writerow(["avg", metric, f"{val:.6f}", f"Average across {len(all_run_metrics)} runs"])
+                            # Write std row
+                            for metric in metric_names:
+                                val = std_metrics.get(metric)
+                                if val is not None:
+                                    writer.writerow(["std", metric, f"{val:.6f}", "Standard deviation"])
+                        print(f"[Evaluation] Saved {category} metrics: {csv_path}")
+
+                    # Save consolidated JSON with all runs
+                    all_runs_json = {
+                        "runs": [],
+                        "average": {},
+                        "std": {},
+                        "totalRuns": len(all_run_metrics),
+                    }
+                    for run_idx, run_metrics in enumerate(all_run_metrics, 1):
+                        run_data = {"run": run_idx}
+                        for category, metric_names in metric_categories.items():
+                            run_data[category] = {m: run_metrics.get(m) for m in metric_names if run_metrics.get(m) is not None}
+                        all_runs_json["runs"].append(run_data)
+
+                    for category, metric_names in metric_categories.items():
+                        all_runs_json["average"][category] = {m: avg_metrics.get(m) for m in metric_names if avg_metrics.get(m) is not None}
+                        all_runs_json["std"][category] = {m: std_metrics.get(m) for m in metric_names}
+
+                    # Also add flat versions for compatibility
+                    all_runs_json["average"]["_flat"] = avg_metrics
+                    all_runs_json["std"]["_flat"] = std_metrics
+
+                    json_path = metrics_dir / "mdqa-results.json"
+                    with open(json_path, "w") as f:
+                        json.dump(all_runs_json, f, indent=2)
+                    print(f"[Evaluation] Saved consolidated metrics: {json_path}")
             else:
                 # Single run evaluation (original behavior)
                 eval_metrics = await execute_evaluation(
@@ -4628,12 +5016,18 @@ async def execute_evaluation(
     dataset_file: Optional[str] = None,
     convex: Optional["ConvexClient"] = None,
     reviews_data: Optional[list] = None,
+    run_number: Optional[int] = None,  # For multi-run: which run this is (1-indexed)
+    save_files: bool = True,  # Whether to save metric files (False for multi-run interim)
 ):
     """
     Run MDQA evaluation on a dataset.
 
     Uses in-memory reviews_data if provided, otherwise reads from file.
     Supports reference dataset for meaningful Lexical/Semantic metrics.
+
+    Args:
+        run_number: If set, indicates which run this is (for logging)
+        save_files: If True, saves metric files. Set to False for multi-run interim evaluations.
     """
     from pathlib import Path
     import json
@@ -4683,6 +5077,31 @@ async def execute_evaluation(
             with open(dataset_path) as f:
                 reader = csv.DictReader(f)
                 reviews = list(reader)
+        elif str(dataset_path).endswith(".xml"):
+            # Parse SemEval-style XML format
+            import xml.etree.ElementTree as ET
+            try:
+                tree = ET.parse(dataset_path)
+                root = tree.getroot()
+                for review_elem in root.findall('./Review'):
+                    review_sentences = []
+                    # Handle both formats: <sentences><sentence>... and <sentence>...
+                    sentences_wrapper = review_elem.find('./sentences')
+                    if sentences_wrapper is not None:
+                        # CERA format: <sentences><sentence>...
+                        sentence_elems = sentences_wrapper.findall('./sentence')
+                    else:
+                        # Standard SemEval format: <sentence> directly under <Review>
+                        sentence_elems = review_elem.findall('./sentence')
+
+                    for sent_elem in sentence_elems:
+                        text_elem = sent_elem.find('text')
+                        if text_elem is not None and text_elem.text:
+                            review_sentences.append({"text": text_elem.text.strip()})
+                    if review_sentences:
+                        reviews.append({"sentences": review_sentences})
+            except ET.ParseError as e:
+                raise ValueError(f"Failed to parse XML file: {e}")
         else:
             # Try to parse as JSONL
             with open(dataset_path) as f:
@@ -4757,6 +5176,18 @@ async def execute_evaluation(
         selected_metrics = [m for m in selected_metrics if m not in reference_required_metrics]
 
     if convex:
+        # Log and save GPU status (only on first run or single run)
+        if run_number is None or run_number == 1:
+            device_type, device_name = get_mdqa_device_info()
+            if device_type == "GPU":
+                await convex.add_log(job_id, "INFO", "MDQA", f"Using GPU acceleration: {device_name}")
+            else:
+                await convex.add_log(job_id, "INFO", "MDQA", "Using CPU (no GPU detected)")
+            # Save device info to job
+            await convex.run_mutation("jobs:setEvaluationDevice", {
+                "jobId": job_id,
+                "device": {"type": device_type, "name": device_name or None},
+            })
         await convex.add_log(job_id, "INFO", "MDQA", f"Computing metrics: {', '.join(selected_metrics)}")
 
     # Compute metrics with Rich progress bar
@@ -4785,10 +5216,17 @@ async def execute_evaluation(
         transient=True,
     ) as progress:
         task = progress.add_task("[cyan]MDQA Evaluation...", total=len(selected_metrics))
+        total_metrics = len(selected_metrics)
 
-        for metric_name in selected_metrics:
+        for idx, metric_name in enumerate(selected_metrics):
             if metric_name in metric_compute_map:
                 progress.update(task, description=f"[cyan]Computing {metric_name}...")
+
+                # Update Convex with per-metric progress (80-95 range)
+                if convex:
+                    metric_progress = 80 + int(((idx + 0.5) / total_metrics) * 15)
+                    await convex.update_progress(job_id, metric_progress, f"MDQA:{metric_name}")
+
                 metrics_results[metric_name] = metric_compute_map[metric_name]()
                 progress.advance(task)
 
@@ -4808,39 +5246,54 @@ async def execute_evaluation(
 
     metrics_results = {k: ensure_python_float(v) for k, v in metrics_results.items()}
 
-    # Keep combined JSON for backward compatibility
-    metrics_path = Path(job_paths["metrics"]) / "mdqa-results.json"
-    with open(metrics_path, "w") as f:
-        json.dump(metrics_results, f, indent=2)
+    # Only save files if requested (skip for multi-run interim evaluations)
+    if save_files:
+        # Metric categories and descriptions
+        metric_categories = {
+            "lexical": ["bleu", "rouge_l"],
+            "semantic": ["bertscore", "moverscore"],
+            "diversity": ["distinct_1", "distinct_2", "self_bleu"],
+        }
+        metric_descriptions = {
+            "bleu": "N-gram overlap precision score",
+            "rouge_l": "Longest common subsequence recall",
+            "bertscore": "Contextual similarity using BERT embeddings",
+            "moverscore": "Earth mover distance on word embeddings",
+            "distinct_1": "Unique unigram ratio",
+            "distinct_2": "Unique bigram ratio",
+            "self_bleu": "Intra-corpus similarity (lower = more diverse)",
+        }
 
-    # Save per-category CSV files (easy to import to Excel/PowerPoint)
-    metric_categories = {
-        "lexical": {"bleu", "rouge_l"},
-        "semantic": {"bertscore", "moverscore"},
-        "diversity": {"distinct_1", "distinct_2", "self_bleu"},
-    }
-    metric_descriptions = {
-        "bleu": "N-gram overlap precision score",
-        "rouge_l": "Longest common subsequence recall",
-        "bertscore": "Contextual similarity using BERT embeddings",
-        "moverscore": "Earth mover distance on word embeddings",
-        "distinct_1": "Unique unigram ratio",
-        "distinct_2": "Unique bigram ratio",
-        "self_bleu": "Intra-corpus similarity (lower = more diverse)",
-    }
+        # Save grouped JSON (organized by category)
+        grouped_results = {}
+        for category, metric_names in metric_categories.items():
+            grouped_results[category] = {
+                k: metrics_results.get(k) for k in metric_names if metrics_results.get(k) is not None
+            }
+        # Also include flat version for backward compatibility
+        grouped_results["_flat"] = metrics_results
 
-    for category, metric_names in metric_categories.items():
-        category_metrics = {k: v for k, v in metrics_results.items() if k in metric_names}
-        if category_metrics:
-            csv_path = Path(job_paths["metrics"]) / f"{category}-metrics.csv"
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv_module.writer(f)
-                writer.writerow(["metric", "score", "description"])
-                for metric, score in category_metrics.items():
-                    writer.writerow([metric, f"{score:.6f}", metric_descriptions.get(metric, "")])
-            print(f"[Evaluation] Saved {category} metrics: {csv_path}")
+        metrics_path = Path(job_paths["metrics"]) / "mdqa-results.json"
+        with open(metrics_path, "w") as f:
+            json.dump(grouped_results, f, indent=2)
 
-    print(f"[Evaluation] Metrics saved to: {metrics_path}")
+        # Save per-category CSV files (easy to import to Excel/PowerPoint)
+        for category, metric_names in metric_categories.items():
+            category_metrics = {k: metrics_results.get(k) for k in metric_names if metrics_results.get(k) is not None}
+            if category_metrics:
+                csv_path = Path(job_paths["metrics"]) / f"{category}-metrics.csv"
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv_module.writer(f)
+                    writer.writerow(["metric", "score", "description"])
+                    # Write metrics in consistent order
+                    for metric in metric_names:
+                        if metric in category_metrics:
+                            score = category_metrics[metric]
+                            writer.writerow([metric, f"{score:.6f}", metric_descriptions.get(metric, "")])
+                print(f"[Evaluation] Saved {category} metrics: {csv_path}")
+
+        print(f"[Evaluation] Metrics saved to: {metrics_path}")
+
     print(f"[Evaluation] Results: {metrics_results}")
 
     if convex:
@@ -4897,6 +5350,26 @@ def compute_self_bleu(texts: list[str], sample_size: int = 100) -> float:
 # Cached SentenceTransformer model for MDQA metrics (same optimization as MAV)
 # =============================================================================
 _mdqa_st_model = None
+_mdqa_device = None  # Cached device info
+
+
+def get_mdqa_device_info() -> tuple[str, str]:
+    """
+    Get MDQA compute device info (for logging).
+    Returns (device_type, device_name) - e.g., ("GPU", "NVIDIA GeForce RTX 3080") or ("CPU", "")
+    """
+    global _mdqa_device
+    if _mdqa_device is None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device_name = torch.cuda.get_device_name(0)
+                _mdqa_device = ("GPU", device_name)
+            else:
+                _mdqa_device = ("CPU", "")
+        except ImportError:
+            _mdqa_device = ("CPU", "")
+    return _mdqa_device
 
 
 def _get_mdqa_st_model():
@@ -4921,6 +5394,16 @@ def _get_mdqa_st_model():
 
         from sentence_transformers import SentenceTransformer
 
+        # Auto-detect GPU availability
+        device = "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+                print(f"[MDQA] GPU detected: {torch.cuda.get_device_name(0)}")
+        except ImportError:
+            pass
+
         # Temporarily redirect stderr to suppress progress bar output
         old_stderr = sys.stderr
         sys.stderr = StringIO()
@@ -4928,16 +5411,16 @@ def _get_mdqa_st_model():
             # Try to load from cache without network check
             try:
                 _mdqa_st_model = SentenceTransformer(
-                    "all-MiniLM-L6-v2", device="cpu", local_files_only=True
+                    "all-MiniLM-L6-v2", device=device, local_files_only=True
                 )
             except Exception:
                 # Fallback: download if not cached
                 _mdqa_st_model = SentenceTransformer(
-                    "all-MiniLM-L6-v2", device="cpu"
+                    "all-MiniLM-L6-v2", device=device
                 )
         finally:
             sys.stderr = old_stderr
-        print("[MDQA] SentenceTransformer model loaded and cached")
+        print(f"[MDQA] SentenceTransformer model loaded on {device.upper()}")
     return _mdqa_st_model
 
 
@@ -5318,6 +5801,12 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
     print(f"[API] Starting pipeline for job: {request.jobId}")
     print(f"[API] Method: {request.method}")
     print(f"[API] Selected phases: {request.phases}")
+    # Debug logging for multi-run
+    if request.config and request.config.generation:
+        print(f"[API] DEBUG: config.generation.total_runs = {request.config.generation.total_runs}")
+        print(f"[API] DEBUG: config.generation (full) = {request.config.generation.model_dump()}")
+    else:
+        print(f"[API] DEBUG: No config or generation config")
 
     background_tasks.add_task(
         execute_pipeline,
@@ -5588,7 +6077,13 @@ class ReadMetricsRequest(BaseModel):
 
 @app.post("/api/read-metrics")
 async def read_metrics(request: ReadMetricsRequest):
-    """Read MDQA metrics from a job directory (3 CSV files)."""
+    """Read MDQA metrics from a job directory.
+
+    Supports:
+    - Single-run metrics: {category}-metrics.csv (no run column)
+    - Multi-run metrics: {category}-metrics.csv (with run column)
+    - Combined JSON: mdqa-results.json (with runs array for multi-run)
+    """
     from pathlib import Path
     import csv
     import json
@@ -5598,40 +6093,171 @@ async def read_metrics(request: ReadMetricsRequest):
         raise HTTPException(status_code=404, detail="Metrics directory not found")
 
     result = {}
+    is_multi_run = False
+    per_run_metrics = {}  # {category: {runN: [metrics]}}
+    average_metrics = {}  # {category: [metrics]}
+    std_metrics = {}  # {category: [metrics]}
 
-    # Read per-category CSV files
-    for category in ["lexical", "semantic", "diversity"]:
-        csv_path = metrics_dir / f"{category}-metrics.csv"
-        if csv_path.exists():
-            metrics = []
-            with open(csv_path, encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    metrics.append({
-                        "metric": row.get("metric", ""),
-                        "score": float(row.get("score", 0)),
-                        "description": row.get("description", ""),
-                    })
-            result[category] = metrics
+    metric_descriptions = {
+        "bleu": "N-gram overlap precision score",
+        "rouge_l": "Longest common subsequence recall",
+        "bertscore": "Contextual similarity using BERT embeddings",
+        "moverscore": "Earth mover distance on word embeddings",
+        "distinct_1": "Unique unigram ratio",
+        "distinct_2": "Unique bigram ratio",
+        "self_bleu": "Intra-corpus similarity (lower = more diverse)",
+    }
 
-    # Fallback: read combined JSON if no CSVs found
-    if not result:
-        json_path = metrics_dir / "mdqa-results.json"
-        if json_path.exists():
-            raw = json.loads(json_path.read_text(encoding="utf-8"))
-            # Categorize the metrics
+    # Try to read from JSON first (preferred for multi-run)
+    json_path = metrics_dir / "mdqa-results.json"
+    if json_path.exists():
+        raw = json.loads(json_path.read_text(encoding="utf-8"))
+
+        # Check if it's the new multi-run format (has "runs" array)
+        if "runs" in raw and isinstance(raw["runs"], list):
+            is_multi_run = True
+            # Extract per-run data
+            for run_data in raw["runs"]:
+                run_num = run_data.get("run", 1)
+                for category in ["lexical", "semantic", "diversity"]:
+                    if category in run_data:
+                        if category not in per_run_metrics:
+                            per_run_metrics[category] = {}
+                        per_run_metrics[category][f"run{run_num}"] = [
+                            {"metric": k, "score": v, "description": metric_descriptions.get(k, "")}
+                            for k, v in run_data[category].items()
+                            if v is not None
+                        ]
+            # Extract averages
+            if "average" in raw:
+                for category in ["lexical", "semantic", "diversity"]:
+                    if category in raw["average"]:
+                        average_metrics[category] = [
+                            {"metric": k, "score": v, "description": metric_descriptions.get(k, "")}
+                            for k, v in raw["average"][category].items()
+                            if v is not None
+                        ]
+            # Extract std
+            if "std" in raw:
+                for category in ["lexical", "semantic", "diversity"]:
+                    if category in raw["std"]:
+                        std_metrics[category] = [
+                            {"metric": k, "score": v, "description": "Standard deviation"}
+                            for k, v in raw["std"][category].items()
+                            if v is not None
+                        ]
+
+            result["isMultiRun"] = True
+            result["totalRuns"] = raw.get("totalRuns", len(raw["runs"]))
+            result["perRun"] = per_run_metrics
+            result["average"] = average_metrics
+            result["std"] = std_metrics
+            # Set main metrics to averages for backward compatibility
+            for category in ["lexical", "semantic", "diversity"]:
+                if category in average_metrics:
+                    result[category] = average_metrics[category]
+
+        # Check if it's the grouped format (single-run with lexical/semantic/diversity keys)
+        elif "lexical" in raw or "semantic" in raw or "diversity" in raw:
+            for category in ["lexical", "semantic", "diversity"]:
+                if category in raw and raw[category]:
+                    result[category] = [
+                        {"metric": k, "score": v, "description": metric_descriptions.get(k, "")}
+                        for k, v in raw[category].items()
+                        if v is not None
+                    ]
+
+        # Old flat format
+        else:
             category_map = {
                 "bleu": "lexical", "rouge_l": "lexical",
                 "bertscore": "semantic", "moverscore": "semantic",
                 "distinct_1": "diversity", "distinct_2": "diversity", "self_bleu": "diversity",
             }
             for metric, score in raw.items():
+                if metric.startswith("_"):  # Skip internal keys like _flat
+                    continue
                 cat = category_map.get(metric, "other")
                 if cat not in result:
                     result[cat] = []
-                result[cat].append({"metric": metric, "score": score, "description": ""})
+                result[cat].append({"metric": metric, "score": score, "description": metric_descriptions.get(metric, "")})
+
+    # Fallback: read from CSVs if JSON not found or empty
+    if not result:
+        for category in ["lexical", "semantic", "diversity"]:
+            csv_path = metrics_dir / f"{category}-metrics.csv"
+            if csv_path.exists():
+                metrics_by_run = {}
+                avg_metrics = []
+                std_row = []
+                with open(csv_path, encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        run_val = row.get("run", "")
+                        metric_entry = {
+                            "metric": row.get("metric", ""),
+                            "score": float(row.get("score", 0)),
+                            "description": row.get("description", ""),
+                        }
+                        if run_val == "avg":
+                            avg_metrics.append(metric_entry)
+                        elif run_val == "std":
+                            std_row.append(metric_entry)
+                        elif run_val.isdigit():
+                            run_key = f"run{run_val}"
+                            if run_key not in metrics_by_run:
+                                metrics_by_run[run_key] = []
+                            metrics_by_run[run_key].append(metric_entry)
+                        else:
+                            # Single-run format (no run column)
+                            if category not in result:
+                                result[category] = []
+                            result[category].append(metric_entry)
+
+                # If we found multi-run data
+                if metrics_by_run:
+                    is_multi_run = True
+                    per_run_metrics[category] = metrics_by_run
+                    if avg_metrics:
+                        average_metrics[category] = avg_metrics
+                        result[category] = avg_metrics  # Default to averages
+                    if std_row:
+                        std_metrics[category] = std_row
+
+        if is_multi_run:
+            result["isMultiRun"] = True
+            result["totalRuns"] = len(list(per_run_metrics.values())[0]) if per_run_metrics else 0
+            result["perRun"] = per_run_metrics
+            result["average"] = average_metrics
+            result["std"] = std_metrics
 
     return {"metrics": result}
+
+
+class ReadConformityRequest(BaseModel):
+    jobDir: str
+
+
+@app.post("/api/read-conformity")
+async def read_conformity(request: ReadConformityRequest):
+    """Read conformity report from a job directory.
+
+    Returns conformity metrics for single-run or multi-run jobs.
+    Multi-run jobs include per-run data, averages, and standard deviations.
+    """
+    from pathlib import Path
+    import json
+
+    reports_dir = Path(request.jobDir) / "reports"
+    if not reports_dir.exists():
+        raise HTTPException(status_code=404, detail="Reports directory not found")
+
+    report_path = reports_dir / "conformity-report.json"
+    if not report_path.exists():
+        raise HTTPException(status_code=404, detail="Conformity report not found")
+
+    raw = json.loads(report_path.read_text(encoding="utf-8"))
+    return {"conformity": raw}
 
 
 # =============================================================================
