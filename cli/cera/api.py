@@ -2522,6 +2522,76 @@ async def download_export(dataset_id: str, format: str):
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
 
 
+@app.get("/api/jobs/{job_id}/export/{report_type}")
+async def export_job_report(job_id: str, report_type: str):
+    """
+    Export job reports as zip files.
+
+    report_type: 'mav', 'conformity', or 'metrics'
+    """
+    import zipfile
+    import io
+    from pathlib import Path
+    from fastapi.responses import StreamingResponse
+
+    # Find job directory
+    jobs_dir = Path("./jobs")
+    job_dir = None
+    for d in jobs_dir.iterdir():
+        if d.is_dir() and d.name.startswith(job_id):
+            job_dir = d
+            break
+
+    if not job_dir:
+        raise HTTPException(status_code=404, detail=f"Job directory not found: {job_id}")
+
+    # Determine which files to include based on report type
+    files_to_zip = []
+    zip_filename = ""
+
+    if report_type == "mav":
+        reports_dir = job_dir / "reports"
+        files_to_zip = [
+            reports_dir / "mav-report.json",
+            reports_dir / "mav-summary.csv",
+        ]
+        zip_filename = f"{job_id}-mav-report.zip"
+    elif report_type == "conformity":
+        reports_dir = job_dir / "reports"
+        files_to_zip = [
+            reports_dir / "conformity-report.json",
+        ]
+        zip_filename = f"{job_id}-conformity-report.zip"
+    elif report_type == "metrics":
+        metrics_dir = job_dir / "metrics"
+        if metrics_dir.exists():
+            files_to_zip = list(metrics_dir.glob("*.json")) + list(metrics_dir.glob("*.csv"))
+        zip_filename = f"{job_id}-mdqa-metrics.zip"
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid report type: {report_type}. Valid types: mav, conformity, metrics")
+
+    # Filter to only existing files
+    existing_files = [f for f in files_to_zip if f.exists()]
+
+    if not existing_files:
+        raise HTTPException(status_code=404, detail=f"No {report_type} files found for job {job_id}")
+
+    # Create zip file in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in existing_files:
+            # Use just the filename in the zip (not full path)
+            zf.write(file_path, file_path.name)
+
+    zip_buffer.seek(0)
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={zip_filename}"}
+    )
+
+
 # ============================================================================
 # Generation Phase Endpoint
 # ============================================================================
