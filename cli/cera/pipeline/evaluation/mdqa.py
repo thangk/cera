@@ -65,18 +65,26 @@ class MultiDimensionalQualityAssessment:
     BERTScore and MoverScore significantly for large datasets.
     """
 
-    def __init__(self, use_gpu: bool = False):
+    def __init__(self, use_gpu: bool = False, progress_callback: Optional[callable] = None):
         """
         Initialize MDQA.
 
         Args:
             use_gpu: Use GPU for neural metrics (BERTScore, MoverScore).
                      If False, runs on CPU which is slower but works everywhere.
+            progress_callback: Optional callback for progress updates.
+                              Called as: callback(progress_percent, metric_name)
         """
         self.use_gpu = use_gpu
         self._device = "cuda" if use_gpu else "cpu"
         self._bertscore_model = None
         self._sentence_model = None  # Lazy-loaded and cached
+        self._progress_callback = progress_callback
+
+    def _report_progress(self, progress: int, metric: str):
+        """Report progress via callback if available."""
+        if self._progress_callback:
+            self._progress_callback(progress, metric)
 
     def _get_sentence_model(self):
         """Lazy-load and cache the SentenceTransformer model."""
@@ -496,25 +504,54 @@ class MultiDimensionalQualityAssessment:
         """
         metrics = MDQAMetrics()
 
-        # Corpus Diversity metrics (always computed)
-        metrics.distinct_1 = self.compute_distinct_n(generated_texts, n=1)
-        metrics.distinct_2 = self.compute_distinct_n(generated_texts, n=2)
-        metrics.self_bleu = self.compute_self_bleu(generated_texts)
+        # Determine total steps for progress calculation
+        # Without reference: 3 steps (distinct_1, distinct_2, self_bleu)
+        # With reference: 7 steps (+ bleu, rouge_l, bertscore, moverscore)
+        has_ref = reference_texts is not None and len(reference_texts) > 0
+        total_steps = 7 if has_ref else 3
+        current_step = 0
 
-        # Reference-based metrics (require references)
-        if reference_texts:
+        def step_progress():
+            nonlocal current_step
+            current_step += 1
+            # Map step to 0-100 range
+            return int((current_step / total_steps) * 100)
+
+        # Setup phase
+        self._report_progress(0, "setup")
+
+        # Reference-based metrics first (if available) - these are slower with GPU
+        if has_ref:
             # Ensure same length for comparison
             min_len = min(len(generated_texts), len(reference_texts))
             gen_subset = generated_texts[:min_len]
             ref_subset = reference_texts[:min_len]
 
             # Lexical Quality
+            self._report_progress(step_progress(), "bleu")
             metrics.bleu = self.compute_bleu(gen_subset, ref_subset)
+
+            self._report_progress(step_progress(), "rouge_l")
             metrics.rouge_l = self.compute_rouge_l(gen_subset, ref_subset)
 
-            # Semantic Similarity
+            # Semantic Similarity (GPU-accelerated, but can still be fast)
+            self._report_progress(step_progress(), "bertscore")
             metrics.bertscore = self.compute_bertscore(gen_subset, ref_subset)
+
+            self._report_progress(step_progress(), "moverscore")
             metrics.moverscore = self.compute_moverscore(gen_subset, ref_subset)
+
+        # Corpus Diversity metrics (always computed, CPU-based, fast)
+        self._report_progress(step_progress(), "distinct_1")
+        metrics.distinct_1 = self.compute_distinct_n(generated_texts, n=1)
+
+        self._report_progress(step_progress(), "distinct_2")
+        metrics.distinct_2 = self.compute_distinct_n(generated_texts, n=2)
+
+        self._report_progress(step_progress(), "self_bleu")
+        metrics.self_bleu = self.compute_self_bleu(generated_texts)
+
+        self._report_progress(100, "complete")
 
         return metrics
 

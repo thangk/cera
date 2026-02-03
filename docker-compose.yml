@@ -67,6 +67,16 @@ services:
       convex:
         condition: service_healthy
     restart: unless-stopped
+    # GPU access for MDQA metrics (BERTScore, MoverScore)
+    # Requires: NVIDIA Container Toolkit on host
+    # To disable: comment out the deploy section below
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   # CERA Web GUI
   web:
