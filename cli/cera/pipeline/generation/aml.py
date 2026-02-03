@@ -1,9 +1,13 @@
 """Authenticity Modeling Layer (AML) - Review generation with authenticity control."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 import random
 import asyncio
+
+# Path to persona template
+PERSONA_TEMPLATE_PATH = Path(__file__).parent.parent.parent / "prompts" / "rgm" / "persona.md"
 
 
 @dataclass
@@ -13,7 +17,7 @@ class GeneratedReview:
     text: str
     polarity: str  # "positive", "neutral", "negative"
     aspects: list[dict]
-    reviewer_age: int
+    reviewer_age: Optional[int]  # None when age ablation is disabled
     reviewer_sex: str
     additional_context: str
     model: str
@@ -36,6 +40,32 @@ class AuthenticityModelingLayer:
         self.model = model
         self.usage_tracker = usage_tracker
         self._client = None
+        self._persona_template = self._load_persona_template()
+
+    def _load_persona_template(self) -> str:
+        """Load the persona template from file."""
+        try:
+            if PERSONA_TEMPLATE_PATH.exists():
+                return PERSONA_TEMPLATE_PATH.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        # Fallback template if file not found
+        return "You are a {age}-year-old {sex} reviewer.\nBackground: {additional_context}\nWriting style: {style_guidance}"
+
+    def _render_persona(self, age: Optional[int], sex: str, additional_context: str) -> str:
+        """Render the persona template with reviewer demographics."""
+        style_guidance = self._get_style_guidance(age, sex)
+
+        # Handle age display
+        age_str = str(age) if age is not None else "adult"
+        sex_str = sex if sex != "unspecified" else "person"
+
+        return self._persona_template.format(
+            age=age_str,
+            sex=sex_str,
+            additional_context=additional_context or "general consumer",
+            style_guidance=style_guidance,
+        )
 
     def _is_placeholder_mode(self) -> bool:
         """Check if we're in placeholder mode (no real API key)."""
@@ -78,11 +108,42 @@ Your reviews should:
 - Avoid generic phrases like "I highly recommend" - be specific
 - Never mention that you're an AI or that this is a generated review
 
+## Natural Variation (IMPORTANT)
+Real reviewers express the same features and experiences in DIFFERENT ways:
+- Vary terminology: Instead of always listing specs ("1080p 4K OLED"), some describe experiences ("the picture is stunning", "crisp visuals", "looks amazing")
+- Vary structure: Some reviews list features, others tell a story, others compare to alternatives
+- Vary detail level: Tech-savvy reviewers mention specs; casual users describe how it feels to use
+- Vary vocabulary: Use different words for the same concepts across reviews
+- NEVER use the exact same phrasing patterns across multiple reviews
+
 Key features of {subject}: {', '.join(features[:5]) if features else 'various features'}
 Known pros: {', '.join(pros[:3]) if pros else 'quality, value'}
 Known cons: {', '.join(cons[:3]) if cons else 'minor issues'}"""
 
         return prompt
+
+    def _get_style_guidance(self, age: Optional[int], sex: str) -> str:
+        """Get writing style guidance based on reviewer demographics."""
+        style_parts = []
+
+        # Age-based writing style (domain-agnostic)
+        if age is not None:
+            if age <= 25:
+                style_parts.append("casual, direct, may use modern expressions")
+            elif age <= 40:
+                style_parts.append("balanced, practical, efficiency-focused")
+            elif age <= 55:
+                style_parts.append("detailed, values reliability and quality")
+            else:
+                style_parts.append("thoughtful, measured, emphasizes service and value")
+
+        # Subtle perspective variation
+        if sex == "female":
+            style_parts.append("may reference social or practical context")
+        elif sex == "male":
+            style_parts.append("may focus on specifications or performance aspects")
+
+        return ", ".join(style_parts) if style_parts else "natural conversational style"
 
     def _build_user_prompt(
         self,
@@ -92,7 +153,7 @@ Known cons: {', '.join(cons[:3]) if cons else 'minor issues'}"""
     ) -> str:
         """Build the user prompt for review generation."""
         subject = subject_context.get("subject", "Product")
-        age = reviewer_context.get("age", 30)
+        age = reviewer_context.get("age")  # None if disabled
         sex = reviewer_context.get("sex", "unspecified")
         context = reviewer_context.get("additional_context", "") or "general user"
 
@@ -102,10 +163,15 @@ Known cons: {', '.join(cons[:3]) if cons else 'minor issues'}"""
             "negative": "disappointed and critical, explaining what went wrong",
         }
 
+        # Render the full persona from template
+        persona_block = self._render_persona(age, sex, context)
+
         prompt = f"""Write a {polarity} review for {subject}.
 
-Reviewer persona: {age}-year-old {sex if sex != 'unspecified' else 'person'}, {context}
-Tone: {sentiment_guide.get(polarity, 'balanced')}
+{persona_block}
+
+## Your Task
+Write a {polarity} review with this tone: {sentiment_guide.get(polarity, 'balanced')}
 
 Write ONLY the review text. No labels, no quotation marks, no explanations."""
 
@@ -159,7 +225,7 @@ Write ONLY the review text. No labels, no quotation marks, no explanations."""
             text=review_text,
             polarity=polarity,
             aspects=[],  # TODO: Extract aspects from generated text
-            reviewer_age=reviewer_context.get("age", 30),
+            reviewer_age=reviewer_context.get("age"),  # None if disabled
             reviewer_sex=reviewer_context.get("sex", "unspecified"),
             additional_context=reviewer_context.get("additional_context", "") or "general",
             model=self.model,

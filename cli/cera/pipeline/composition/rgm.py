@@ -10,7 +10,7 @@ class ReviewerContext:
     """Context document containing reviewer profile."""
 
     sex: str
-    age: int
+    age: Optional[int] = None  # None when age ablation is disabled
     additional_context: Optional[str] = None
     style_ref: Optional[str] = None
 
@@ -25,10 +25,11 @@ class ReviewerGenerationModule:
 
     def __init__(
         self,
-        age_range: tuple[int, int] = (18, 65),
+        age_range: Optional[tuple[int, int]] = (18, 65),
         sex_distribution: dict[str, float] = None,
         additional_context: Optional[str] = None,
     ):
+        # None means age is disabled via ablation
         self.age_range = age_range
         self.sex_distribution = sex_distribution or {
             "male": 0.45,
@@ -54,8 +55,8 @@ class ReviewerGenerationModule:
                 sex = s
                 break
 
-        # Sample age uniformly within range
-        age = random.randint(self.age_range[0], self.age_range[1])
+        # Sample age uniformly within range (None if disabled)
+        age = random.randint(self.age_range[0], self.age_range[1]) if self.age_range else None
 
         return ReviewerContext(
             sex=sex,

@@ -21,8 +21,32 @@ from cera.models.config import CeraConfig
 from cera.models.output import Review, ReviewerInfo, ReviewMetadata, AspectSentiment, Dataset, DatasetMetrics
 from cera.llm.usage import UsageTracker
 from cera.logging import get_logger
+import statistics
 
 logger = get_logger("cera.pipeline.executor")
+
+
+def compute_average_metrics(metrics_list: list[MDQAMetrics]) -> dict:
+    """
+    Compute mean and standard deviation for each metric across multiple runs.
+
+    Args:
+        metrics_list: List of MDQAMetrics from each run
+
+    Returns:
+        Dict with metric names mapping to {mean, std} objects
+    """
+    result = {}
+    metric_names = ['bleu', 'rouge_l', 'bertscore', 'moverscore', 'distinct_1', 'distinct_2', 'self_bleu']
+
+    for name in metric_names:
+        values = [getattr(m, name) for m in metrics_list if getattr(m, name) is not None]
+        if values:
+            mean = statistics.mean(values)
+            std = statistics.stdev(values) if len(values) > 1 else None
+            result[name] = {'mean': mean, 'std': std}
+
+    return result
 
 
 class PipelineExecutor:
@@ -69,13 +93,31 @@ class PipelineExecutor:
             )
 
         self.sil = SubjectIntelligenceLayer(api_key, mav_config=mav_config, usage_tracker=self.usage_tracker)
-        self.rgm = ReviewerGenerationModule(
-            age_range=tuple(config.reviewer_profile.age_range),
-            sex_distribution={
+
+        # Check ablation settings for age and sex
+        age_enabled = getattr(config.ablation, 'age_enabled', True) if config.ablation else True
+        sex_enabled = getattr(config.ablation, 'sex_enabled', True) if config.ablation else True
+
+        # Pass None for age_range if age is disabled via ablation
+        rgm_age_range = tuple(config.reviewer_profile.age_range) if age_enabled else None
+
+        # If sex is disabled, use 100% unspecified
+        if sex_enabled:
+            rgm_sex_distribution = {
                 "male": config.reviewer_profile.sex_distribution.male,
                 "female": config.reviewer_profile.sex_distribution.female,
                 "unspecified": config.reviewer_profile.sex_distribution.unspecified,
-            },
+            }
+        else:
+            rgm_sex_distribution = {
+                "male": 0.0,
+                "female": 0.0,
+                "unspecified": 1.0,
+            }
+
+        self.rgm = ReviewerGenerationModule(
+            age_range=rgm_age_range,
+            sex_distribution=rgm_sex_distribution,
             additional_context=config.reviewer_profile.additional_context,
         )
         self.acm = AttributesCompositionModule(
@@ -293,14 +335,23 @@ class PipelineExecutor:
         self,
         reviews: list[GeneratedReview],
         metrics: Optional[MDQAMetrics],
+        run_number: Optional[int] = None,
     ) -> Path:
-        """Save generated dataset to output directory."""
+        """
+        Save generated dataset to output directory.
+
+        Args:
+            reviews: Generated reviews
+            metrics: MDQA evaluation metrics
+            run_number: Run number for multi-run jobs (1-indexed). If provided, adds "-runN" suffix.
+        """
         # Create output directory
         output_dir = Path(self.config.output.directory)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate dataset ID
-        dataset_id = f"{self.config.subject_profile.query.lower().replace(' ', '-')}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        # Generate dataset ID (with optional run suffix)
+        base_id = f"{self.config.subject_profile.query.lower().replace(' ', '-')}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        dataset_id = f"{base_id}-run{run_number}" if run_number else base_id
 
         # Convert GeneratedReview objects to output format
         output_reviews = []
@@ -368,16 +419,28 @@ class PipelineExecutor:
 
         return output_path
 
-    async def execute(self, skip_eval: bool = False) -> tuple[Path, Optional[MDQAMetrics]]:
+    async def execute(
+        self,
+        skip_eval: bool = False,
+        run_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> tuple[list[Path], Optional[MDQAMetrics], Optional[dict], list[MDQAMetrics]]:
         """
         Execute the full CERA pipeline.
 
         Args:
             skip_eval: Skip MDQA evaluation phase
+            run_callback: Callback for multi-run progress (current_run, total_runs)
 
         Returns:
-            Tuple of (output_path, metrics) - metrics is None if skip_eval=True
+            Tuple of (output_paths, metrics, average_metrics, all_metrics):
+            - output_paths: List of output file paths (one per run)
+            - metrics: First run's metrics (for backward compatibility)
+            - average_metrics: Dict with mean/std for each metric (if multiple runs, else None)
+            - all_metrics: List of MDQAMetrics from each run
         """
+        # Get total runs from config (default to 1)
+        total_runs = getattr(self.config.generation, 'total_runs', 1) or 1
+
         # Check if using real LLM or placeholder
         is_placeholder = self.aml._is_placeholder_mode()
         mode_str = "[yellow]placeholder[/yellow]" if is_placeholder else "[green]OpenRouter[/green]"
@@ -387,21 +450,57 @@ class PipelineExecutor:
         self.console.print(f"[dim]Count: {self.config.generation.count} reviews[/dim]")
         self.console.print(f"[dim]Model: {self.config.generation.provider}/{self.config.generation.model}[/dim]")
         self.console.print(f"[dim]Mode: {mode_str}[/dim]")
+        if total_runs > 1:
+            self.console.print(f"[dim]Total Runs: {total_runs}[/dim]")
+
+        output_paths: list[Path] = []
+        all_metrics: list[MDQAMetrics] = []
 
         try:
-            # Phase 1: Composition
+            # Phase 1: Composition (runs once regardless of total_runs)
             subject_ctx, reviewer_contexts, attrs_ctx = await self._run_composition_phase()
 
-            # Phase 2: Generation
-            reviews = await self._run_generation_phase(subject_ctx, reviewer_contexts, attrs_ctx)
+            # Phase 2 & 3: Generation + Evaluation (runs N times)
+            for run in range(1, total_runs + 1):
+                if total_runs > 1:
+                    self.console.print(f"\n[bold yellow]═══ Run {run}/{total_runs} ═══[/bold yellow]")
+                    if run_callback:
+                        run_callback(run, total_runs)
 
-            # Phase 3: Evaluation (optional)
-            metrics = None
-            if not skip_eval:
-                metrics = await self._run_evaluation_phase(reviews)
-            else:
-                self.console.print("\n[dim]Skipping evaluation (--skip-eval)[/dim]")
-                self._update_progress(95, "skipped_eval")
+                # Regenerate reviewer profiles for each run to get variability
+                if run > 1:
+                    self.console.print("[dim]  RGM[/dim] Regenerating reviewer profiles...")
+                    reviewer_contexts = self.rgm.generate_profiles(self.config.generation.count)
+
+                # Generate reviews
+                reviews = await self._run_generation_phase(subject_ctx, reviewer_contexts, attrs_ctx)
+
+                # Evaluate if not skipped
+                metrics = None
+                if not skip_eval:
+                    metrics = await self._run_evaluation_phase(reviews)
+                    all_metrics.append(metrics)
+                else:
+                    if run == 1:
+                        self.console.print("\n[dim]Skipping evaluation (--skip-eval)[/dim]")
+                    self._update_progress(95, "skipped_eval")
+
+                # Save output with run number (only if multiple runs)
+                run_number = run if total_runs > 1 else None
+                output_path = self._save_output(reviews, metrics, run_number)
+                output_paths.append(output_path)
+                self.console.print(f"[green]  OK[/green] Saved to {output_path}")
+
+            # Compute average metrics if multiple runs
+            average_metrics = None
+            if len(all_metrics) > 1:
+                average_metrics = compute_average_metrics(all_metrics)
+                self.console.print("\n[bold cyan]Average Metrics (across all runs)[/bold cyan]")
+                for metric_name, values in average_metrics.items():
+                    if values.get('std') is not None:
+                        self.console.print(f"[dim]  {metric_name}: {values['mean']:.4f} ± {values['std']:.4f}[/dim]")
+                    else:
+                        self.console.print(f"[dim]  {metric_name}: {values['mean']:.4f}[/dim]")
 
             # Compute costs
             cost_summary = None
@@ -410,19 +509,15 @@ class PipelineExecutor:
                     await self.usage_tracker.fetch_pricing(self.api_key)
                     cost_summary = self.usage_tracker.compute_cost()
                     if cost_summary["total_cost_usd"] > 0:
-                        self.console.print(f"\n[dim]  Estimated cost: ${cost_summary['total_cost_usd']:.4f}[/dim]")
+                        self.console.print(f"\n[dim]  Total cost ({total_runs} run{'s' if total_runs > 1 else ''}): ${cost_summary['total_cost_usd']:.4f}[/dim]")
                 except Exception as e:
                     logger.warning("pricing_fetch_failed", error=str(e))
 
-            # Save output
-            self._update_progress(98, "saving")
-            self.console.print("\n[bold cyan]Saving Output[/bold cyan]")
-            output_path = self._save_output(reviews, metrics)
-            self.console.print(f"[green]  OK[/green] Saved to {output_path}")
-
             self._update_progress(100, "complete")
 
-            return output_path, metrics
+            # Return first metrics for backward compatibility
+            first_metrics = all_metrics[0] if all_metrics else None
+            return output_paths, first_metrics, average_metrics, all_metrics
         finally:
             # Clean up AML client
             await self.aml.close()
@@ -434,7 +529,8 @@ async def run_pipeline(
     console: Optional[Console] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
     skip_eval: bool = False,
-) -> tuple[Path, Optional[MDQAMetrics]]:
+    run_callback: Optional[Callable[[int, int], None]] = None,
+) -> tuple[list[Path], Optional[MDQAMetrics], Optional[dict], list[MDQAMetrics]]:
     """
     Convenience function to run the CERA pipeline.
 
@@ -444,9 +540,14 @@ async def run_pipeline(
         console: Rich console for output
         progress_callback: Progress callback function
         skip_eval: Skip MDQA evaluation phase
+        run_callback: Callback for multi-run progress (current_run, total_runs)
 
     Returns:
-        Tuple of (output_path, metrics) - metrics is None if skip_eval=True
+        Tuple of (output_paths, metrics, average_metrics, all_metrics):
+        - output_paths: List of output file paths (one per run)
+        - metrics: First run's metrics (for backward compatibility)
+        - average_metrics: Dict with mean/std for each metric (if multiple runs, else None)
+        - all_metrics: List of MDQAMetrics from each run
     """
     executor = PipelineExecutor(
         config=config,
@@ -454,4 +555,4 @@ async def run_pipeline(
         console=console,
         progress_callback=progress_callback,
     )
-    return await executor.execute(skip_eval=skip_eval)
+    return await executor.execute(skip_eval=skip_eval, run_callback=run_callback)
