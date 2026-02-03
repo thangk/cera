@@ -59,6 +59,10 @@ services:
       - ./configs:/app/configs
       - ./jobs:/app/jobs  # Persist job files (AML prompts, reports, datasets)
       - ./cli/cera/config/custom-aspect-categories:/app/cera/config/custom-aspect-categories  # Persist extracted presets
+      - ./cli/cera/config/domain-patterns.json:/app/cera/config/domain-patterns.json  # Domain patterns (editable via UI)
+      - ./cli/cera/config/domain-patterns-defaults.json:/app/cera/config/domain-patterns-defaults.json  # Domain pattern defaults (for reset)
+      # DEV ONLY: Mount source for hot-reload (comment out for production)
+      - ./cli/cera:/app/cera:ro
     depends_on:
       convex:
         condition: service_healthy
