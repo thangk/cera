@@ -38,7 +38,7 @@ class MultiAgentVerification:
         self,
         api_key: str,
         models: Optional[list[str]] = None,
-        similarity_threshold: float = 0.85,
+        similarity_threshold: float = 0.75,
     ):
         self.api_key = api_key
         self.models = models or self.DEFAULT_MODELS
@@ -66,6 +66,10 @@ class MultiAgentVerification:
             warnings.filterwarnings("ignore", category=FutureWarning)
 
             from sentence_transformers import SentenceTransformer
+            import torch
+
+            # Auto-detect GPU availability
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
             # Temporarily redirect stderr to suppress progress bar output
             old_stderr = sys.stderr
@@ -74,12 +78,12 @@ class MultiAgentVerification:
                 # Try to load from cache without network check
                 try:
                     self._similarity_model = SentenceTransformer(
-                        "all-MiniLM-L6-v2", device="cpu", local_files_only=True
+                        "all-MiniLM-L6-v2", device=device, local_files_only=True
                     )
                 except Exception:
                     # Fallback: download if not cached
                     self._similarity_model = SentenceTransformer(
-                        "all-MiniLM-L6-v2", device="cpu"
+                        "all-MiniLM-L6-v2", device=device
                     )
             finally:
                 sys.stderr = old_stderr

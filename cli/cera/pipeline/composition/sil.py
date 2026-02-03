@@ -24,7 +24,7 @@ class MAVConfig:
 
     enabled: bool = True
     models: list[str] = None  # N models for cross-validation (minimum 2)
-    similarity_threshold: float = 0.85  # Query deduplication threshold
+    similarity_threshold: float = 0.75  # Query deduplication threshold
     answer_threshold: float = 0.80  # Per-query answer consensus threshold
     max_queries: int = 30  # Soft cap on pooled queries after dedup
     min_verification_rate: float = 0.30  # Minimum consensus rate before fallback
@@ -231,6 +231,10 @@ class SubjectIntelligenceLayer:
 
             try:
                 from sentence_transformers import SentenceTransformer
+                import torch
+
+                # Auto-detect GPU availability
+                device = "cuda" if torch.cuda.is_available() else "cpu"
 
                 # Temporarily redirect stderr to suppress progress bar output
                 old_stderr = sys.stderr
@@ -239,11 +243,13 @@ class SubjectIntelligenceLayer:
                     # Try to load from cache without network check
                     try:
                         self._similarity_model = SentenceTransformer(
-                            "all-MiniLM-L6-v2", local_files_only=True
+                            "all-MiniLM-L6-v2", device=device, local_files_only=True
                         )
                     except Exception:
                         # Fallback: download if not cached
-                        self._similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+                        self._similarity_model = SentenceTransformer(
+                            "all-MiniLM-L6-v2", device=device
+                        )
                 finally:
                     sys.stderr = old_stderr
             except ImportError:
