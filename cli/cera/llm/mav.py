@@ -49,17 +49,40 @@ class MultiAgentVerification:
         """Lazy-load and cache the SentenceTransformer model."""
         if self._similarity_model is None:
             import os
+            import sys
             import logging
+            import warnings
+            from io import StringIO
 
-            # Suppress progress bars and verbose logging
+            # Suppress all progress bars and verbose logging
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+            logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+            logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+            logging.getLogger("transformers").setLevel(logging.ERROR)
+            logging.getLogger("safetensors").setLevel(logging.ERROR)
+            warnings.filterwarnings("ignore", category=FutureWarning)
 
             from sentence_transformers import SentenceTransformer
 
-            self._similarity_model = SentenceTransformer(
-                "all-MiniLM-L6-v2", device="cpu"
-            )
+            # Temporarily redirect stderr to suppress progress bar output
+            old_stderr = sys.stderr
+            sys.stderr = StringIO()
+            try:
+                # Try to load from cache without network check
+                try:
+                    self._similarity_model = SentenceTransformer(
+                        "all-MiniLM-L6-v2", device="cpu", local_files_only=True
+                    )
+                except Exception:
+                    # Fallback: download if not cached
+                    self._similarity_model = SentenceTransformer(
+                        "all-MiniLM-L6-v2", device="cpu"
+                    )
+            finally:
+                sys.stderr = old_stderr
         return self._similarity_model
 
     async def _query_model(

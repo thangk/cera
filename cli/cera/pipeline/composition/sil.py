@@ -165,13 +165,30 @@ class SubjectIntelligenceLayer:
         self.tavily_api_key = tavily_api_key
         self.usage_tracker = usage_tracker
         self._similarity_model = None  # Lazy-loaded SentenceTransformer
-        self._log = log_callback  # Optional callback: (level, phase, message) -> None
+        self._log = log_callback  # Optional async callback: async (level, phase, message, progress) -> None
 
-    def _emit_log(self, level: str, phase: str, message: str):
-        """Emit a log message via the callback if configured."""
+    async def _emit_log(self, level: str, phase: str, message: str, progress: int = None):
+        """Emit a log message via the async callback if configured.
+
+        Args:
+            level: Log level (INFO, WARN, ERROR)
+            phase: Current phase (SIL, MAV, etc.)
+            message: Log message
+            progress: Optional progress percentage (0-100) for composition phase
+        """
+        # Always print to stdout for Docker visibility
+        prog_str = f" ({progress}%)" if progress is not None else ""
+        print(f"[{phase}] {message}{prog_str}", flush=True)
+
         if self._log:
             try:
-                self._log(level, phase, message)
+                await self._log(level, phase, message, progress)
+            except TypeError:
+                # Fallback for callbacks that don't accept progress parameter
+                try:
+                    await self._log(level, phase, message)
+                except Exception:
+                    pass
             except Exception:
                 pass  # Silently ignore logging errors
 
@@ -195,9 +212,40 @@ class SubjectIntelligenceLayer:
     def _get_similarity_model(self):
         """Lazy-load the SentenceTransformer model (shared across all comparisons)."""
         if self._similarity_model is None:
+            import os
+            import sys
+            import logging
+            import warnings
+            from io import StringIO
+
+            # Suppress all progress bars and verbose logging
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+            logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+            logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+            logging.getLogger("transformers").setLevel(logging.ERROR)
+            logging.getLogger("safetensors").setLevel(logging.ERROR)
+            warnings.filterwarnings("ignore", category=FutureWarning)
+
             try:
                 from sentence_transformers import SentenceTransformer
-                self._similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+                # Temporarily redirect stderr to suppress progress bar output
+                old_stderr = sys.stderr
+                sys.stderr = StringIO()
+                try:
+                    # Try to load from cache without network check
+                    try:
+                        self._similarity_model = SentenceTransformer(
+                            "all-MiniLM-L6-v2", local_files_only=True
+                        )
+                    except Exception:
+                        # Fallback: download if not cached
+                        self._similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+                finally:
+                    sys.stderr = old_stderr
             except ImportError:
                 self._similarity_model = None
         return self._similarity_model
@@ -360,7 +408,7 @@ class SubjectIntelligenceLayer:
 
     # ─── Round 2: Query Pooling + Deduplication ─────────────────────────
 
-    def _deduplicate_queries(
+    async def _deduplicate_queries(
         self,
         all_queries: list[tuple[str, str]],  # (query_text, source_model)
         threshold: float,
@@ -368,6 +416,9 @@ class SubjectIntelligenceLayer:
     ) -> list[FactualQuery]:
         """
         Deduplicate and cap queries from all models.
+
+        Uses batch encoding for efficiency: encodes all queries in one forward pass,
+        then uses vectorized cosine similarity for O(n) neural inferences instead of O(n²).
 
         Args:
             all_queries: List of (query_text, source_model) tuples
@@ -380,35 +431,89 @@ class SubjectIntelligenceLayer:
         if not all_queries:
             return []
 
-        pooled: list[FactualQuery] = []
-        query_id_counter = 1
         total_queries = len(all_queries)
-        log_interval = max(1, total_queries // 10)  # Log every ~10%
+        await self._emit_log("INFO", "SIL", f"Deduplicating {total_queries} queries...")
 
-        for idx, (query_text, source_model) in enumerate(all_queries):
-            # Log progress periodically during embedding computation
-            if idx % log_interval == 0 or idx == total_queries - 1:
-                self._emit_log("INFO", "SIL", f"Deduplicating queries... ({idx + 1}/{total_queries})")
-            # Check if this query is similar to any already-pooled query
-            is_duplicate = False
-            for existing in pooled:
-                similarity = self._compute_similarity(query_text, existing.query)
-                if similarity >= threshold:
-                    # Merge: increment overlap count
-                    existing.overlap_count += 1
-                    existing.deduplicated_from.append(f"q{query_id_counter}")
-                    is_duplicate = True
-                    break
+        # Get the model for batch encoding
+        model = self._get_similarity_model()
 
-            if not is_duplicate:
-                pooled.append(FactualQuery(
-                    id=f"q{query_id_counter}",
-                    query=query_text,
-                    source_model=source_model,
-                    overlap_count=1,
-                ))
+        if model is not None:
+            # OPTIMIZED: Batch encode all queries at once
+            await self._emit_log("INFO", "SIL", "Encoding queries (batch)...")
+            query_texts = [q[0] for q in all_queries]
+            embeddings = model.encode(query_texts, show_progress_bar=False, convert_to_numpy=True)
 
-            query_id_counter += 1
+            # Import numpy for vectorized operations
+            import numpy as np
+            from numpy.linalg import norm
+
+            # Normalize embeddings for cosine similarity
+            norms = norm(embeddings, axis=1, keepdims=True)
+            norms[norms == 0] = 1  # Avoid division by zero
+            normalized = embeddings / norms
+
+            await self._emit_log("INFO", "SIL", "Computing similarities...")
+
+            # Greedy deduplication using precomputed embeddings
+            pooled: list[FactualQuery] = []
+            pooled_indices: list[int] = []  # Track which original indices are in pooled
+            query_id_counter = 1
+
+            for idx, (query_text, source_model) in enumerate(all_queries):
+                is_duplicate = False
+
+                if pooled_indices:
+                    # Compute cosine similarity with all pooled queries at once (vectorized)
+                    current_emb = normalized[idx]
+                    pooled_embs = normalized[pooled_indices]
+                    similarities = np.dot(pooled_embs, current_emb)
+
+                    # Find if any similarity exceeds threshold
+                    max_sim_idx = np.argmax(similarities)
+                    if similarities[max_sim_idx] >= threshold:
+                        # Merge with the most similar existing query
+                        pooled[max_sim_idx].overlap_count += 1
+                        pooled[max_sim_idx].deduplicated_from.append(f"q{query_id_counter}")
+                        is_duplicate = True
+
+                if not is_duplicate:
+                    pooled.append(FactualQuery(
+                        id=f"q{query_id_counter}",
+                        query=query_text,
+                        source_model=source_model,
+                        overlap_count=1,
+                    ))
+                    pooled_indices.append(idx)
+
+                query_id_counter += 1
+
+            await self._emit_log("INFO", "SIL", f"Deduplication complete: {len(pooled)} unique queries")
+
+        else:
+            # Fallback: no model available, use simple exact matching
+            await self._emit_log("WARN", "SIL", "No similarity model available, using exact matching")
+            pooled: list[FactualQuery] = []
+            seen_queries: set[str] = set()
+            query_id_counter = 1
+
+            for query_text, source_model in all_queries:
+                normalized_text = query_text.lower().strip()
+                if normalized_text not in seen_queries:
+                    seen_queries.add(normalized_text)
+                    pooled.append(FactualQuery(
+                        id=f"q{query_id_counter}",
+                        query=query_text,
+                        source_model=source_model,
+                        overlap_count=1,
+                    ))
+                else:
+                    # Find and update existing
+                    for existing in pooled:
+                        if existing.query.lower().strip() == normalized_text:
+                            existing.overlap_count += 1
+                            existing.deduplicated_from.append(f"q{query_id_counter}")
+                            break
+                query_id_counter += 1
 
         # Apply soft cap: prioritize queries with higher overlap_count
         if len(pooled) > max_queries:
@@ -769,10 +874,13 @@ class SubjectIntelligenceLayer:
         # Check if MAV is enabled with at least 2 models
         if self.mav_config.enabled and len(self.mav_config.models) >= 2:
             n_models = len(self.mav_config.models)
-            self._emit_log("INFO", "SIL", f"Starting MAV with {n_models} models...")
+            await self._emit_log("INFO", "SIL", f"Starting MAV with {n_models} models...", progress=5)
 
             # ─── ROUND 1: Research + Query Generation (parallel) ────
-            self._emit_log("INFO", "SIL", "Round 1: Researching subject and generating queries...")
+            await self._emit_log("INFO", "SIL", "Round 1: Researching subject and generating queries...", progress=6)
+
+            # Per-model timeout for Round 1 (5 minutes)
+            MODEL_TIMEOUT = 300
 
             async def round1_for_model(model: str) -> tuple[str, SubjectUnderstanding, str, list[str]]:
                 """Run Round 1 for a single model."""
@@ -784,8 +892,56 @@ class SubjectIntelligenceLayer:
                 )
                 return model, understanding, search_content, queries
 
-            round1_tasks = [round1_for_model(m) for m in self.mav_config.models]
-            round1_results = await asyncio.gather(*round1_tasks, return_exceptions=True)
+            async def round1_with_timeout(model: str) -> tuple[str, SubjectUnderstanding, str, list[str]]:
+                """Run Round 1 with timeout protection."""
+                return await asyncio.wait_for(round1_for_model(model), timeout=MODEL_TIMEOUT)
+
+            # Create tasks with model names for tracking
+            round1_tasks = {
+                asyncio.create_task(round1_with_timeout(m)): m
+                for m in self.mav_config.models
+            }
+
+            # Use as_completed to log progress as each model finishes
+            round1_results = []
+            completed_count = 0
+            total_models = len(self.mav_config.models)
+
+            for coro in asyncio.as_completed(round1_tasks.keys()):
+                try:
+                    result = await coro
+                    round1_results.append(result)
+                    completed_count += 1
+                    model_name = result[0].split("/")[-1] if "/" in result[0] else result[0]
+                    await self._emit_log(
+                        "INFO", "SIL",
+                        f"Round 1: {model_name} finished ({completed_count}/{total_models} models)",
+                        progress=6 + int((completed_count / total_models) * 9)  # Progress 6-15
+                    )
+                except asyncio.TimeoutError:
+                    completed_count += 1
+                    # Find which model timed out
+                    for task, model in round1_tasks.items():
+                        if task.done() and task.exception() is not None:
+                            model_name = model.split("/")[-1] if "/" in model else model
+                            await self._emit_log(
+                                "WARN", "SIL",
+                                f"Round 1: {model_name} timed out after {MODEL_TIMEOUT}s ({completed_count}/{total_models} models)"
+                            )
+                            break
+                    else:
+                        await self._emit_log(
+                            "WARN", "SIL",
+                            f"Round 1: Model timed out ({completed_count}/{total_models} models)"
+                        )
+                    round1_results.append(asyncio.TimeoutError())
+                except Exception as e:
+                    completed_count += 1
+                    await self._emit_log(
+                        "WARN", "SIL",
+                        f"Round 1: Model failed ({completed_count}/{total_models} models)"
+                    )
+                    round1_results.append(e)
 
             # Collect Round 1 results
             all_raw_queries: list[tuple[str, str]] = []  # (query_text, source_model)
@@ -800,29 +956,30 @@ class SubjectIntelligenceLayer:
                     all_raw_queries.append((q, model))
 
             total_queries_generated = len(all_raw_queries)
-            self._emit_log("INFO", "SIL", f"Round 1 complete: {total_queries_generated} queries from {len(model_research)} models")
+            await self._emit_log("INFO", "SIL", f"Round 1 complete: {total_queries_generated} queries from {len(model_research)} models", progress=15)
 
             if total_queries_generated == 0:
                 # No queries generated - fall back to single model
-                self._emit_log("WARN", "SIL", "No queries generated, falling back to single model")
+                await self._emit_log("WARN", "SIL", "No queries generated, falling back to single model")
                 return await self._single_model_fallback(query, additional_context)
 
             # ─── ROUND 2: Query Pooling + Deduplication ─────────────
-            self._emit_log("INFO", "SIL", "Round 2: Pooling and deduplicating queries...")
-            pooled_queries = self._deduplicate_queries(
+            await self._emit_log("INFO", "SIL", "Round 2: Pooling and deduplicating queries...", progress=16)
+            pooled_queries = await self._deduplicate_queries(
                 all_raw_queries,
                 self.mav_config.similarity_threshold,
                 self.mav_config.max_queries,
             )
 
             if not pooled_queries:
-                self._emit_log("WARN", "SIL", "No queries after deduplication, falling back")
+                await self._emit_log("WARN", "SIL", "No queries after deduplication, falling back")
                 return await self._single_model_fallback(query, additional_context)
 
-            self._emit_log("INFO", "SIL", f"Round 2 complete: {len(pooled_queries)} unique queries (from {total_queries_generated})")
+            await self._emit_log("INFO", "SIL", f"Round 2 complete: {len(pooled_queries)} unique queries (from {total_queries_generated})", progress=24)
 
             # ─── ROUND 3: Query Answering (parallel) ────────────────
-            self._emit_log("INFO", "MAV", f"Round 3: Verifying {len(pooled_queries)} queries across models...")
+            # Progress 26+ enters MAV phase in UI (MAV range is 25-35)
+            await self._emit_log("INFO", "MAV", f"Round 3: Verifying {len(pooled_queries)} queries across models...", progress=26)
 
             async def round3_for_model(model: str) -> tuple[str, list[QueryAnswer]]:
                 """Run Round 3 for a single model."""
@@ -869,10 +1026,10 @@ class SubjectIntelligenceLayer:
                     search_content=search_content if isinstance(search_content, str) else "",
                 ))
 
-            self._emit_log("INFO", "MAV", f"Round 3 complete: {len(model_answers)} models responded")
+            await self._emit_log("INFO", "MAV", f"Round 3 complete: {len(model_answers)} models responded", progress=30)
 
             # ─── ROUND 4: Per-Query Consensus ───────────────────────
-            self._emit_log("INFO", "MAV", "Round 4: Computing consensus on answers...")
+            await self._emit_log("INFO", "MAV", "Round 4: Computing consensus on answers...", progress=31)
             effective_n_models = len([r for r in round3_results if not isinstance(r, Exception)])
             consensus_results: list[QueryConsensusResult] = []
             total_pooled = len(pooled_queries)
@@ -881,7 +1038,7 @@ class SubjectIntelligenceLayer:
             for idx, pq in enumerate(pooled_queries):
                 # Log progress periodically during consensus computation
                 if idx % consensus_log_interval == 0 or idx == total_pooled - 1:
-                    self._emit_log("INFO", "MAV", f"Computing consensus... ({idx + 1}/{total_pooled})")
+                    await self._emit_log("INFO", "MAV", f"Computing consensus... ({idx + 1}/{total_pooled})")
                 query_answers = all_answers.get(pq.id, [])
                 result = self._compute_query_consensus(
                     pq, query_answers, self.mav_config.answer_threshold, effective_n_models
@@ -892,7 +1049,7 @@ class SubjectIntelligenceLayer:
             verified_results = [r for r in consensus_results if r.consensus_reached]
             unverified_results = [r for r in consensus_results if not r.consensus_reached]
 
-            self._emit_log("INFO", "MAV", f"Round 4 complete: {len(verified_results)}/{len(pooled_queries)} queries reached consensus")
+            await self._emit_log("INFO", "MAV", f"Round 4 complete: {len(verified_results)}/{len(pooled_queries)} queries reached consensus", progress=35)
 
             # Build report
             report = MAVQueryPoolReport(
@@ -953,13 +1110,13 @@ class SubjectIntelligenceLayer:
                 )
 
             # ─── POST-CONSENSUS: Classification ─────────────────────
-            self._emit_log("INFO", "SIL", "Classifying verified facts into categories...")
+            await self._emit_log("INFO", "SIL", "Classifying verified facts into categories...", progress=40)
             classified = await self._classify_verified_answers(verified_results, query)
 
             n_features = len(classified.get("characteristics", []))
             n_pros = len(classified.get("positives", []))
             n_cons = len(classified.get("negatives", []))
-            self._emit_log("INFO", "SIL", f"Classification complete: {n_features} features, {n_pros} pros, {n_cons} cons")
+            await self._emit_log("INFO", "SIL", f"Classification complete: {n_features} features, {n_pros} pros, {n_cons} cons")
 
             context = SubjectContext(
                 subject=query,
@@ -970,7 +1127,7 @@ class SubjectIntelligenceLayer:
                 mav_verified=True,
             )
 
-            self._emit_log("INFO", "SIL", "Subject intelligence gathering complete")
+            await self._emit_log("INFO", "SIL", "Subject intelligence gathering complete", progress=50)
             return MAVResult(
                 context=context,
                 model_data=model_data_list,
