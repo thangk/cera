@@ -91,6 +91,9 @@ class GenerationConfig(BaseModel):
     output_formats: Optional[list[str]] = None  # e.g., ["jsonl", "csv", "semeval_xml"]
     dataset_mode: str = "explicit"  # "explicit", "implicit", or "both"
     total_runs: int = 1  # Number of times to run generation (for research variability assessment)
+    # NEB (Negative Example Buffer) - prevents generating similar reviews across batches
+    neb_enabled: bool = True  # Enable NEB for diversity enforcement
+    neb_depth: int = 2  # How many batches to remember (1-10). Buffer size = neb_depth * request_size
 
 
 class AblationConfig(BaseModel):
@@ -196,6 +199,7 @@ def save_job_config(
     phases: list[str],
     evaluation_config: Optional[dict] = None,
     reused_from: Optional[str] = None,
+    reference_dataset: Optional[dict] = None,
 ) -> str:
     """
     Save job configuration to config.json in the job directory.
@@ -265,6 +269,7 @@ def save_job_config(
                 "preset": getattr(config.attributes_profile.noise, 'preset', 'moderate'),
             },
             "length_range": config.attributes_profile.length_range,
+            "temperature_range": getattr(config.attributes_profile, 'temp_range', None) or getattr(config.attributes_profile, 'temperature_range', [0.7, 0.9]),
         }
 
     # Add generation config if available
@@ -278,6 +283,9 @@ def save_job_config(
             "output_formats": getattr(config.generation, 'output_formats', ["semeval_xml"]),
             "dataset_mode": getattr(config.generation, 'dataset_mode', 'both'),
             "total_runs": getattr(config.generation, 'total_runs', 1),
+            # NEB (Negative Example Buffer) settings
+            "neb_enabled": getattr(config.generation, 'neb_enabled', False),
+            "neb_depth": getattr(config.generation, 'neb_depth', 1),
         }
 
     # Add ablation settings if provided
@@ -294,6 +302,10 @@ def save_job_config(
     # Add evaluation config if provided
     if evaluation_config:
         config_data["evaluation"] = evaluation_config
+
+    # Add reference dataset config if provided
+    if reference_dataset:
+        config_data["reference_dataset"] = reference_dataset
 
     config_path = Path(job_paths["root"]) / "config.json"
     with open(config_path, "w", encoding="utf-8") as f:
@@ -2924,7 +2936,37 @@ Output ONLY the JSON object, no other text."""
 Region: {subject_context.get("region", "N/A")}
 Key features: {", ".join(features_list) if features_list else "N/A"}"""
         dataset_mode = getattr(config.generation, "dataset_mode", "explicit")
-        aspect_cats = getattr(config.subject_profile, "aspect_categories", None) or ["PRODUCT#QUALITY", "PRODUCT#PRICES", "SERVICE#GENERAL", "EXPERIENCE#GENERAL"]
+
+        # Get aspect categories - try request config first, then job's config.json, then defaults
+        aspect_cats = getattr(config.subject_profile, "aspect_categories", None) if config.subject_profile else None
+        if not aspect_cats or len(aspect_cats) == 0:
+            # Try to read from job's config.json (for GEN+EVAL only mode where composition was reused)
+            job_config_path = job_path / "config.json"
+            if job_config_path.exists():
+                try:
+                    with open(job_config_path) as f:
+                        job_config_data = json.load(f)
+                    aspect_cats = job_config_data.get("subject_profile", {}).get("aspect_categories", [])
+                    if aspect_cats:
+                        print(f"[Generation] Loaded {len(aspect_cats)} aspect categories from job config.json", flush=True)
+                except Exception as e:
+                    print(f"[Generation] Warning: Could not read aspect categories from config.json: {e}", flush=True)
+        if not aspect_cats or len(aspect_cats) == 0:
+            aspect_cats = ["PRODUCT#QUALITY", "PRODUCT#PRICES", "SERVICE#GENERAL", "EXPERIENCE#GENERAL"]
+            print(f"[Generation] Using default aspect categories", flush=True)
+
+        # Initialize NEB (Negative Example Buffer) for diversity enforcement
+        from cera.pipeline.generation.neb import NegativeExampleBuffer
+        neb_enabled = getattr(config.generation, 'neb_enabled', False)
+        neb_depth = getattr(config.generation, 'neb_depth', 1)
+        neb_buffer = None
+        if neb_enabled:
+            max_buffer_size = neb_depth * request_size
+            neb_buffer = NegativeExampleBuffer(max_size=max_buffer_size)
+            print(f"[NEB] Enabled with depth={neb_depth}, max_buffer={max_buffer_size} reviews", flush=True)
+            print(f"[NEB DEBUG] neb_buffer created: id={id(neb_buffer)}, type={type(neb_buffer).__name__}", flush=True)
+            if convex:
+                await convex.add_log(job_id, "INFO", "NEB", f"Negative Example Buffer enabled (depth={neb_depth}, max={max_buffer_size})")
 
         if dataset_mode == "implicit":
             dataset_mode_instruction = "For implicit mode: do NOT include target terms. Only provide the category and polarity for each opinion."
@@ -2933,12 +2975,58 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
             dataset_mode_instruction = "For explicit mode: include the target term from the sentence text for each opinion. IMPORTANT: The target MUST be a SINGLE WORD (noun) in lowercase that appears exactly in the text."
             output_example = '{\n  "sentences": [\n    {\n      "text": "The carbonara was absolutely divine.",\n      "opinions": [\n        {"target": "carbonara", "category": "FOOD#QUALITY", "polarity": "positive"}\n      ]\n    }\n  ]\n}'
 
-        async def generate_single_review(review_index: int) -> dict:
+        async def generate_single_review(review_index: int, neb_buffer_param) -> dict:
             """Generate a single review with retries. Returns result dict."""
+            # Use explicitly passed neb_buffer to avoid closure capture issues
+            neb_buffer = neb_buffer_param
             async with semaphore:
                 reviewer = rgm.generate_profile()
                 num_sentences = random.randint(length_range[0], length_range[1])
                 temperature = random.uniform(temp_range[0], temp_range[1])
+
+                # Get NEB context (empty string if disabled or first batch)
+                neb_context = ""
+                print(f"[NEB DEBUG] Review {review_index}: entering NEB check, neb_buffer is {'not None' if neb_buffer else 'None'}", flush=True)
+                if neb_buffer and len(neb_buffer) > 0:
+                    neb_context = neb_buffer.get_formatted_context()
+                    print(f"[NEB DEBUG] Review {review_index}: neb_buffer has {len(neb_buffer)} reviews, neb_context length: {len(neb_context)}", flush=True)
+                elif neb_buffer:
+                    print(f"[NEB DEBUG] Review {review_index}: neb_buffer exists but empty (len={len(neb_buffer)})", flush=True)
+                else:
+                    print(f"[NEB DEBUG] Review {review_index}: neb_buffer is None!", flush=True)
+
+                # Roll polarity for each sentence independently based on distribution
+                sentence_polarities_list = []
+                for sent_idx in range(num_sentences):
+                    rand = random.random()
+                    neg_threshold = polarity_dist["negative"]
+                    neu_threshold = neg_threshold + polarity_dist["neutral"]
+                    if rand < neg_threshold:
+                        polarity = "negative"
+                    elif rand < neu_threshold:
+                        polarity = "neutral"
+                    else:
+                        polarity = "positive"
+                    sentence_polarities_list.append(polarity)
+
+                # Format sentence polarities for prompt
+                sentence_polarities_str = "\n".join(
+                    f"- Sentence {i+1}: {pol}" for i, pol in enumerate(sentence_polarities_list)
+                )
+
+                # Build reviewer profile conditionally (omit age if None, omit sex if "unspecified")
+                reviewer_profile_parts = []
+                if reviewer.age is not None:
+                    reviewer_profile_parts.append(f"- Age: {reviewer.age}")
+                if reviewer.sex and reviewer.sex.lower() != "unspecified":
+                    reviewer_profile_parts.append(f"- Sex: {reviewer.sex}")
+                region = subject_context.get("region", "")
+                if region:
+                    reviewer_profile_parts.append(f"- Region: {region}")
+                additional_ctx = reviewers_context.get("additional_context", "general consumer")
+                if additional_ctx:
+                    reviewer_profile_parts.append(f"- Background: {additional_ctx}")
+                reviewer_profile_str = "\n".join(reviewer_profile_parts) if reviewer_profile_parts else "- Background: general consumer"
 
                 prompt_vars = {
                     "subject": subject_context["query"],
@@ -2947,18 +3035,13 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
                     "features": ", ".join(features_list) if features_list else "various features",
                     "pros": ", ".join(pros_list) if pros_list else "quality and value",
                     "cons": ", ".join(cons_list) if cons_list else "minor issues",
-                    "polarity_positive": int(polarity_dist["positive"] * 100),
-                    "polarity_neutral": int(polarity_dist["neutral"] * 100),
-                    "polarity_negative": int(polarity_dist["negative"] * 100),
-                    "age": reviewer.age,
-                    "sex": reviewer.sex,
-                    "region": subject_context.get("region", ""),
-                    "additional_context": reviewers_context.get("additional_context", "general consumer"),
-                    "min_sentences": num_sentences,
-                    "max_sentences": num_sentences + 1,
-                    "aspect_categories": ", ".join(aspect_cats),
+                    "num_sentences": num_sentences,
+                    "sentence_polarities": sentence_polarities_str,
+                    "reviewer_profile": reviewer_profile_str,
+                    "aspect_categories": "\n".join(f"- {cat}" for cat in aspect_cats),
                     "dataset_mode_instruction": dataset_mode_instruction,
                     "output_example": output_example,
+                    "neb_context": neb_context,
                 }
 
                 system_prompt = format_prompt(system_template, **prompt_vars)
@@ -3081,7 +3164,8 @@ Requirements:
                     return {"status": status, "jobId": job_id, "generatedCount": generated_count}
 
             batch_end = min(batch_start + request_size, total_reviews)
-            tasks = [generate_single_review(i) for i in range(batch_start, batch_end)]
+            print(f"[NEB DEBUG] At batch creation: neb_buffer is {'not None (id=' + str(id(neb_buffer)) + ')' if neb_buffer else 'None'}", flush=True)
+            tasks = [generate_single_review(i, neb_buffer) for i in range(batch_start, batch_end)]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for result in batch_results:
@@ -3171,6 +3255,31 @@ Requirements:
                     })
                     generated_count += 1
                     total_sentences_generated += result["num_sentences"]
+
+            # Update NEB buffer with this batch's successful reviews
+            if neb_buffer is not None:
+                batch_review_texts = []
+                successful_count = 0
+                error_in_batch = 0
+                for result in batch_results:
+                    if isinstance(result, Exception):
+                        error_in_batch += 1
+                        continue
+                    if not result.get("error") and not result.get("malformed"):
+                        # Use parsed_review (already validated) to extract clean text
+                        parsed_review = result.get("parsed_review")
+                        if parsed_review and "sentences" in parsed_review:
+                            successful_count += 1
+                            texts = [s.get("text", "") for s in parsed_review["sentences"] if s.get("text")]
+                            if texts:
+                                review_text = " ".join(texts)
+                                batch_review_texts.append(review_text)
+                print(f"[NEB DEBUG] Batch {batch_start}-{batch_end}: {successful_count} successful, {error_in_batch} errors, {len(batch_review_texts)} texts collected", flush=True)
+                if batch_review_texts:
+                    neb_buffer.add_batch(batch_review_texts)
+                    print(f"[NEB] Buffer updated: {len(neb_buffer)} reviews in memory", flush=True)
+                else:
+                    print(f"[NEB DEBUG] No review texts to add to buffer!", flush=True)
 
             # Update progress after batch
             elapsed = time.time() - start_time
@@ -3690,6 +3799,7 @@ class PipelineRequest(BaseModel):
     evaluationConfig: Optional[dict] = None
     datasetFile: Optional[str] = None  # For EVAL-only jobs
     reusedFromJobDir: Optional[str] = None  # Source job directory for composition reuse
+    referenceDataset: Optional[dict] = None  # Reference dataset info for config.json
     # Heuristic method fields (RQ1 baseline)
     method: str = "cera"  # "cera" or "heuristic"
     heuristicConfig: Optional[HeuristicConfig] = None
@@ -4271,6 +4381,7 @@ async def execute_pipeline(
     evaluation_config: Optional[dict],
     dataset_file: Optional[str],
     reused_from_job_dir: Optional[str] = None,
+    reference_dataset: Optional[dict] = None,
     method: str = "cera",
     heuristic_config: Optional[HeuristicConfig] = None,
 ):
@@ -4330,6 +4441,7 @@ async def execute_pipeline(
             phases=phases,
             evaluation_config=evaluation_config,
             reused_from=reused_from_job_dir,
+            reference_dataset=reference_dataset,
         )
 
         if convex:
@@ -4395,10 +4507,11 @@ async def execute_pipeline(
         # Helper function to calculate conformity from reviews (defined early so it's available in loop)
         def calculate_conformity_from_reviews(reviews: list, job_config: JobConfig) -> dict:
             """Calculate conformity metrics from a list of reviews."""
+            # Polarity values are already stored as decimals (0-1), not percentages
             target_polarity = {
-                "positive": job_config.attributes_profile.polarity.positive / 100,
-                "neutral": job_config.attributes_profile.polarity.neutral / 100,
-                "negative": job_config.attributes_profile.polarity.negative / 100,
+                "positive": job_config.attributes_profile.polarity.positive,
+                "neutral": job_config.attributes_profile.polarity.neutral,
+                "negative": job_config.attributes_profile.polarity.negative,
             }
             total_reviews = len(reviews)
 
@@ -5892,6 +6005,7 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
         request.evaluationConfig,
         request.datasetFile,
         request.reusedFromJobDir,
+        request.referenceDataset,
         request.method,
         request.heuristicConfig,
     )
@@ -6576,32 +6690,28 @@ def _analyze_sex_distribution(reviews: list[dict], patterns: dict) -> SexDistrib
 
 
 def _analyze_polarity_distribution(reviews: list[dict]) -> PolarityDistribution:
-    """Analyze document-level polarity distribution."""
+    """Analyze sentence-level polarity distribution.
+
+    Counts individual opinion polarities across all sentences in all reviews,
+    rather than aggregating to document-level via majority voting.
+    This gives a more accurate representation of sentiment distribution.
+    """
     positive_count = 0
     neutral_count = 0
     negative_count = 0
 
     for review in reviews:
-        # Count polarities per review (document-level via majority voting)
-        review_polarities = {"positive": 0, "neutral": 0, "negative": 0}
-
         if "sentences" in review:
             for sentence in review["sentences"]:
                 if isinstance(sentence, dict) and "opinions" in sentence:
                     for opinion in sentence["opinions"]:
                         polarity = opinion.get("polarity", "").lower()
-                        if polarity in review_polarities:
-                            review_polarities[polarity] += 1
-
-        # Document-level polarity is the majority
-        max_polarity = max(review_polarities, key=review_polarities.get)
-        if review_polarities[max_polarity] > 0:
-            if max_polarity == "positive":
-                positive_count += 1
-            elif max_polarity == "neutral":
-                neutral_count += 1
-            elif max_polarity == "negative":
-                negative_count += 1
+                        if polarity == "positive":
+                            positive_count += 1
+                        elif polarity == "neutral":
+                            neutral_count += 1
+                        elif polarity == "negative":
+                            negative_count += 1
 
     total = positive_count + neutral_count + negative_count
     if total == 0:

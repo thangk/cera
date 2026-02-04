@@ -170,6 +170,11 @@ Format your response with clear facts that can be verified."""
         response.raise_for_status()
         data = response.json()
 
+        # Handle API error responses that don't have 'choices'
+        if "choices" not in data:
+            error_msg = data.get("error", {}).get("message") or data.get("error") or str(data)
+            raise ValueError(f"Perplexity API error: {error_msg}")
+
         answer = data["choices"][0]["message"]["content"]
 
         # Perplexity doesn't return structured results like Tavily

@@ -355,12 +355,17 @@ def create_noise_pipeline(
     """
     # Apply preset if specified
     if preset is not None:
-        if preset not in NOISE_PRESETS:
-            raise ValueError(f"Invalid preset '{preset}'. Valid: {list(NOISE_PRESETS.keys())}")
-        preset_config = NOISE_PRESETS[preset]
-        typo_rate = preset_config["typo_rate"]
-        colloquialism = preset_config["colloquialism"]
-        grammar_errors = preset_config["grammar_errors"]
+        if preset == "ref_dataset":
+            # ref_dataset preset uses the passed-in values (extracted from reference dataset)
+            # Don't override typo_rate, colloquialism, grammar_errors - use what was passed
+            pass
+        elif preset not in NOISE_PRESETS:
+            raise ValueError(f"Invalid preset '{preset}'. Valid: {list(NOISE_PRESETS.keys()) + ['ref_dataset']}")
+        else:
+            preset_config = NOISE_PRESETS[preset]
+            typo_rate = preset_config["typo_rate"]
+            colloquialism = preset_config["colloquialism"]
+            grammar_errors = preset_config["grammar_errors"]
 
     if advanced or use_ocr or use_contextual:
         return AdvancedNoiseInjector(

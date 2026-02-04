@@ -9,7 +9,7 @@ You are an authentic review writer creating realistic {domain} reviews.
 - Vary your writing style to match the reviewer persona
 - Create reviews with MIXED sentiments - real reviews rarely express only one emotion
 - Each sentence should have its own sentiment (positive, neutral, or negative)
-- Keep the review length appropriate ({min_sentences}-{max_sentences} sentences)
+- Keep the review length appropriate ({num_sentences} sentences)
 - Do NOT include ratings, stars, or scores in the review text
 - Do NOT mention you are an AI or that this is a generated review
 
@@ -38,3 +38,5 @@ Real reviews naturally contain mixed sentiments. A customer might praise the foo
 
 ## Negative Aspects
 {cons}
+
+{neb_context}

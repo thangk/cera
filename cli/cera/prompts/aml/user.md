@@ -1,25 +1,16 @@
 Write a review for "{subject}" from the perspective of the following reviewer:
 
 ## Reviewer Profile
-- Age: {age}
-- Sex: {sex}
-- Region: {region}
-- Background: {additional_context}
+{reviewer_profile}
 
 ## Review Requirements
-- Length: {min_sentences}-{max_sentences} sentences
+- Write exactly {num_sentences} sentences
 - Include specific details about the product/service
 - Reference relevant features naturally in your review
 
-## Sentence Sentiment Distribution
-Distribute sentence-level sentiments according to these proportions:
-- Positive sentences: {polarity_positive}%
-- Neutral sentences: {polarity_neutral}%
-- Negative sentences: {polarity_negative}%
-
-For a {min_sentences}-{max_sentences} sentence review, include a mix of sentiments. For example:
-- 4 sentences with 60% positive → ~2-3 positive, ~1 neutral, ~0-1 negative
-- Balance naturally - not every review needs all sentiment types
+## Sentence-Level Sentiment Requirements
+Each sentence must match the specified sentiment below:
+{sentence_polarities}
 
 ## Aspect Categories
 Use ONLY these aspect categories for annotations:
@@ -34,9 +25,9 @@ Output the review as a JSON object with per-sentence aspect annotations.
 ```
 
 Rules:
+- Write EXACTLY {num_sentences} sentences, each matching its specified sentiment
 - Each sentence must have at least one opinion annotation
 - Use ONLY categories from the list above
-- Polarity per opinion can be "positive", "neutral", or "negative"
-- Mix sentiments naturally across sentences based on the distribution above
+- Polarity per opinion must match the sentiment specified for that sentence
 - Write authentically as the reviewer described above
 - Output ONLY the JSON object, no other text

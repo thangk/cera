@@ -209,6 +209,13 @@ class OpenRouterClient:
         response.raise_for_status()
 
         data = response.json()
+
+        # Handle API error responses that don't have 'choices'
+        if "choices" not in data:
+            error_msg = data.get("error", {}).get("message") or data.get("error") or str(data)
+            logger.error("openrouter_api_error", model=model_id, error=error_msg)
+            raise ValueError(f"OpenRouter API error: {error_msg}")
+
         content = data["choices"][0]["message"]["content"]
 
         # Record usage if tracker is available
@@ -267,6 +274,13 @@ class OpenRouterClient:
         response.raise_for_status()
 
         data = response.json()
+
+        # Handle API error responses that don't have 'choices'
+        if "choices" not in data:
+            error_msg = data.get("error", {}).get("message") or data.get("error") or str(data)
+            logger.error("openrouter_api_error", model=model_id, error=error_msg)
+            raise ValueError(f"OpenRouter API error: {error_msg}")
+
         content = data["choices"][0]["message"]["content"]
         usage = data.get("usage")
         gen_id = data.get("id")

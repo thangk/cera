@@ -377,18 +377,35 @@ def evaluate(
     else:
         console.print("[red]Needs improvement[/red] - Consider adjusting generation parameters")
 
-    # Polarity distribution (if available)
-    if isinstance(reviews[0], dict) and "polarity" in reviews[0]:
-        polarities = [r.get("polarity", "unknown") for r in reviews]
-        pos = polarities.count("positive")
-        neu = polarities.count("neutral")
-        neg = polarities.count("negative")
-        total = len(polarities)
+    # Polarity distribution (sentence-level from opinions)
+    if isinstance(reviews[0], dict):
+        pos, neu, neg = 0, 0, 0
 
-        console.print(f"\n[bold]Polarity Distribution:[/bold]")
-        console.print(f"  Positive: {pos} ({pos/total:.1%})")
-        console.print(f"  Neutral:  {neu} ({neu/total:.1%})")
-        console.print(f"  Negative: {neg} ({neg/total:.1%})")
+        # Check for sentence-level structure first (new format)
+        if "sentences" in reviews[0]:
+            for r in reviews:
+                for sent in r.get("sentences", []):
+                    for op in sent.get("opinions", []):
+                        pol = op.get("polarity", "").lower()
+                        if pol == "positive":
+                            pos += 1
+                        elif pol == "neutral":
+                            neu += 1
+                        elif pol == "negative":
+                            neg += 1
+        # Fallback to review-level polarity (legacy format)
+        elif "polarity" in reviews[0]:
+            polarities = [r.get("polarity", "unknown") for r in reviews]
+            pos = polarities.count("positive")
+            neu = polarities.count("neutral")
+            neg = polarities.count("negative")
+
+        total = pos + neu + neg
+        if total > 0:
+            console.print(f"\n[bold]Polarity Distribution (opinions):[/bold]")
+            console.print(f"  Positive: {pos} ({pos/total:.1%})")
+            console.print(f"  Neutral:  {neu} ({neu/total:.1%})")
+            console.print(f"  Negative: {neg} ({neg/total:.1%})")
 
     # Save report if output specified
     if output:
@@ -401,14 +418,36 @@ def evaluate(
             "device": "GPU" if use_gpu else "CPU",
         }
 
-        # Add polarity distribution if available
-        if isinstance(reviews[0], dict) and "polarity" in reviews[0]:
-            polarities = [r.get("polarity", "unknown") for r in reviews]
-            report["polarity_distribution"] = {
-                "positive": polarities.count("positive") / len(polarities),
-                "neutral": polarities.count("neutral") / len(polarities),
-                "negative": polarities.count("negative") / len(polarities),
-            }
+        # Add polarity distribution (sentence-level from opinions)
+        if isinstance(reviews[0], dict):
+            pos, neu, neg = 0, 0, 0
+
+            # Check for sentence-level structure first (new format)
+            if "sentences" in reviews[0]:
+                for r in reviews:
+                    for sent in r.get("sentences", []):
+                        for op in sent.get("opinions", []):
+                            pol = op.get("polarity", "").lower()
+                            if pol == "positive":
+                                pos += 1
+                            elif pol == "neutral":
+                                neu += 1
+                            elif pol == "negative":
+                                neg += 1
+            # Fallback to review-level polarity (legacy format)
+            elif "polarity" in reviews[0]:
+                polarities = [r.get("polarity", "unknown") for r in reviews]
+                pos = polarities.count("positive")
+                neu = polarities.count("neutral")
+                neg = polarities.count("negative")
+
+            total = pos + neu + neg
+            if total > 0:
+                report["polarity_distribution"] = {
+                    "positive": pos / total,
+                    "neutral": neu / total,
+                    "negative": neg / total,
+                }
 
         with open(output, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)

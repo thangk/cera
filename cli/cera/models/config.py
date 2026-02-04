@@ -56,7 +56,7 @@ class SexDistribution(BaseModel):
 class ReviewerProfile(BaseModel):
     """Reviewer profile configuration."""
 
-    age_range: tuple[int, int] = Field(default=(18, 65), description="Age range")
+    age_range: Optional[tuple[int, int]] = Field(default=None, description="Age range (None when age ablation disabled)")
     sex_distribution: SexDistribution = Field(default_factory=SexDistribution)
     additional_context: Optional[str] = Field(
         default=None,
@@ -115,6 +115,9 @@ class GenerationConfig(BaseModel):
     provider: str = Field(default="anthropic", description="LLM provider")
     model: str = Field(default="claude-sonnet-4", description="Model name")
     dataset_mode: str = Field(default="explicit", description="Dataset annotation mode: explicit, implicit, or both")
+    # NEB (Negative Example Buffer) - prevents generating similar reviews
+    neb_enabled: bool = Field(default=True, description="Enable NEB to prevent similar reviews across batches")
+    neb_depth: int = Field(default=2, ge=1, le=10, description="How many batches to remember (1-10). Buffer size = neb_depth * request_size")
 
 
 class OutputConfig(BaseModel):
