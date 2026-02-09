@@ -101,6 +101,9 @@ class AttributesProfile(BaseModel):
     temp_range: tuple[float, float] = Field(
         default=(0.7, 0.9), description="Temperature range"
     )
+    cap_weights: Optional[dict] = Field(
+        default=None, description="Capitalization style weights: {standard, lowercase, mixed, emphasis}"
+    )
 
 
 class GenerationConfig(BaseModel):
