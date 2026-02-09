@@ -78,6 +78,7 @@ class AttributesProfile(BaseModel):
     noise: NoiseConfig
     length_range: list[int]
     temp_range: list[float] = [0.7, 0.9]  # LLM temperature range, optional with default
+    cap_weights: Optional[dict] = None  # e.g., {"standard": 0.55, "lowercase": 0.20, "mixed": 0.15, "emphasis": 0.10}
 
 
 class GenerationConfig(BaseModel):
@@ -224,7 +225,7 @@ def save_job_config(
     }
 
     # Add subject_profile if available
-    if config.subject_profile:
+    if config and config.subject_profile:
         config_data["subject_profile"] = {
             "query": config.subject_profile.query,
             "region": config.subject_profile.region,
@@ -243,7 +244,7 @@ def save_job_config(
             }
 
     # Add reviewer_profile if available
-    if config.reviewer_profile:
+    if config and config.reviewer_profile:
         config_data["reviewer_profile"] = {
             "age_range": config.reviewer_profile.age_range,
             "sex_distribution": {
@@ -255,7 +256,7 @@ def save_job_config(
         }
 
     # Add attributes_profile if available
-    if config.attributes_profile:
+    if config and config.attributes_profile:
         config_data["attributes_profile"] = {
             "polarity": {
                 "positive": config.attributes_profile.polarity.positive,
@@ -270,10 +271,11 @@ def save_job_config(
             },
             "length_range": config.attributes_profile.length_range,
             "temperature_range": getattr(config.attributes_profile, 'temp_range', None) or getattr(config.attributes_profile, 'temperature_range', [0.7, 0.9]),
+            "cap_weights": getattr(config.attributes_profile, 'cap_weights', None),
         }
 
     # Add generation config if available
-    if config.generation:
+    if config and config.generation:
         config_data["generation"] = {
             "count": config.generation.count,
             "batch_size": config.generation.batch_size,
@@ -289,7 +291,7 @@ def save_job_config(
         }
 
     # Add ablation settings if provided
-    if config.ablation:
+    if config and config.ablation:
         config_data["ablation"] = {
             "sil_enabled": config.ablation.sil_enabled,
             "mav_enabled": config.ablation.mav_enabled,
@@ -1307,6 +1309,7 @@ async def compose_job(request: Union[CompositionRequest, CompositionRequestV2]):
                         noise=NoiseConfig(**config.get("attributes_profile", {}).get("noise", {})),
                         length_range=config.get("attributes_profile", {}).get("length_range", [2, 5]),
                         temp_range=config.get("attributes_profile", {}).get("temp_range", [0.7, 0.9]),
+                        cap_weights=config.get("attributes_profile", {}).get("cap_weights", None),
                     ),
                     generation=GenerationConfig(**config.get("generation", {})),
                 ),
@@ -2968,6 +2971,41 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
             if convex:
                 await convex.add_log(job_id, "INFO", "NEB", f"Negative Example Buffer enabled (depth={neb_depth}, max={max_buffer_size})")
 
+        # Opening directives for per-review diversity enforcement
+        OPENING_DIRECTIVES = [
+            "Start with a specific product detail, measurement, or physical observation you noticed immediately",
+            "Start mid-thought or mid-story, as if continuing a conversation (e.g., 'So I finally...' or 'Three weeks in and...')",
+            "Start with a rhetorical question or genuine question to the reader",
+            "Start with a raw emotional reaction -- excitement, disappointment, surprise, or frustration",
+            "Start with when, where, or how you acquired/visited/discovered this (time and place context)",
+            "Start with a comparison to a competitor, alternative, or your previous experience",
+            "Start with a casual filler word or interjection (e.g., 'Ok so...', 'Man,', 'Alright,', 'Look,')",
+            "Start with a direct complaint or frustration about a specific issue",
+            "Start with enthusiastic praise or a strong recommendation",
+            "Start with a warning, caveat, or 'heads up' to other buyers/visitors",
+            "Start by addressing the reader directly (e.g., 'If you're looking for...', 'For anyone considering...')",
+            "Start with a time reference (e.g., 'After two months...', 'First day with this...')",
+            "Start with a contradictory or nuanced take (e.g., 'I wanted to love this but...', 'Mixed feelings...')",
+            "Start with a factual statement about usage (e.g., 'Used this daily for 3 months...')",
+            "Start with a story or anecdote about why you bought/visited this",
+        ]
+
+        # Capitalization styles for per-review authenticity (weighted distribution)
+        # Read weights from config or use defaults (decimal values, e.g., 0.55 = 55%)
+        cap_weights = getattr(config.attributes_profile, 'cap_weights', None) or {}
+        _cap_w = {
+            "standard": cap_weights.get("standard", 0.55),
+            "lowercase": cap_weights.get("lowercase", 0.20),
+            "mixed": cap_weights.get("mixed", 0.15),
+            "emphasis": cap_weights.get("emphasis", 0.10),
+        }
+        CAPITALIZATION_STYLES = [
+            ("Write with standard/proper capitalization. Capitalize the first word of each sentence normally.", _cap_w["standard"]),
+            ("Write in mostly lowercase. Start your review and most sentences with lowercase letters. Use lowercase 'i' instead of 'I'. Example: 'honestly this laptop is pretty solid. i use it every day and the keyboard feels great.'", _cap_w["lowercase"]),
+            ("Write with casual/mixed capitalization. Start the review lowercase, occasionally skip capitalization after periods, but not consistently. Example: 'so i picked this up last week. The screen is decent but the speakers kinda suck.'", _cap_w["mixed"]),
+            ("Write with occasional ALL CAPS for emphasis on key words, but otherwise normal capitalization. Example: 'The battery life is AMAZING but the trackpad is SO frustrating to use.'", _cap_w["emphasis"]),
+        ]
+
         if dataset_mode == "implicit":
             dataset_mode_instruction = "For implicit mode: do NOT include target terms. Only provide the category and polarity for each opinion."
             output_example = '{\n  "sentences": [\n    {\n      "text": "The food was absolutely divine.",\n      "opinions": [\n        {"category": "FOOD#QUALITY", "polarity": "positive"}\n      ]\n    }\n  ]\n}'
@@ -2975,14 +3013,17 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
             dataset_mode_instruction = "For explicit mode: include the target term from the sentence text for each opinion. IMPORTANT: The target MUST be a SINGLE WORD (noun) in lowercase that appears exactly in the text."
             output_example = '{\n  "sentences": [\n    {\n      "text": "The carbonara was absolutely divine.",\n      "opinions": [\n        {"target": "carbonara", "category": "FOOD#QUALITY", "polarity": "positive"}\n      ]\n    }\n  ]\n}'
 
-        async def generate_single_review(review_index: int, neb_buffer_param) -> dict:
+        async def generate_single_review(review_index: int, neb_buffer_param, opening_directive: str = "", capitalization_style: str = "") -> dict:
             """Generate a single review with retries. Returns result dict."""
             # Use explicitly passed neb_buffer to avoid closure capture issues
             neb_buffer = neb_buffer_param
             async with semaphore:
                 reviewer = rgm.generate_profile()
                 num_sentences = random.randint(length_range[0], length_range[1])
-                temperature = random.uniform(temp_range[0], temp_range[1])
+                # Sample temperature in 0.1 increments (e.g., 0.7, 0.8, 0.9)
+                temp_steps = [round(temp_range[0] + i * 0.1, 1)
+                              for i in range(int((temp_range[1] - temp_range[0]) / 0.1) + 1)]
+                temperature = random.choice(temp_steps)
 
                 # Get NEB context (empty string if disabled or first batch)
                 neb_context = ""
@@ -3041,7 +3082,10 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
                     "aspect_categories": "\n".join(f"- {cat}" for cat in aspect_cats),
                     "dataset_mode_instruction": dataset_mode_instruction,
                     "output_example": output_example,
+                    "temperature": f"{temperature:.1f}",
                     "neb_context": neb_context,
+                    "opening_directive": opening_directive,
+                    "capitalization_style": capitalization_style,
                 }
 
                 system_prompt = format_prompt(system_template, **prompt_vars)
@@ -3165,7 +3209,25 @@ Requirements:
 
             batch_end = min(batch_start + request_size, total_reviews)
             print(f"[NEB DEBUG] At batch creation: neb_buffer is {'not None (id=' + str(id(neb_buffer)) + ')' if neb_buffer else 'None'}", flush=True)
-            tasks = [generate_single_review(i, neb_buffer) for i in range(batch_start, batch_end)]
+            # Sample unique opening directives for this batch
+            batch_size = batch_end - batch_start
+            if batch_size <= len(OPENING_DIRECTIVES):
+                batch_directives = random.sample(OPENING_DIRECTIVES, batch_size)
+            else:
+                batch_directives = OPENING_DIRECTIVES.copy()
+                extras = random.choices(OPENING_DIRECTIVES, k=batch_size - len(OPENING_DIRECTIVES))
+                batch_directives.extend(extras)
+                random.shuffle(batch_directives)
+
+            # Sample capitalization styles for this batch (weighted random)
+            cap_texts = [s[0] for s in CAPITALIZATION_STYLES]
+            cap_weights = [s[1] for s in CAPITALIZATION_STYLES]
+            batch_cap_styles = random.choices(cap_texts, weights=cap_weights, k=batch_size)
+
+            tasks = [
+                generate_single_review(i, neb_buffer, batch_directives[i - batch_start], batch_cap_styles[i - batch_start])
+                for i in range(batch_start, batch_end)
+            ]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for result in batch_results:
@@ -3779,7 +3841,8 @@ class HeuristicConfig(BaseModel):
     targetMode: str  # "reviews" or "sentences"
     targetValue: int
     reviewsPerBatch: int
-    avgSentencesPerReview: int
+    requestSize: int = 3  # Number of parallel batch requests
+    avgSentencesPerReview: str  # e.g., "5" or "4-7" (passed verbatim to prompt)
     model: str
     outputFormat: str  # "semeval_xml", "jsonl", "csv"
     totalRuns: int = 1  # Number of times to run generation (for research variability assessment)
@@ -3860,11 +3923,22 @@ async def execute_heuristic_pipeline(
             except ImportError:
                 await convex.set_evaluation_device(job_id, "CPU")
 
+        # Parse avg sentences for numeric calculations (e.g. "4-7" → 5.5, "5" → 5)
+        avg_sentences_str = heuristic_config.avgSentencesPerReview
+        range_match = re.match(r'^(\d+)\s*-\s*(\d+)$', avg_sentences_str)
+        if range_match:
+            avg_sentences_num = (int(range_match.group(1)) + int(range_match.group(2))) / 2
+        else:
+            try:
+                avg_sentences_num = float(avg_sentences_str)
+            except ValueError:
+                avg_sentences_num = 5.0
+
         # Calculate total reviews and batches
         if heuristic_config.targetMode == "reviews":
             total_reviews = heuristic_config.targetValue
         else:  # sentences mode
-            total_reviews = math.ceil(heuristic_config.targetValue / heuristic_config.avgSentencesPerReview)
+            total_reviews = math.ceil(heuristic_config.targetValue / avg_sentences_num)
 
         total_batches = math.ceil(total_reviews / heuristic_config.reviewsPerBatch)
 
@@ -3874,9 +3948,10 @@ async def execute_heuristic_pipeline(
         # Inject variables into prompt template
         prompt = heuristic_config.prompt
         prompt = prompt.replace("{review_count}", str(heuristic_config.reviewsPerBatch))
-        prompt = prompt.replace("{avg_sentences}", str(heuristic_config.avgSentencesPerReview))
-        # Calculate sentence count for this batch (reviews_per_batch * avg_sentences)
-        batch_sentence_count = heuristic_config.reviewsPerBatch * heuristic_config.avgSentencesPerReview
+        # Pass avg_sentences verbatim (e.g. "4-7") so the LLM sees it as-is
+        prompt = prompt.replace("{avg_sentences}", avg_sentences_str)
+        # Calculate sentence count for this batch using numeric midpoint
+        batch_sentence_count = int(heuristic_config.reviewsPerBatch * avg_sentences_num)
         prompt = prompt.replace("{sentence_count}", str(batch_sentence_count))
 
         # Append JSON format instructions for ABSA format (if enabled)
@@ -3944,95 +4019,113 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                 })
 
             all_reviews = []
+            request_size = heuristic_config.requestSize
+            completed_batches = 0
 
-            # Batch generation loop
-            for batch_num in range(1, total_batches + 1):
+            # Single batch generation coroutine
+            async def generate_batch(batch_num: int, semaphore: asyncio.Semaphore) -> list:
+                async with semaphore:
+                    if convex:
+                        await convex.add_log(job_id, "INFO", "Heuristic", f"Generating batch {batch_num}/{total_batches}...")
+
+                    retries = 0
+                    max_retries = 3
+                    batch_reviews = []
+
+                    while retries < max_retries:
+                        try:
+                            from cera.llm.openrouter import OpenRouterClient
+
+                            llm = OpenRouterClient(api_key=api_key)
+                            content = await llm.chat(
+                                model=heuristic_config.model,
+                                messages=[{"role": "user", "content": prompt}],
+                                temperature=0.8,
+                                max_tokens=8192,
+                            )
+
+                            # Try to extract JSON array from response
+                            content = re.sub(r'```json\s*', '', content)
+                            content = re.sub(r'```\s*', '', content)
+                            content = content.strip()
+
+                            print(f"[Heuristic] Batch {batch_num} raw content length: {len(content)}")
+                            print(f"[Heuristic] Batch {batch_num} content preview: {content[:500]}...")
+
+                            batch_reviews = json.loads(content)
+
+                            if not isinstance(batch_reviews, list):
+                                raise ValueError("Response is not a JSON array")
+
+                            print(f"[Heuristic] Batch {batch_num} parsed {len(batch_reviews)} reviews")
+                            break  # Success
+
+                        except (json.JSONDecodeError, ValueError, KeyError) as e:
+                            retries += 1
+                            print(f"[Heuristic] Batch {batch_num} parse error: {str(e)[:200]}")
+                            print(f"[Heuristic] Content was: {content[:300] if 'content' in dir() else 'N/A'}...")
+                            if convex:
+                                await convex.add_log(job_id, "WARN", "Heuristic", f"Batch {batch_num} parse error (retry {retries}/{max_retries}): {str(e)[:100]}")
+                            if retries >= max_retries:
+                                if convex:
+                                    await convex.add_log(job_id, "ERROR", "Heuristic", f"Batch {batch_num} failed after {max_retries} retries")
+                                batch_reviews = []
+
+                    return [(batch_num, review) for review in batch_reviews]
+
+            # Parallel batch generation with request_size concurrency
+            semaphore = asyncio.Semaphore(request_size)
+            if convex:
+                await convex.add_log(job_id, "INFO", "Heuristic", f"Parallel generation: {request_size} concurrent requests")
+
+            # Process batches in waves of request_size for progress tracking
+            for wave_start in range(1, total_batches + 1, request_size):
+                wave_end = min(wave_start + request_size, total_batches + 1)
+                tasks = [generate_batch(b, semaphore) for b in range(wave_start, wave_end)]
+                wave_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for result in wave_results:
+                    if isinstance(result, Exception):
+                        print(f"[Heuristic] Batch exception: {result}")
+                        if convex:
+                            await convex.add_log(job_id, "ERROR", "Heuristic", f"Batch exception: {str(result)[:100]}")
+                        continue
+                    for batch_num, review in result:
+                        review_id = f"{job_id}-{len(all_reviews):05d}"
+                        if "sentences" in review:
+                            all_reviews.append({
+                                "id": review_id,
+                                "sentences": review.get("sentences", []),
+                                "method": "heuristic",
+                                "batch": batch_num,
+                            })
+                        else:
+                            text = review.get("text", "")
+                            polarity = review.get("polarity", "neutral")
+                            all_reviews.append({
+                                "id": review_id,
+                                "sentences": [{
+                                    "text": text,
+                                    "opinions": [{
+                                        "target": "NULL",
+                                        "category": "RESTAURANT#GENERAL",
+                                        "polarity": polarity,
+                                        "from": 0,
+                                        "to": 0,
+                                    }]
+                                }],
+                                "method": "heuristic",
+                                "batch": batch_num,
+                            })
+
+                completed_batches = wave_end - 1
                 if convex:
-                    await convex.add_log(job_id, "INFO", "Heuristic", f"Generating batch {batch_num}/{total_batches}...")
                     await convex.run_mutation("jobs:updateHeuristicProgress", {
                         "jobId": job_id,
-                        "currentBatch": batch_num,
+                        "currentBatch": completed_batches,
                         "totalBatches": total_batches,
                         "reviewsCollected": len(all_reviews),
                     })
-
-                # Call LLM
-                retries = 0
-                max_retries = 3
-                batch_reviews = []
-
-                while retries < max_retries:
-                    try:
-                        from cera.llm.openrouter import OpenRouterClient
-
-                        llm = OpenRouterClient(api_key=api_key)
-                        content = await llm.chat(
-                            model=heuristic_config.model,
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.8,
-                            max_tokens=8192,
-                        )
-
-                        # Try to extract JSON array from response
-                        # Remove markdown code blocks if present
-                        content = re.sub(r'```json\s*', '', content)
-                        content = re.sub(r'```\s*', '', content)
-                        content = content.strip()
-
-                        print(f"[Heuristic] Batch {batch_num} raw content length: {len(content)}")
-                        print(f"[Heuristic] Batch {batch_num} content preview: {content[:500]}...")
-
-                        batch_reviews = json.loads(content)
-
-                        if not isinstance(batch_reviews, list):
-                            raise ValueError("Response is not a JSON array")
-
-                        print(f"[Heuristic] Batch {batch_num} parsed {len(batch_reviews)} reviews")
-                        break  # Success
-
-                    except (json.JSONDecodeError, ValueError, KeyError) as e:
-                        retries += 1
-                        print(f"[Heuristic] Batch {batch_num} parse error: {str(e)[:200]}")
-                        print(f"[Heuristic] Content was: {content[:300] if 'content' in dir() else 'N/A'}...")
-                        if convex:
-                            await convex.add_log(job_id, "WARN", "Heuristic", f"Batch {batch_num} parse error (retry {retries}/{max_retries}): {str(e)[:100]}")
-                        if retries >= max_retries:
-                            if convex:
-                                await convex.add_log(job_id, "ERROR", "Heuristic", f"Batch {batch_num} failed after {max_retries} retries")
-                            batch_reviews = []
-
-                # Add batch reviews with IDs (handle both simple and ABSA formats)
-                for i, review in enumerate(batch_reviews):
-                    review_id = f"{job_id}-{len(all_reviews):05d}"
-
-                    # Check if review is in ABSA format (has sentences) or simple format (has text)
-                    if "sentences" in review:
-                        # ABSA format - keep as-is with proper structure
-                        all_reviews.append({
-                            "id": review_id,
-                            "sentences": review.get("sentences", []),
-                            "method": "heuristic",
-                            "batch": batch_num,
-                        })
-                    else:
-                        # Simple format - convert to ABSA-like structure for compatibility
-                        text = review.get("text", "")
-                        polarity = review.get("polarity", "neutral")
-                        all_reviews.append({
-                            "id": review_id,
-                            "sentences": [{
-                                "text": text,
-                                "opinions": [{
-                                    "target": "NULL",
-                                    "category": "RESTAURANT#GENERAL",
-                                    "polarity": polarity,
-                                    "from": 0,
-                                    "to": 0,
-                                }]
-                            }],
-                            "method": "heuristic",
-                            "batch": batch_num,
-                        })
 
             # Normalize targets: single-word, lowercase, fix offsets
             for review in all_reviews:
@@ -4172,131 +4265,46 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                 if convex:
                     if current_run == 1:
                         await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
-                        # Log and save GPU status (only on first run)
-                        device_type, device_name = get_mdqa_device_info()
-                        if device_type == "GPU":
-                            await convex.add_log(job_id, "INFO", "MDQA", f"Using GPU acceleration: {device_name}")
-                        else:
-                            await convex.add_log(job_id, "INFO", "MDQA", "Using CPU (no GPU detected)")
-                        # Save device info to job
-                        await convex.run_mutation("jobs:setEvaluationDevice", {
-                            "jobId": job_id,
-                            "device": {"type": device_type, "name": device_name or None},
-                        })
-                        # Log reference dataset status (only on first run)
-                        ref_enabled = evaluation_config.get("reference_metrics_enabled", False)
-                        if ref_enabled:
-                            await convex.add_log(job_id, "INFO", "MDQA", "Reference dataset: Enabled (Lexical + Semantic + Diversity)")
-                        else:
-                            await convex.add_log(job_id, "INFO", "MDQA", "Reference dataset: Not provided (Diversity metrics only)")
                     if total_runs > 1:
                         await convex.add_log(job_id, "INFO", "MDQA", f"Evaluating run {current_run}/{total_runs}...")
-                    else:
-                        await convex.add_log(job_id, "INFO", "MDQA", "Starting evaluation...")
 
-                metrics_result = {}
-                # Extract all sentence texts from ABSA format reviews
-                review_texts = []
-                for r in all_reviews:
-                    for sentence in r.get("sentences", []):
-                        if sentence.get("text"):
-                            review_texts.append(sentence["text"])
+                # Use shared execute_evaluation() for consistent metric computation
+                metrics_result = await execute_evaluation(
+                    job_id=job_id,
+                    job_paths=job_paths,
+                    evaluation_config=evaluation_config,
+                    convex=convex,
+                    reviews_data=all_reviews,
+                    run_number=current_run if total_runs > 1 else None,
+                    save_files=(total_runs == 1),  # Only save files for single run; multi-run saves at end
+                )
 
-                selected_metrics = evaluation_config.get("metrics", [])
+                if metrics_result:
+                    # Save per-run metrics file for multi-run
+                    if total_runs > 1:
+                        metrics_suffix = f"-run{current_run}"
+                        metrics_path = Path(job_paths["metrics"]) / f"mdqa_metrics{metrics_suffix}.json"
+                        with open(metrics_path, "w") as f:
+                            json.dump(metrics_result, f, indent=2)
 
-                # Check for reference dataset (for Lexical/Semantic metrics)
-                reference_texts = []
-                reference_metrics_enabled = evaluation_config.get("reference_metrics_enabled", False)
-                reference_required_metrics = {"bleu", "rouge_l", "bertscore", "moverscore"}
+                    all_run_metrics.append(metrics_result)
 
-                if reference_metrics_enabled:
-                    # Look for reference dataset file in the dataset directory
-                    reference_files = list(dataset_dir.glob("reference_*"))
-                    if reference_files:
-                        reference_file = reference_files[0]
-                        reference_texts, ref_stats = load_texts_from_file(str(reference_file), return_stats=True)
-                        if reference_texts:
-                            print(f"[Heuristic MDQA] Loaded {ref_stats['reviews']} reviews ({ref_stats['sentences']} sentences) from {reference_file.name}")
-                            if convex and current_run == 1:
-                                await convex.add_log(job_id, "INFO", "MDQA", f"Using reference: {reference_file.name} ({ref_stats['reviews']} reviews)")
-                        else:
-                            print(f"[Heuristic MDQA] Warning: Reference file found but empty: {reference_file}")
-                            if convex and current_run == 1:
-                                await convex.add_log(job_id, "WARN", "MDQA", f"Reference file empty: {reference_file.name}")
-                    else:
-                        print("[Heuristic MDQA] Warning: reference_metrics_enabled but no reference file found")
-                        if convex and current_run == 1:
-                            await convex.add_log(job_id, "WARN", "MDQA", "No reference file found - skipping Lexical/Semantic metrics")
-
-                # Filter out reference-requiring metrics if no reference is available
-                use_reference = len(reference_texts) > 0
-                if not use_reference:
-                    skipped = [m for m in selected_metrics if m in reference_required_metrics]
-                    if skipped and current_run == 1:
-                        print(f"[Heuristic MDQA] Skipping metrics (no reference): {', '.join(skipped)}")
-                    selected_metrics = [m for m in selected_metrics if m not in reference_required_metrics]
-
-                if convex and current_run == 1:
-                    await convex.add_log(job_id, "INFO", "MDQA", f"Computing metrics: {', '.join(selected_metrics)}")
-
-                # Compute Lexical metrics (require reference)
-                if use_reference:
-                    if "bleu" in selected_metrics:
-                        metrics_result["bleu"] = compute_bleu_with_reference(review_texts, reference_texts)
-                    if "rouge_l" in selected_metrics:
-                        metrics_result["rouge_l"] = compute_rouge_l_with_reference(review_texts, reference_texts)
-
-                # Compute Semantic metrics (require reference)
-                if use_reference:
-                    if "bertscore" in selected_metrics:
-                        metrics_result["bertscore"] = compute_bertscore_with_reference(review_texts, reference_texts)
-                    if "moverscore" in selected_metrics:
-                        metrics_result["moverscore"] = compute_moverscore_with_reference(review_texts, reference_texts)
-
-                # Compute Diversity metrics (always available)
-                if "distinct_1" in selected_metrics:
-                    metrics_result["distinct_1"] = compute_distinct_n(review_texts, 1)
-                if "distinct_2" in selected_metrics:
-                    metrics_result["distinct_2"] = compute_distinct_n(review_texts, 2)
-                if "self_bleu" in selected_metrics:
-                    metrics_result["self_bleu"] = compute_self_bleu(review_texts)
-
-                # Convert numpy types to Python floats for JSON serialization
-                def ensure_python_float(val):
-                    if val is None:
-                        return None
-                    try:
-                        return float(val)
-                    except (TypeError, ValueError):
-                        return val
-
-                metrics_result = {k: ensure_python_float(v) for k, v in metrics_result.items()}
-
-                # Save per-run metrics
-                metrics_suffix = f"-run{current_run}" if total_runs > 1 else ""
-                metrics_path = Path(job_paths["metrics"]) / f"mdqa_metrics{metrics_suffix}.json"
-                with open(metrics_path, "w") as f:
-                    json.dump(metrics_result, f, indent=2)
-
-                # Collect metrics for averaging
-                all_run_metrics.append(metrics_result)
-
-                # Save per-run metrics to Convex for multi-run
-                if total_runs > 1 and convex:
-                    try:
-                        per_run_metrics = {
-                            k: float(round(float(v), 6))
-                            for k, v in metrics_result.items()
-                            if v is not None and k in ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
-                        }
-                        await convex.run_mutation("jobs:savePerRunMetrics", {
-                            "jobId": job_id,
-                            "run": current_run,
-                            "datasetFile": f"reviews-explicit{run_suffix}.jsonl",
-                            "metrics": per_run_metrics,
-                        })
-                    except Exception as e:
-                        print(f"[Heuristic] Warning: Could not save run {current_run} metrics: {e}")
+                    # Save per-run metrics to Convex for multi-run
+                    if total_runs > 1 and convex:
+                        try:
+                            per_run_metrics = {
+                                k: float(round(float(v), 6))
+                                for k, v in metrics_result.items()
+                                if v is not None and k in ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                            }
+                            await convex.run_mutation("jobs:savePerRunMetrics", {
+                                "jobId": job_id,
+                                "run": current_run,
+                                "datasetFile": f"reviews-explicit{run_suffix}.jsonl",
+                                "metrics": per_run_metrics,
+                            })
+                        except Exception as e:
+                            print(f"[Heuristic] Warning: Could not save run {current_run} metrics: {e}")
 
         # End of multi-run loop
 
@@ -4416,11 +4424,11 @@ async def execute_pipeline(
         # Handle Composition Reuse (copy context files from source job)
         # ========================================
         if reused_from_job_dir and "composition" not in phases:
+            import shutil
             source_contexts_dir = Path(reused_from_job_dir) / "contexts"
             target_contexts_dir = Path(job_paths["contexts"])
 
             if source_contexts_dir.exists():
-                import shutil
                 # Copy all context files from source job
                 for context_file in source_contexts_dir.glob("*.json"):
                     shutil.copy2(context_file, target_contexts_dir / context_file.name)
@@ -4430,6 +4438,15 @@ async def execute_pipeline(
             else:
                 if convex:
                     await convex.add_log(job_id, "WARN", "Pipeline", f"Source job contexts not found: {source_contexts_dir}")
+
+            # Copy reference dataset files from source job (for MDQA evaluation)
+            source_dataset_dir = Path(reused_from_job_dir) / "dataset"
+            target_dataset_dir = Path(job_paths["dataset"])
+            if source_dataset_dir.exists():
+                for ref_file in source_dataset_dir.glob("reference_*"):
+                    shutil.copy2(ref_file, target_dataset_dir / ref_file.name)
+                    if convex:
+                        await convex.add_log(job_id, "INFO", "Pipeline", f"Copied reference dataset: {ref_file.name}")
 
         # ========================================
         # Save config.json for this job
@@ -5097,22 +5114,25 @@ async def execute_pipeline(
             await convex.fail_job(job_id, error_msg)
 
 
-def load_texts_from_file(file_path: str, return_stats: bool = False) -> list[str] | tuple[list[str], dict]:
+def load_texts_from_file(file_path: str, return_stats: bool = False, return_sentences: bool = False) -> list[str] | tuple[list[str], dict]:
     """
     Load review texts from a dataset file (JSONL, CSV, XML, or TXT).
 
     Args:
         file_path: Path to the dataset file
         return_stats: If True, returns (texts, stats_dict) with review and sentence counts
+        return_sentences: If True, also returns individual sentence texts (for sentence-level metrics)
 
     Returns:
-        List of plain text strings, or tuple of (texts, stats) if return_stats=True
+        List of plain text strings, or tuple of (texts, stats) if return_stats=True.
+        If return_sentences=True, stats dict includes "sentence_texts" key.
     """
     from pathlib import Path
     import json
 
     path = Path(file_path)
     texts = []
+    all_sentence_texts = []  # Individual sentences for sentence-level metrics
     sentence_count = 0
 
     if not path.exists():
@@ -5134,9 +5154,11 @@ def load_texts_from_file(file_path: str, return_stats: bool = False) -> list[str
                             # Count sentences from structured data or estimate from text
                             if sentences:
                                 sentence_count += len(sentences)
+                                all_sentence_texts.extend(s.get("text", "") for s in sentences if s.get("text"))
                             else:
                                 # Rough estimate: split on sentence-ending punctuation
                                 sentence_count += max(1, text.count('.') + text.count('!') + text.count('?'))
+                                all_sentence_texts.append(text)
                     except json.JSONDecodeError:
                         continue
 
@@ -5167,6 +5189,7 @@ def load_texts_from_file(file_path: str, return_stats: bool = False) -> list[str
                 # Join all sentences into one review text
                 if review_sentences:
                     texts.append(" ".join(review_sentences))
+                    all_sentence_texts.extend(review_sentences)
         except ET.ParseError:
             pass  # Silently fail on malformed XML
 
@@ -5188,7 +5211,10 @@ def load_texts_from_file(file_path: str, return_stats: bool = False) -> list[str
                     sentence_count += max(1, line.count('.') + line.count('!') + line.count('?'))
 
     if return_stats:
-        return texts, {"reviews": len(texts), "sentences": sentence_count}
+        stats = {"reviews": len(texts), "sentences": sentence_count}
+        if return_sentences:
+            stats["sentence_texts"] = all_sentence_texts
+        return texts, stats
     return texts
 
 
@@ -5215,23 +5241,36 @@ async def execute_evaluation(
     from pathlib import Path
     import json
 
+    # Prepare two granularities:
+    #   review_texts  = whole reviews (sentences joined) → used for diversity metrics
+    #   sentence_texts = individual sentences → used for reference metrics (lexical/semantic)
     review_texts = []
+    sentence_texts = []
 
-    if reviews_data:
-        # Use in-memory data from generation phase
-        for r in reviews_data:
-            # Handle CERA's internal review format (has "sentences" from generation)
+    def _extract_from_records(records):
+        """Extract both review-level and sentence-level texts from review records."""
+        for r in records:
             sentences = r.get("sentences", [])
             if sentences:
-                text = " ".join(s.get("text", "") for s in sentences if s.get("text"))
+                sent_list = [s.get("text", "") for s in sentences if s.get("text")]
+                if sent_list:
+                    review_texts.append(" ".join(sent_list))
+                    sentence_texts.extend(sent_list)
             else:
                 text = r.get("review_text") or r.get("text") or r.get("review") or ""
-            if text:
-                review_texts.append(text)
+                if text:
+                    review_texts.append(text)
+                    sentence_texts.append(text)
+
+    if reviews_data:
+        _extract_from_records(reviews_data)
     else:
         # Fall back to file-based loading
         if dataset_file:
             dataset_path = Path(dataset_file)
+            # If just a filename (not absolute), resolve relative to job's dataset dir
+            if not dataset_path.is_absolute() and not dataset_path.exists():
+                dataset_path = Path(job_paths["dataset"]) / dataset_path
         else:
             # Try to find any dataset file in the dataset dir
             dataset_dir = Path(job_paths["dataset"])
@@ -5296,37 +5335,59 @@ async def execute_evaluation(
         if not reviews:
             raise ValueError("No reviews found in dataset file")
 
-        # Extract review texts (handles both flat and sentence-based formats)
-        for r in reviews:
-            text = r.get("review_text") or r.get("text") or r.get("review") or ""
-            if not text:
-                # Handle CERA's sentence-based JSONL format
-                sentences = r.get("sentences", [])
-                if sentences:
-                    text = " ".join(s.get("text", "") for s in sentences if s.get("text"))
-            if text:
-                review_texts.append(text)
+        _extract_from_records(reviews)
 
     if not review_texts:
         raise ValueError("No review text found in dataset")
 
-    print(f"[Evaluation] Loaded {len(review_texts)} reviews for evaluation")
+    print(f"[Evaluation] Loaded {len(review_texts)} reviews ({len(sentence_texts)} sentences) for evaluation")
 
-    # Check for reference dataset (for meaningful Lexical/Semantic metrics)
-    reference_texts = []
+    # Check for Ceiling Test mode (split dataset into two halves)
+    reference_texts = []       # Review-level reference (for diversity ceiling tests)
+    reference_sentence_texts = []  # Sentence-level reference (for lexical/semantic metrics)
     reference_metrics_enabled = evaluation_config.get("reference_metrics_enabled", False) if evaluation_config else False
+    ceiling_test = evaluation_config.get("ceiling_test") if evaluation_config else None
 
     # Lexical/Semantic metrics that require a reference dataset
     reference_required_metrics = {"bleu", "rouge_l", "bertscore", "moverscore"}
 
-    if reference_metrics_enabled:
-        # Look for reference dataset file in the dataset directory
+    if ceiling_test and ceiling_test.get("enabled"):
+        # Ceiling Test: split the dataset into two halves
+        split_mode = ceiling_test.get("split_mode", "random")
+        if split_mode == "random":
+            import random
+            indices = list(range(len(review_texts)))
+            random.shuffle(indices)
+            mid = len(indices) // 2
+            set_a = [review_texts[i] for i in indices[:mid]]
+            set_b = [review_texts[i] for i in indices[mid:]]
+        else:  # sequential
+            mid = len(review_texts) // 2
+            set_a = review_texts[:mid]
+            set_b = review_texts[mid:]
+
+        print(f"[Evaluation] Ceiling Test ({split_mode} split): Set A = {len(set_a)} reviews, Set B = {len(set_b)} reviews")
+        if convex:
+            await convex.add_log(job_id, "INFO", "MDQA", f"Ceiling Test ({split_mode} split): Set A = {len(set_a)} reviews, Set B = {len(set_b)} reviews")
+
+        # For ceiling test, use review-level for both (same split)
+        review_texts = set_a
+        reference_texts = set_b
+        # Sentence-level split: approximate by splitting sentence_texts at midpoint
+        sent_mid = len(sentence_texts) // 2
+        reference_sentence_texts = sentence_texts[sent_mid:]
+        sentence_texts = sentence_texts[:sent_mid]
+        reference_metrics_enabled = True
+
+    elif reference_metrics_enabled:
+        # Normal mode: look for reference dataset file in the dataset directory
         dataset_dir = Path(job_paths["dataset"])
         reference_files = list(dataset_dir.glob("reference_*"))
 
         if reference_files:
             reference_file = reference_files[0]  # Use first reference file found
-            reference_texts, ref_stats = load_texts_from_file(str(reference_file), return_stats=True)
+            reference_texts, ref_stats = load_texts_from_file(str(reference_file), return_stats=True, return_sentences=True)
+            reference_sentence_texts = ref_stats.get("sentence_texts", reference_texts)
             if reference_texts:
                 print(f"[Evaluation] Loaded {ref_stats['reviews']} reviews ({ref_stats['sentences']} sentences) from {reference_file.name}")
                 if convex:
@@ -5379,13 +5440,14 @@ async def execute_evaluation(
     metrics_results = {}
 
     # Map metric names to their compute functions
-    # Lexical/Semantic metrics require reference texts (they're filtered out if no reference)
-    # Diversity metrics only use generated texts
+    # Reference metrics (Lexical/Semantic) use sentence-level texts for ABSA granularity
+    # Diversity metrics use review-level texts for meaningful inter-review diversity
+    ref_sents = reference_sentence_texts if reference_sentence_texts else reference_texts
     metric_compute_map = {
-        "bleu": lambda: compute_bleu_with_reference(review_texts, reference_texts),
-        "rouge_l": lambda: compute_rouge_l_with_reference(review_texts, reference_texts),
-        "bertscore": lambda: compute_bertscore_with_reference(review_texts, reference_texts),
-        "moverscore": lambda: compute_moverscore_with_reference(review_texts, reference_texts),
+        "bleu": lambda: compute_bleu_with_reference(sentence_texts, ref_sents),
+        "rouge_l": lambda: compute_rouge_l_with_reference(sentence_texts, ref_sents),
+        "bertscore": lambda: compute_bertscore_with_reference(sentence_texts, ref_sents),
+        "moverscore": lambda: compute_moverscore_with_reference(sentence_texts, ref_sents),
         "distinct_1": lambda: compute_distinct_n(review_texts, n=1),
         "distinct_2": lambda: compute_distinct_n(review_texts, n=2),
         "self_bleu": lambda: compute_self_bleu(review_texts),
