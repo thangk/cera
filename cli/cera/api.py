@@ -55,6 +55,7 @@ class ReviewerProfile(BaseModel):
     age_range: Optional[list[int]] = None  # None when age ablation is disabled
     sex_distribution: dict[str, float]
     additional_context: Optional[str] = None
+    persona_ratio: Optional[float] = 0.9  # 0.0-1.0, percentage of unique personas relative to review count
 
 
 class NoiseConfig(BaseModel):
@@ -77,7 +78,7 @@ class AttributesProfile(BaseModel):
     polarity: PolarityConfig
     noise: NoiseConfig
     length_range: list[int]
-    temp_range: list[float] = [0.7, 0.9]  # LLM temperature range, optional with default
+    temp_range: list[float] = [0.85, 0.95]  # LLM temperature range, optional with default
     cap_weights: Optional[dict] = None  # e.g., {"standard": 0.55, "lowercase": 0.20, "mixed": 0.15, "emphasis": 0.10}
 
 
@@ -94,7 +95,10 @@ class GenerationConfig(BaseModel):
     total_runs: int = 1  # Number of times to run generation (for research variability assessment)
     # NEB (Negative Example Buffer) - prevents generating similar reviews across batches
     neb_enabled: bool = True  # Enable NEB for diversity enforcement
-    neb_depth: int = 2  # How many batches to remember (1-10). Buffer size = neb_depth * request_size
+    neb_depth: int = 3  # How many batches to remember (1-10). Buffer size = neb_depth * request_size
+    # Multi-model comparison
+    models: Optional[list[str]] = None  # Multiple generation models (when set, overrides `model`)
+    parallel_models: bool = False  # Run models concurrently
 
 
 class AblationConfig(BaseModel):
@@ -270,7 +274,7 @@ def save_job_config(
                 "preset": getattr(config.attributes_profile.noise, 'preset', 'moderate'),
             },
             "length_range": config.attributes_profile.length_range,
-            "temperature_range": getattr(config.attributes_profile, 'temp_range', None) or getattr(config.attributes_profile, 'temperature_range', [0.7, 0.9]),
+            "temperature_range": getattr(config.attributes_profile, 'temp_range', None) or getattr(config.attributes_profile, 'temperature_range', [0.85, 0.95]),
             "cap_weights": getattr(config.attributes_profile, 'cap_weights', None),
         }
 
@@ -286,8 +290,8 @@ def save_job_config(
             "dataset_mode": getattr(config.generation, 'dataset_mode', 'both'),
             "total_runs": getattr(config.generation, 'total_runs', 1),
             # NEB (Negative Example Buffer) settings
-            "neb_enabled": getattr(config.generation, 'neb_enabled', False),
-            "neb_depth": getattr(config.generation, 'neb_depth', 1),
+            "neb_enabled": getattr(config.generation, 'neb_enabled', True),
+            "neb_depth": getattr(config.generation, 'neb_depth', 3),
         }
 
     # Add ablation settings if provided
@@ -759,6 +763,69 @@ class ConvexClient:
         except Exception as e:
             print(f"Warning: Failed to save average metrics in Convex: {e}")
 
+    async def update_model_progress(
+        self, job_id: str, model: str, model_slug: str,
+        generated: int, failed: int, target: int, progress: int,
+        status: str, eval_progress: int = 0,
+    ):
+        """Update per-model progress for multi-model jobs."""
+        try:
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:updateModelProgress",
+                    "args": {
+                        "jobId": job_id,
+                        "model": model,
+                        "modelSlug": model_slug,
+                        "generated": generated,
+                        "failed": failed,
+                        "target": target,
+                        "progress": progress,
+                        "status": status,
+                        "evalProgress": eval_progress,
+                    },
+                },
+            )
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to update model progress in Convex: {e}")
+
+    async def save_per_model_metrics(
+        self, job_id: str, model: str, model_slug: str,
+        metrics: dict, conformity: dict = None, per_run_metrics: list = None,
+    ):
+        """Save per-model evaluation metrics for multi-model jobs."""
+        try:
+            args = {
+                "jobId": job_id,
+                "model": model,
+                "modelSlug": model_slug,
+                "metrics": metrics,
+            }
+            if conformity:
+                args["conformity"] = conformity
+            if per_run_metrics:
+                args["perRunMetrics"] = per_run_metrics
+            response = await self.client.post(
+                f"{self.url}/api/mutation",
+                headers={
+                    "Authorization": f"Convex {self.token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "path": "jobs:savePerModelMetrics",
+                    "args": args,
+                },
+            )
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Warning: Failed to save per-model metrics in Convex: {e}")
+
 
 async def execute_composition(
     job_id: str,
@@ -781,6 +848,7 @@ async def execute_composition(
     Returns the job paths dictionary.
     """
     import json
+    import math
     from pathlib import Path
     from datetime import datetime
 
@@ -986,10 +1054,9 @@ async def execute_composition(
                 "config": {
                     "models": [md.model for md in mav_result.model_data if not md.error],
                     "model_count": len([md for md in mav_result.model_data if not md.error]),
-                    "min_agreement": __import__('math').ceil(2/3 * len([md for md in mav_result.model_data if not md.error])),
                     "answer_similarity_threshold": report.threshold_used,
                     "max_queries": mav_max_queries,
-                    "consensus_method": "query-based ceil(2/3*N) majority voting",
+                    "consensus_method": "LLM-judged agreement voting",
                 },
                 "summary": {
                     "total_queries_generated": report.total_queries_generated,
@@ -1015,6 +1082,9 @@ async def execute_composition(
                         "agreeing_models": r.agreeing_models,
                         "pairwise_similarities": r.pairwise_similarities,
                         "agreement_count": r.agreement_count,
+                        "agreement_votes": r.agreement_votes,
+                        "total_points": r.total_points,
+                        "points_by_source": r.points_by_source,
                     }
                     for r in report.per_query_results
                 ],
@@ -1044,7 +1114,7 @@ async def execute_composition(
                 writer.writerow(["queries_with_consensus", report.queries_with_consensus])
                 writer.writerow(["consensus_rate", f"{mav_report['summary']['consensus_rate']:.4f}"])
                 writer.writerow(["answer_threshold", report.threshold_used])
-                writer.writerow(["consensus_method", "query-based ceil(2/3*N) majority voting"])
+                writer.writerow(["consensus_method", "LLM-judged agreement voting"])
                 writer.writerow(["used_fallback", str(report.used_fallback)])
 
             if convex:
@@ -1126,8 +1196,230 @@ async def execute_composition(
             json.dump(attributes_context, f, indent=2)
 
         if convex:
-            await convex.update_composition_progress(job_id, 100, "ACM")
+            await convex.update_composition_progress(job_id, 80, "ACM")
             await convex.add_log(job_id, "INFO", "ACM", "Attributes context saved")
+
+        # ========================================
+        # Phase 4: Persona Pool Generation
+        # ========================================
+        personas_dir = Path(job_paths["root"]) / "reviewer-personas"
+        personas_dir.mkdir(parents=True, exist_ok=True)
+
+        # Estimate review count for persona ratio computation
+        count_mode = getattr(config.generation, 'count_mode', 'reviews')
+        if count_mode == "sentences":
+            target_sentences = getattr(config.generation, 'target_sentences', config.generation.count)
+            length_range = config.attributes_profile.length_range
+            avg_sentences = (length_range[0] + length_range[1]) / 2
+            estimated_review_count = math.ceil(target_sentences / avg_sentences)
+        else:
+            estimated_review_count = config.generation.count
+
+        persona_ratio = getattr(config.reviewer_profile, 'persona_ratio', 0.9) or 0.9
+        persona_count = max(1, math.ceil(estimated_review_count * persona_ratio))
+
+        if convex:
+            await convex.update_composition_progress(job_id, 82, "Personas")
+            await convex.add_log(job_id, "INFO", "Personas", f"Generating {persona_count} reviewer personas (ratio={persona_ratio:.0%} of ~{estimated_review_count} reviews)...")
+
+        try:
+            from cera.llm.openrouter import OpenRouterClient
+            from cera.prompts import load_prompt, format_prompt
+            from cera.pipeline.composition.rgm import ReviewerGenerationModule
+
+            # Use the generation model for persona generation
+            _gen_model = config.generation.model
+            _llm = OpenRouterClient(api_key=api_key)
+
+            # Pre-sample demographics via RGM
+            age_range_tuple = tuple(config.reviewer_profile.age_range) if config.reviewer_profile.age_range and age_enabled else None
+            sex_dist = config.reviewer_profile.sex_distribution if sex_enabled else {"male": 0.0, "female": 0.0, "unspecified": 1.0}
+            _rgm = ReviewerGenerationModule(
+                age_range=age_range_tuple,
+                sex_distribution=sex_dist,
+            )
+            pre_sampled = _rgm.generate_profiles(persona_count)
+
+            # Build demographics list for prompt
+            demo_lines = []
+            for idx, prof in enumerate(pre_sampled):
+                parts = [f"Persona {idx + 1}:"]
+                if prof.age is not None:
+                    parts.append(f"age {prof.age}")
+                if prof.sex and prof.sex.lower() != "unspecified":
+                    parts.append(prof.sex)
+                demo_lines.append(" ".join(parts))
+            demographics_list = "\n".join(demo_lines)
+
+            # Get reviewer context from RDE (if available)
+            reviewer_ctx = reviewers_context.get("additional_context", "general consumer")
+            _region = subject_context.get("region", "unknown")
+
+            # Load and format persona prompt
+            persona_prompt_template = load_prompt("composition", "personas")
+            persona_prompt = format_prompt(persona_prompt_template,
+                persona_count=persona_count,
+                domain=subject_context.get("domain", subject_context.get("category", "general")),
+                subject=subject_context.get("query", ""),
+                region=_region,
+                reviewer_context=reviewer_ctx,
+                demographics_list=demographics_list,
+            )
+
+            # Generate personas in batches if needed (max ~25 per call to avoid token limits)
+            PERSONA_BATCH_SIZE = 25
+            all_personas = []
+
+            for batch_start in range(0, persona_count, PERSONA_BATCH_SIZE):
+                batch_end = min(batch_start + PERSONA_BATCH_SIZE, persona_count)
+                batch_count = batch_end - batch_start
+
+                if persona_count > PERSONA_BATCH_SIZE:
+                    # Rebuild prompt for this batch slice
+                    batch_demos = "\n".join(demo_lines[batch_start:batch_end])
+                    batch_prompt = format_prompt(persona_prompt_template,
+                        persona_count=batch_count,
+                        domain=subject_context.get("domain", subject_context.get("category", "general")),
+                        subject=subject_context.get("query", ""),
+                        region=_region,
+                        reviewer_context=reviewer_ctx,
+                        demographics_list=batch_demos,
+                    )
+                else:
+                    batch_prompt = persona_prompt
+
+                response = await _llm.chat(
+                    model=_gen_model,
+                    messages=[{"role": "user", "content": batch_prompt}],
+                    temperature=0.9,
+                    max_tokens=8192,
+                )
+
+                # Parse JSON from response (robust extraction)
+                batch_personas = _extract_json_from_llm(response, expected_type="array")
+
+                # Merge pre-sampled demographics into LLM-generated personas
+                for i, persona in enumerate(batch_personas):
+                    global_idx = batch_start + i
+                    if global_idx < len(pre_sampled):
+                        persona["age"] = pre_sampled[global_idx].age
+                        persona["sex"] = pre_sampled[global_idx].sex
+                    persona["id"] = f"persona-{str(global_idx + 1).zfill(2)}"
+                    if not persona.get("region"):
+                        persona["region"] = _region
+
+                all_personas.extend(batch_personas)
+
+            # Save personas as individual markdown files
+            for persona in all_personas:
+                pid = persona["id"]
+                persona_md = f"# {pid}\n\n"
+                persona_md += f"- **Name**: {persona.get('name', 'Anonymous')}\n"
+                if persona.get("age"):
+                    persona_md += f"- **Age**: {persona['age']}\n"
+                if persona.get("sex") and persona["sex"].lower() != "unspecified":
+                    persona_md += f"- **Sex**: {persona['sex']}\n"
+                persona_md += f"- **Region**: {persona.get('region', _region)}\n"
+                persona_md += f"- **Background**: {persona.get('background', 'N/A')}\n"
+                persona_md += f"- **Writing Tendencies**: {persona.get('writing_tendencies', 'N/A')}\n"
+                priorities = persona.get("priorities", [])
+                if isinstance(priorities, list):
+                    priorities = ", ".join(priorities)
+                persona_md += f"- **Priorities**: {priorities}\n"
+
+                persona_file = personas_dir / f"{pid}.md"
+                persona_file.write_text(persona_md, encoding="utf-8")
+
+            # Also save as JSON for pipeline consumption
+            personas_json_path = Path(job_paths["contexts"]) / "personas.json"
+            with open(personas_json_path, "w") as f:
+                json.dump(all_personas, f, indent=2)
+
+            print(f"[Personas] Generated {len(all_personas)} personas, saved to {personas_dir}", flush=True)
+            if convex:
+                await convex.update_composition_progress(job_id, 88, "Personas")
+                await convex.add_log(job_id, "INFO", "Personas", f"Generated {len(all_personas)} reviewer personas")
+
+        except Exception as e:
+            print(f"[Personas] Warning: Persona generation failed, will use fallback: {e}", flush=True)
+            if convex:
+                await convex.add_log(job_id, "WARN", "Personas", f"Persona generation failed ({e}), will use RGM fallback during generation")
+
+        # ========================================
+        # Phase 5: Writing Pattern Generation
+        # ========================================
+        if convex:
+            await convex.update_composition_progress(job_id, 90, "Patterns")
+            await convex.add_log(job_id, "INFO", "Patterns", "Generating domain-specific writing patterns...")
+
+        try:
+            from cera.llm.openrouter import OpenRouterClient
+            from cera.prompts import load_prompt, format_prompt
+
+            _llm = OpenRouterClient(api_key=api_key)
+            _gen_model = config.generation.model
+            _domain = subject_context.get("domain", subject_context.get("category", "general"))
+            _region = subject_context.get("region", "unknown")
+
+            # Build reference context from reference dataset (if available)
+            reference_context = ""
+            dataset_dir = Path(job_paths["root"]) / "dataset"
+            if dataset_dir.exists():
+                ref_files = list(dataset_dir.glob("reference_*"))
+                if ref_files:
+                    try:
+                        with open(ref_files[0], "r") as f:
+                            lines = f.readlines()[:20]  # Sample first 20 entries
+                        sample_texts = []
+                        for line in lines:
+                            try:
+                                entry = json.loads(line.strip())
+                                text = entry.get("text", entry.get("review_text", ""))
+                                if text:
+                                    sample_texts.append(text[:200])  # Truncate for prompt size
+                            except json.JSONDecodeError:
+                                continue
+                        if sample_texts:
+                            reference_context = "## Reference Reviews (sample from real dataset)\n" + "\n".join(f"- \"{t}\"" for t in sample_texts[:10])
+                    except Exception:
+                        pass
+
+            if not reference_context:
+                reference_context = "No reference dataset available. Generate patterns based on the domain and subject."
+
+            patterns_template = load_prompt("composition", "writing_patterns")
+            patterns_prompt = format_prompt(patterns_template,
+                domain=_domain,
+                subject=subject_context.get("query", ""),
+                region=_region,
+                reference_context=reference_context,
+            )
+
+            response = await _llm.chat(
+                model=_gen_model,
+                messages=[{"role": "user", "content": patterns_prompt}],
+                temperature=0.7,
+                max_tokens=4096,
+            )
+
+            # Parse JSON from response (robust extraction)
+            patterns_data = _extract_json_from_llm(response, expected_type="object")
+
+            # Save writing patterns
+            patterns_path = Path(job_paths["contexts"]) / "writing-patterns.json"
+            with open(patterns_path, "w") as f:
+                json.dump(patterns_data, f, indent=2)
+
+            pattern_count = len(patterns_data.get("patterns", {}))
+            print(f"[Patterns] Generated {pattern_count} writing pattern categories", flush=True)
+            if convex:
+                await convex.update_composition_progress(job_id, 95, "Patterns")
+                await convex.add_log(job_id, "INFO", "Patterns", f"Generated {pattern_count} writing pattern categories")
+
+        except Exception as e:
+            print(f"[Patterns] Warning: Writing pattern generation failed: {e}", flush=True)
+            if convex:
+                await convex.add_log(job_id, "WARN", "Patterns", f"Pattern generation failed ({e}), patterns will be omitted from AMLs")
 
         # ========================================
         # Complete composition
@@ -1308,7 +1600,7 @@ async def compose_job(request: Union[CompositionRequest, CompositionRequestV2]):
                         polarity=PolarityConfig(**config.get("attributes_profile", {}).get("polarity", {})),
                         noise=NoiseConfig(**config.get("attributes_profile", {}).get("noise", {})),
                         length_range=config.get("attributes_profile", {}).get("length_range", [2, 5]),
-                        temp_range=config.get("attributes_profile", {}).get("temp_range", [0.7, 0.9]),
+                        temp_range=config.get("attributes_profile", {}).get("temp_range", [0.85, 0.95]),
                         cap_weights=config.get("attributes_profile", {}).get("cap_weights", None),
                     ),
                     generation=GenerationConfig(**config.get("generation", {})),
@@ -1560,10 +1852,9 @@ async def execute_composition_simple(
             "config": {
                 "models": [md.model for md in mav_result.model_data if not md.error],
                 "model_count": len([md for md in mav_result.model_data if not md.error]),
-                "min_agreement": __import__('math').ceil(2/3 * len([md for md in mav_result.model_data if not md.error])),
                 "answer_similarity_threshold": report.threshold_used,
                 "max_queries": mav_max_queries,
-                "consensus_method": "query-based ceil(2/3*N) majority voting",
+                "consensus_method": "LLM-judged agreement voting",
             },
             "summary": {
                 "total_queries_generated": report.total_queries_generated,
@@ -1589,6 +1880,9 @@ async def execute_composition_simple(
                     "agreeing_models": r.agreeing_models,
                     "pairwise_similarities": r.pairwise_similarities,
                     "agreement_count": r.agreement_count,
+                    "agreement_votes": r.agreement_votes,
+                    "total_points": r.total_points,
+                    "points_by_source": r.points_by_source,
                 }
                 for r in report.per_query_results
             ],
@@ -1618,7 +1912,7 @@ async def execute_composition_simple(
             writer.writerow(["queries_with_consensus", report.queries_with_consensus])
             writer.writerow(["consensus_rate", f"{mav_report['summary']['consensus_rate']:.4f}"])
             writer.writerow(["answer_threshold", report.threshold_used])
-            writer.writerow(["consensus_method", "query-based ceil(2/3*N) majority voting"])
+            writer.writerow(["consensus_method", "LLM-judged agreement voting"])
             writer.writerow(["used_fallback", str(report.used_fallback)])
 
         await log_progress("MAV", "Generated reports: mav-report.json, mav-summary.csv", 50)
@@ -1683,7 +1977,210 @@ async def execute_composition_simple(
         json.dump(attributes_context, f, indent=2)
 
     polarity = config.attributes_profile.polarity
-    await log_progress("ACM", f"Polarity set: {polarity.positive}%+ / {polarity.neutral}%~ / {polarity.negative}%-", 95)
+    await log_progress("ACM", f"Polarity set: {polarity.positive}%+ / {polarity.neutral}%~ / {polarity.negative}%-", 80)
+
+    # ========================================
+    # Phase 4: Persona Pool Generation
+    # ========================================
+    import math
+    personas_dir = Path(job_paths["root"]) / "reviewer-personas"
+    personas_dir.mkdir(parents=True, exist_ok=True)
+
+    # Estimate review count for persona ratio computation
+    count_mode = getattr(config.generation, 'count_mode', 'reviews')
+    if count_mode == "sentences":
+        target_sentences = getattr(config.generation, 'target_sentences', config.generation.count)
+        length_range = config.attributes_profile.length_range
+        avg_sentences = (length_range[0] + length_range[1]) / 2
+        estimated_review_count = math.ceil(target_sentences / avg_sentences)
+    else:
+        estimated_review_count = config.generation.count
+
+    persona_ratio = getattr(config.reviewer_profile, 'persona_ratio', 0.9) or 0.9
+    persona_count = max(1, math.ceil(estimated_review_count * persona_ratio))
+
+    await log_progress("Personas", f"Generating {persona_count} reviewer personas (ratio={persona_ratio:.0%} of ~{estimated_review_count} reviews)...", 82)
+
+    try:
+        from cera.llm.openrouter import OpenRouterClient
+        from cera.prompts import load_prompt, format_prompt
+        from cera.pipeline.composition.rgm import ReviewerGenerationModule
+
+        _gen_model = config.generation.model
+        _llm = OpenRouterClient(api_key=api_key)
+
+        # Pre-sample demographics via RGM
+        age_range_tuple = tuple(config.reviewer_profile.age_range) if config.reviewer_profile.age_range and age_enabled else None
+        sex_dist = config.reviewer_profile.sex_distribution if sex_enabled else {"male": 0.0, "female": 0.0, "unspecified": 1.0}
+        _rgm = ReviewerGenerationModule(
+            age_range=age_range_tuple,
+            sex_distribution=sex_dist,
+        )
+        pre_sampled = _rgm.generate_profiles(persona_count)
+
+        # Build demographics list for prompt
+        demo_lines = []
+        for idx, prof in enumerate(pre_sampled):
+            parts = [f"Persona {idx + 1}:"]
+            if prof.age is not None:
+                parts.append(f"age {prof.age}")
+            if prof.sex and prof.sex.lower() != "unspecified":
+                parts.append(prof.sex)
+            demo_lines.append(" ".join(parts))
+        demographics_list = "\n".join(demo_lines)
+
+        reviewer_ctx = reviewers_context.get("additional_context", "general consumer")
+        _region = subject_context.get("region", "unknown")
+
+        persona_prompt_template = load_prompt("composition", "personas")
+        persona_prompt = format_prompt(persona_prompt_template,
+            persona_count=persona_count,
+            domain=subject_context.get("domain", subject_context.get("category", "general")),
+            subject=subject_context.get("query", ""),
+            region=_region,
+            reviewer_context=reviewer_ctx,
+            demographics_list=demographics_list,
+        )
+
+        PERSONA_BATCH_SIZE = 25
+        all_personas = []
+
+        for batch_start in range(0, persona_count, PERSONA_BATCH_SIZE):
+            batch_end = min(batch_start + PERSONA_BATCH_SIZE, persona_count)
+            batch_count = batch_end - batch_start
+
+            if persona_count > PERSONA_BATCH_SIZE:
+                batch_demos = "\n".join(demo_lines[batch_start:batch_end])
+                batch_prompt = format_prompt(persona_prompt_template,
+                    persona_count=batch_count,
+                    domain=subject_context.get("domain", subject_context.get("category", "general")),
+                    subject=subject_context.get("query", ""),
+                    region=_region,
+                    reviewer_context=reviewer_ctx,
+                    demographics_list=batch_demos,
+                )
+            else:
+                batch_prompt = persona_prompt
+
+            response = await _llm.chat(
+                model=_gen_model,
+                messages=[{"role": "user", "content": batch_prompt}],
+                temperature=0.9,
+                max_tokens=8192,
+            )
+
+            batch_personas = _extract_json_from_llm(response, expected_type="array")
+
+            for i, persona in enumerate(batch_personas):
+                global_idx = batch_start + i
+                if global_idx < len(pre_sampled):
+                    persona["age"] = pre_sampled[global_idx].age
+                    persona["sex"] = pre_sampled[global_idx].sex
+                persona["id"] = f"persona-{str(global_idx + 1).zfill(2)}"
+                if not persona.get("region"):
+                    persona["region"] = _region
+
+            all_personas.extend(batch_personas)
+
+        # Save personas as individual markdown files
+        for persona in all_personas:
+            pid = persona["id"]
+            persona_md = f"# {pid}\n\n"
+            persona_md += f"- **Name**: {persona.get('name', 'Anonymous')}\n"
+            if persona.get("age"):
+                persona_md += f"- **Age**: {persona['age']}\n"
+            if persona.get("sex") and persona["sex"].lower() != "unspecified":
+                persona_md += f"- **Sex**: {persona['sex']}\n"
+            persona_md += f"- **Region**: {persona.get('region', _region)}\n"
+            persona_md += f"- **Background**: {persona.get('background', 'N/A')}\n"
+            persona_md += f"- **Writing Tendencies**: {persona.get('writing_tendencies', 'N/A')}\n"
+            priorities = persona.get("priorities", [])
+            if isinstance(priorities, list):
+                priorities = ", ".join(priorities)
+            persona_md += f"- **Priorities**: {priorities}\n"
+
+            persona_file = personas_dir / f"{pid}.md"
+            persona_file.write_text(persona_md, encoding="utf-8")
+
+        # Also save as JSON for pipeline consumption
+        personas_json_path = Path(job_paths["contexts"]) / "personas.json"
+        with open(personas_json_path, "w") as f:
+            json.dump(all_personas, f, indent=2)
+
+        await log_progress("Personas", f"Generated {len(all_personas)} reviewer personas", 88)
+
+    except Exception as e:
+        print(f"[Personas] Warning: Persona generation failed, will use fallback: {e}", flush=True)
+        await log_progress("Personas", f"Persona generation failed ({e}), will use RGM fallback during generation", level="WARN")
+
+    # ========================================
+    # Phase 5: Writing Pattern Generation
+    # ========================================
+    await log_progress("Patterns", "Generating domain-specific writing patterns...", 90)
+
+    try:
+        from cera.llm.openrouter import OpenRouterClient
+        from cera.prompts import load_prompt, format_prompt
+
+        _llm = OpenRouterClient(api_key=api_key)
+        _gen_model = config.generation.model
+        _domain = subject_context.get("domain", subject_context.get("category", "general"))
+        _region = subject_context.get("region", "unknown")
+
+        # Build reference context from reference dataset (if available)
+        reference_context = ""
+        dataset_dir = Path(job_paths["root"]) / "dataset"
+        if dataset_dir.exists():
+            ref_files = list(dataset_dir.glob("reference_*"))
+            if ref_files:
+                try:
+                    with open(ref_files[0], "r") as f:
+                        lines = f.readlines()[:20]
+                    sample_texts = []
+                    for line in lines:
+                        try:
+                            entry = json.loads(line.strip())
+                            text = entry.get("text", entry.get("review_text", ""))
+                            if text:
+                                sample_texts.append(text[:200])
+                        except json.JSONDecodeError:
+                            continue
+                    if sample_texts:
+                        reference_context = "## Reference Reviews (sample from real dataset)\n" + "\n".join(f"- \"{t}\"" for t in sample_texts[:10])
+                except Exception:
+                    pass
+
+        if not reference_context:
+            reference_context = "No reference dataset available. Generate patterns based on the domain and subject."
+
+        patterns_template = load_prompt("composition", "writing_patterns")
+        patterns_prompt = format_prompt(patterns_template,
+            domain=_domain,
+            subject=subject_context.get("query", ""),
+            region=_region,
+            reference_context=reference_context,
+        )
+
+        response = await _llm.chat(
+            model=_gen_model,
+            messages=[{"role": "user", "content": patterns_prompt}],
+            temperature=0.7,
+            max_tokens=4096,
+        )
+
+        patterns_data = _extract_json_from_llm(response, expected_type="object")
+
+        patterns_path = Path(job_paths["contexts"]) / "writing-patterns.json"
+        with open(patterns_path, "w") as f:
+            json.dump(patterns_data, f, indent=2)
+
+        pattern_count = len(patterns_data.get("patterns", {}))
+        await log_progress("Patterns", f"Generated {pattern_count} writing pattern categories", 95)
+
+    except Exception as e:
+        print(f"[Patterns] Warning: Writing pattern generation failed: {e}", flush=True)
+        await log_progress("Patterns", f"Pattern generation failed ({e}), patterns will be omitted from AMLs", level="WARN")
+
     await log_progress("ACM", "Composition complete!", 100)
 
     return {
@@ -2264,9 +2761,13 @@ async def merge_datasets(request: MergeDatasetsRequest):
 class SubsampleDatasetRequest(BaseModel):
     content: str
     format: str  # jsonl, csv, xml
-    mode: str  # "equal" or "custom"
+    mode: str  # "equal", "custom", or "sample"
     num_splits: int | None = 2
     split_sizes: list[int] | None = None
+    set_sizes: list[int] | None = None  # For "sample" mode
+    unit: str | None = "review"  # "review" or "sentence"
+    name_prefix: str | None = None  # File name prefix for sample mode
+    name_postfix: str | None = None  # File name postfix for sample mode
 
 
 @app.post("/api/subsample-dataset")
@@ -2346,6 +2847,137 @@ async def subsample_dataset(request: SubsampleDatasetRequest):
 
     total_records = len(reviews)
 
+    def serialize_reviews(review_list: list, fmt: str) -> str:
+        """Serialize a list of reviews to the given format."""
+        if fmt == "jsonl":
+            return "\n".join([json.dumps(r, ensure_ascii=False) for r in review_list]) + "\n"
+        elif fmt == "csv":
+            sio = io.StringIO()
+            writer = csv_module.writer(sio)
+            writer.writerow(["review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"])
+            for review in review_list:
+                for sent in review.get("sentences", []):
+                    for op in sent.get("opinions", []):
+                        writer.writerow([
+                            review["id"],
+                            sent.get("id", ""),
+                            sent["text"],
+                            op.get("target", "NULL"),
+                            op.get("category", ""),
+                            op.get("polarity", "neutral"),
+                            op.get("from", 0),
+                            op.get("to", 0),
+                        ])
+            return sio.getvalue()
+        elif fmt == "xml":
+            xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', '<Reviews>']
+            for review in review_list:
+                xml_lines.append(f'  <Review rid="{review["id"]}">')
+                xml_lines.append('    <sentences>')
+                for sent in review.get("sentences", []):
+                    text_escaped = sent["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                    xml_lines.append(f'      <sentence id="{sent.get("id", "")}">')
+                    xml_lines.append(f'        <text>{text_escaped}</text>')
+                    xml_lines.append('        <Opinions>')
+                    for op in sent.get("opinions", []):
+                        target_escaped = op.get("target", "NULL").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                        xml_lines.append(f'          <Opinion target="{target_escaped}" category="{op.get("category", "")}" polarity="{op.get("polarity", "neutral")}" from="{op.get("from", 0)}" to="{op.get("to", 0)}" />')
+                    xml_lines.append('        </Opinions>')
+                    xml_lines.append('      </sentence>')
+                xml_lines.append('    </sentences>')
+                xml_lines.append('  </Review>')
+            xml_lines.append('</Reviews>')
+            return "\n".join(xml_lines) + "\n"
+        return ""
+
+    def reassign_ids(review_list: list) -> None:
+        """Re-assign sequential IDs within a list of reviews."""
+        for j, review in enumerate(review_list):
+            review["id"] = str(j + 1)
+            for k, sent in enumerate(review.get("sentences", [])):
+                sent["id"] = f"{review['id']}:{k}"
+
+    # Count total sentences
+    total_sentences = sum(len(r.get("sentences", [])) for r in reviews)
+
+    # === Sample mode: independent random sets with overlap ===
+    if request.mode == "sample":
+        import copy
+        set_sizes = request.set_sizes or [100]
+        unit = request.unit or "review"
+        prefix = request.name_prefix or "set"
+        postfix = request.name_postfix or ""
+
+        def make_set_name(target: int) -> str:
+            parts = [prefix, str(target)]
+            if postfix:
+                parts.append(postfix)
+            return "-".join(parts)
+
+        splits = []
+        for i, target_size in enumerate(set_sizes):
+            if unit == "sentence":
+                # Pick random sentences until we hit the target count
+                # Build a flat list of (review_index, sentence_index)
+                all_sentences = []
+                for ri, review in enumerate(reviews):
+                    for si in range(len(review.get("sentences", []))):
+                        all_sentences.append((ri, si))
+
+                if target_size > len(all_sentences):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Set {i+1} requests {target_size} sentences but only {len(all_sentences)} available"
+                    )
+
+                # Random sample of sentence indices
+                sampled = random.sample(all_sentences, target_size)
+
+                # Group by review to reconstruct partial reviews
+                review_sentences: dict[int, list[int]] = {}
+                for ri, si in sampled:
+                    review_sentences.setdefault(ri, []).append(si)
+
+                # Build review list with only the selected sentences
+                set_reviews = []
+                for ri in sorted(review_sentences.keys()):
+                    original = reviews[ri]
+                    orig_sents = original.get("sentences", [])
+                    partial = copy.deepcopy(original)
+                    partial["sentences"] = [copy.deepcopy(orig_sents[si]) for si in sorted(review_sentences[ri])]
+                    set_reviews.append(partial)
+
+                reassign_ids(set_reviews)
+                actual_sentences = sum(len(r.get("sentences", [])) for r in set_reviews)
+                splits.append({
+                    "name": make_set_name(target_size),
+                    "content": serialize_reviews(set_reviews, fmt),
+                    "count": len(set_reviews),
+                    "sentence_count": actual_sentences,
+                })
+            else:
+                # By review: simple random sample
+                if target_size > total_records:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Set {i+1} requests {target_size} reviews but only {total_records} available"
+                    )
+                sampled_reviews = copy.deepcopy(random.sample(reviews, target_size))
+                reassign_ids(sampled_reviews)
+                splits.append({
+                    "name": make_set_name(target_size),
+                    "content": serialize_reviews(sampled_reviews, fmt),
+                    "count": len(sampled_reviews),
+                })
+
+        return {
+            "splits": splits,
+            "format": fmt,
+            "total_records": total_records,
+            "total_sentences": total_sentences,
+        }
+
+    # === Split modes (equal / custom): non-overlapping ===
     # Shuffle for random distribution
     random.shuffle(reviews)
 
@@ -2366,59 +2998,10 @@ async def subsample_dataset(request: SubsampleDatasetRequest):
     for i, size in enumerate(sizes):
         split_reviews = reviews[offset:offset + size]
         offset += size
-
-        # Re-assign IDs within split
-        for j, review in enumerate(split_reviews):
-            review["id"] = str(j + 1)
-            for k, sent in enumerate(review.get("sentences", [])):
-                sent["id"] = f"{review['id']}:{k}"
-
-        # Serialize to format
-        if fmt == "jsonl":
-            split_content = "\n".join([json.dumps(r, ensure_ascii=False) for r in split_reviews]) + "\n"
-
-        elif fmt == "csv":
-            sio = io.StringIO()
-            writer = csv_module.writer(sio)
-            writer.writerow(["review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"])
-            for review in split_reviews:
-                for sent in review.get("sentences", []):
-                    for op in sent.get("opinions", []):
-                        writer.writerow([
-                            review["id"],
-                            sent.get("id", ""),
-                            sent["text"],
-                            op.get("target", "NULL"),
-                            op.get("category", ""),
-                            op.get("polarity", "neutral"),
-                            op.get("from", 0),
-                            op.get("to", 0),
-                        ])
-            split_content = sio.getvalue()
-
-        elif fmt == "xml":
-            xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', '<Reviews>']
-            for review in split_reviews:
-                xml_lines.append(f'  <Review rid="{review["id"]}">')
-                xml_lines.append('    <sentences>')
-                for sent in review.get("sentences", []):
-                    text_escaped = sent["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-                    xml_lines.append(f'      <sentence id="{sent.get("id", "")}">')
-                    xml_lines.append(f'        <text>{text_escaped}</text>')
-                    xml_lines.append('        <Opinions>')
-                    for op in sent.get("opinions", []):
-                        target_escaped = op.get("target", "NULL").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-                        xml_lines.append(f'          <Opinion target="{target_escaped}" category="{op.get("category", "")}" polarity="{op.get("polarity", "neutral")}" from="{op.get("from", 0)}" to="{op.get("to", 0)}" />')
-                    xml_lines.append('        </Opinions>')
-                    xml_lines.append('      </sentence>')
-                xml_lines.append('    </sentences>')
-                xml_lines.append('  </Review>')
-            xml_lines.append('</Reviews>')
-            split_content = "\n".join(xml_lines) + "\n"
-
+        reassign_ids(split_reviews)
         splits.append({
             "name": f"split-{i + 1}",
-            "content": split_content,
+            "content": serialize_reviews(split_reviews, fmt),
             "count": len(split_reviews),
         })
 
@@ -2623,6 +3206,189 @@ class GenerationRequest(BaseModel):
     convexToken: Optional[str] = None
 
 
+# ========================================
+# AML Restructuring Helpers
+# ========================================
+
+def build_sentence_plan(num_sentences: int, aspect_pool: list[str], polarity_dist: dict) -> list[dict]:
+    """Pre-assign 0-3 aspect categories and per-aspect polarity for each sentence.
+
+    Returns a list of dicts, one per sentence:
+        [{"sentence": 1, "aspects": [{"category": "LAPTOP#PRICE", "polarity": "negative"}, ...]}, ...]
+    Sentences with 0 aspects are contextual/transitional (empty opinions array in output).
+    """
+    import random
+    plan = []
+    for i in range(num_sentences):
+        num_aspects = random.randint(0, 3)
+        if num_aspects == 0:
+            plan.append({"sentence": i + 1, "aspects": []})
+        else:
+            sampled = random.sample(aspect_pool, min(num_aspects, len(aspect_pool)))
+            aspects = []
+            for cat in sampled:
+                rand = random.random()
+                neg_t = polarity_dist["negative"]
+                neu_t = neg_t + polarity_dist["neutral"]
+                pol = "negative" if rand < neg_t else ("neutral" if rand < neu_t else "positive")
+                aspects.append({"category": cat, "polarity": pol})
+            plan.append({"sentence": i + 1, "aspects": aspects})
+
+    # Ensure at least 1 sentence has aspects (prevent all-contextual reviews)
+    if all(len(s["aspects"]) == 0 for s in plan):
+        idx = random.randint(0, len(plan) - 1)
+        cat = random.choice(aspect_pool)
+        rand = random.random()
+        neg_t = polarity_dist["negative"]
+        neu_t = neg_t + polarity_dist["neutral"]
+        pol = "negative" if rand < neg_t else ("neutral" if rand < neu_t else "positive")
+        plan[idx]["aspects"] = [{"category": cat, "polarity": pol}]
+
+    return plan
+
+
+def format_sentence_plan(plan: list[dict]) -> str:
+    """Format a sentence plan for injection into the AML prompt."""
+    lines = []
+    for entry in plan:
+        sent_num = entry["sentence"]
+        aspects = entry["aspects"]
+        if not aspects:
+            lines.append(f"- Sentence {sent_num}: (contextual — personal detail or transition)")
+        else:
+            aspect_strs = [f"{a['category']} ({a['polarity']})" for a in aspects]
+            lines.append(f"- Sentence {sent_num}: {', '.join(aspect_strs)}")
+    return "\n".join(lines)
+
+
+def build_persona_assignments(personas: list[dict], review_count: int) -> list[dict]:
+    """Assign personas to reviews via shuffled round-robin (deck of cards pattern).
+
+    Shuffles the full persona pool, deals sequentially. When exhausted,
+    reshuffles and continues — guarantees even distribution while preventing
+    predictable overlap at deck boundaries.
+    """
+    import random
+    assignments = []
+    deck = []
+    for _ in range(review_count):
+        if not deck:
+            deck = list(personas)
+            random.shuffle(deck)
+        assignments.append(deck.pop())
+    return assignments
+
+
+def _extract_json_from_llm(text: str, expected_type: str = "array") -> any:
+    """Extract and parse JSON from LLM response, handling common issues.
+
+    Handles: markdown code fences, trailing commas, extra text around JSON.
+    expected_type: "array" to find [...], "object" to find {...}
+    """
+    # Strip markdown code fences
+    clean = text.strip()
+    if clean.startswith("```"):
+        clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+        if clean.endswith("```"):
+            clean = clean[:-3]
+        clean = clean.strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    # Fix trailing commas before ] or } and retry
+    fixed = re.sub(r',\s*([}\]])', r'\1', clean)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to extract JSON structure from mixed text
+    bracket = "[" if expected_type == "array" else "{"
+    close = "]" if expected_type == "array" else "}"
+    start = clean.find(bracket)
+    if start != -1:
+        # Find matching close bracket using depth tracking
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(clean)):
+            c = clean[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == '\\' and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == bracket:
+                depth += 1
+            elif c == close:
+                depth -= 1
+                if depth == 0:
+                    candidate = clean[start:i + 1]
+                    # Try with trailing comma fix
+                    candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+
+    raise json.JSONDecodeError("Could not extract valid JSON from LLM response", text, 0)
+
+
+def format_persona_text(persona: dict) -> str:
+    """Format a persona dict into the text block for the AML prompt."""
+    parts = []
+    if persona.get("name"):
+        parts.append(f"- Name: {persona['name']}")
+    if persona.get("age"):
+        sex_str = f", {persona['sex'].capitalize()}" if persona.get("sex") and persona["sex"].lower() != "unspecified" else ""
+        parts.append(f"- Age: {persona['age']}{sex_str}")
+    elif persona.get("sex") and persona["sex"].lower() != "unspecified":
+        parts.append(f"- Sex: {persona['sex'].capitalize()}")
+    if persona.get("region"):
+        parts.append(f"- Region: {persona['region']}")
+    if persona.get("background"):
+        parts.append(f"- Background: {persona['background']}")
+    if persona.get("writing_tendencies"):
+        parts.append(f"- Writing style: {persona['writing_tendencies']}")
+    if persona.get("priorities"):
+        priorities = persona["priorities"]
+        if isinstance(priorities, list):
+            priorities = ", ".join(priorities)
+        parts.append(f"- Priorities: {priorities}")
+    return "\n".join(parts) if parts else "- Background: general consumer"
+
+
+def strip_url_citations(text: str) -> str:
+    """Remove markdown URL citations like [source.com](https://...) from text."""
+    import re
+    return re.sub(r'\[([^\]]*)\]\(https?://[^\)]*\)', r'\1', text)
+
+
+def assign_writing_patterns(patterns_data: dict) -> str:
+    """Randomly pick ONE option per pattern category and format for AML prompt."""
+    import random
+    if not patterns_data or not patterns_data.get("patterns"):
+        return ""
+    lines = ["**Writing Patterns:**"]
+    for _cat_key, cat_data in patterns_data["patterns"].items():
+        context = cat_data.get("context", "")
+        options = cat_data.get("options", [])
+        if options:
+            chosen = random.choice(options)
+            lines.append(f'- {context}: write "{chosen}"')
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 async def execute_generation(
     job_id: str,
     job_dir: str,
@@ -2631,6 +3397,10 @@ async def execute_generation(
     convex_url: Optional[str],
     convex_token: Optional[str],
     should_complete_job: bool = True,  # Set to False when called from pipeline (evaluation will complete)
+    model_tag: Optional[str] = None,  # Multi-model: tag for output filenames (e.g. "gemini-3-flash-preview")
+    progress_callback=None,  # Multi-model: async callback(generated, failed, progress) instead of global convex update
+    current_run: int = 1,  # Multi-run: which run this is (1-indexed)
+    total_runs: int = 1,  # Multi-run: total number of runs
 ) -> dict:
     """
     Execute the GENERATION phase of the CERA pipeline.
@@ -2657,8 +3427,13 @@ async def execute_generation(
 
     job_path = Path(job_dir)
     contexts_path = job_path / "contexts"
-    amls_path = job_path / "amls"
     dataset_path = job_path / "dataset"
+
+    # Multi-run AML directory support: run subdirectories for multi-run, flat for single-run
+    if total_runs > 1:
+        amls_path = job_path / "amls" / f"run-{current_run}"
+    else:
+        amls_path = job_path / "amls"
 
     # Ensure directories exist
     amls_path.mkdir(parents=True, exist_ok=True)
@@ -2682,9 +3457,52 @@ async def execute_generation(
         with open(contexts_path / "attributes-context.json") as f:
             attributes_context = json.load(f)
 
+        # Load reference dataset sentences for style injection (if available)
+        reference_sentences: list[str] = []
+        dataset_dir = job_path / "dataset"
+        if dataset_dir.exists():
+            ref_files = list(dataset_dir.glob("reference_*"))
+            if ref_files:
+                try:
+                    _, ref_stats = load_texts_from_file(str(ref_files[0]), return_stats=True, return_sentences=True)
+                    reference_sentences = ref_stats.get("sentence_texts", [])
+                    if reference_sentences:
+                        print(f"[Generation] Loaded {len(reference_sentences)} reference sentences for style injection")
+                except Exception as e:
+                    print(f"[Generation] Warning: Could not load reference sentences: {e}")
+
+        # Load personas pool (generated during composition)
+        personas_pool: list[dict] = []
+        personas_json_path = contexts_path / "personas.json"
+        if personas_json_path.exists():
+            try:
+                with open(personas_json_path) as f:
+                    personas_pool = json.load(f)
+                print(f"[Generation] Loaded {len(personas_pool)} personas from pool")
+            except Exception as e:
+                print(f"[Generation] Warning: Could not load personas: {e}")
+
+        # Load writing patterns (generated during composition)
+        writing_patterns: dict = {}
+        patterns_path = contexts_path / "writing-patterns.json"
+        if patterns_path.exists():
+            try:
+                with open(patterns_path) as f:
+                    writing_patterns = json.load(f)
+                pattern_count = len(writing_patterns.get("patterns", {}))
+                print(f"[Generation] Loaded {pattern_count} writing pattern categories")
+            except Exception as e:
+                print(f"[Generation] Warning: Could not load writing patterns: {e}")
+
         if convex:
             await convex.add_log(job_id, "INFO", "AML", "Starting generation phase...")
             await convex.add_log(job_id, "INFO", "AML", f"Subject: {subject_context.get('query', 'N/A')}")
+            if reference_sentences:
+                await convex.add_log(job_id, "INFO", "AML", f"Reference style injection: {len(reference_sentences)} sentences loaded")
+            if personas_pool:
+                await convex.add_log(job_id, "INFO", "AML", f"Personas loaded: {len(personas_pool)} from pool")
+            if writing_patterns:
+                await convex.add_log(job_id, "INFO", "AML", f"Writing patterns loaded: {len(writing_patterns.get('patterns', {}))} categories")
             await convex.update_progress(job_id, 5, "AML")
 
         # ========================================
@@ -2722,6 +3540,12 @@ async def execute_generation(
 
         batch_size = config.generation.batch_size
         request_size = config.generation.request_size
+
+        # Pre-assign personas to reviews via shuffled round-robin
+        persona_assignments: list[dict] = []
+        if personas_pool:
+            persona_assignments = build_persona_assignments(personas_pool, total_reviews)
+            print(f"[Generation] Pre-assigned {len(persona_assignments)} persona slots from pool of {len(personas_pool)}")
 
         # Build model ID - check if model already has provider prefix
         model_name = config.generation.model
@@ -2931,13 +3755,17 @@ Output ONLY the JSON object, no other text."""
         rate_limit_lock = asyncio.Lock()  # For coordinating rate limiting across parallel requests
         last_request_times = [0.0]  # Mutable container for shared state
 
-        # Pre-compute static values
-        features_list = subject_context.get("characteristics", [])[:5]
-        pros_list = subject_context.get("positives", [])[:3]
-        cons_list = subject_context.get("negatives", [])[:3]
-        subject_context_text = f"""Domain: {subject_context.get("domain", subject_context.get("category", "N/A"))}
-Region: {subject_context.get("region", "N/A")}
-Key features: {", ".join(features_list) if features_list else "N/A"}"""
+        # Keep full feature pools for per-review subsampling (diversity)
+        all_features = subject_context.get("characteristics", [])
+        all_pros = subject_context.get("positives", [])
+        all_cons = subject_context.get("negatives", [])
+        # When pros/cons are empty (common with SIL output), derive synthetic pools from characteristics
+        if not all_pros and all_features:
+            all_pros = [f.split('.')[0].strip() for f in all_features[:5]]
+        if not all_cons:
+            all_cons = ["minor issues", "occasional inconsistencies", "room for improvement", "could be better in some areas"]
+        _domain = subject_context.get("domain", subject_context.get("category", "N/A"))
+        _region = subject_context.get("region", "N/A")
         dataset_mode = getattr(config.generation, "dataset_mode", "explicit")
 
         # Get aspect categories - try request config first, then job's config.json, then defaults
@@ -2958,18 +3786,23 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
             aspect_cats = ["PRODUCT#QUALITY", "PRODUCT#PRICES", "SERVICE#GENERAL", "EXPERIENCE#GENERAL"]
             print(f"[Generation] Using default aspect categories", flush=True)
 
-        # Initialize NEB (Negative Example Buffer) for diversity enforcement
+        # Initialize diversity enforcement modules
         from cera.pipeline.generation.neb import NegativeExampleBuffer
-        neb_enabled = getattr(config.generation, 'neb_enabled', False)
-        neb_depth = getattr(config.generation, 'neb_depth', 1)
+        from cera.pipeline.generation.vocab_tracker import VocabDiversityTracker
+        # Pass subject features + pros/cons as exempt terms so product vocabulary isn't penalized
+        _subject_terms = all_features + all_pros + all_cons
+        vocab_tracker = VocabDiversityTracker(top_k=10, subject_terms=_subject_terms)
+        neb_enabled = getattr(config.generation, 'neb_enabled', True)
+        neb_depth = getattr(config.generation, 'neb_depth', 3)
         neb_buffer = None
-        if neb_enabled:
+        if neb_enabled and neb_depth > 0:
             max_buffer_size = neb_depth * request_size
             neb_buffer = NegativeExampleBuffer(max_size=max_buffer_size)
             print(f"[NEB] Enabled with depth={neb_depth}, max_buffer={max_buffer_size} reviews", flush=True)
-            print(f"[NEB DEBUG] neb_buffer created: id={id(neb_buffer)}, type={type(neb_buffer).__name__}", flush=True)
             if convex:
                 await convex.add_log(job_id, "INFO", "NEB", f"Negative Example Buffer enabled (depth={neb_depth}, max={max_buffer_size})")
+        else:
+            print(f"[NEB] Disabled (neb_enabled={neb_enabled}, neb_depth={neb_depth})", flush=True)
 
         # Opening directives for per-review diversity enforcement
         OPENING_DIRECTIVES = [
@@ -3018,7 +3851,6 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
             # Use explicitly passed neb_buffer to avoid closure capture issues
             neb_buffer = neb_buffer_param
             async with semaphore:
-                reviewer = rgm.generate_profile()
                 num_sentences = random.randint(length_range[0], length_range[1])
                 # Sample temperature in 0.1 increments (e.g., 0.7, 0.8, 0.9)
                 temp_steps = [round(temp_range[0] + i * 0.1, 1)
@@ -3027,65 +3859,96 @@ Key features: {", ".join(features_list) if features_list else "N/A"}"""
 
                 # Get NEB context (empty string if disabled or first batch)
                 neb_context = ""
-                print(f"[NEB DEBUG] Review {review_index}: entering NEB check, neb_buffer is {'not None' if neb_buffer else 'None'}", flush=True)
                 if neb_buffer and len(neb_buffer) > 0:
                     neb_context = neb_buffer.get_formatted_context()
-                    print(f"[NEB DEBUG] Review {review_index}: neb_buffer has {len(neb_buffer)} reviews, neb_context length: {len(neb_context)}", flush=True)
-                elif neb_buffer:
-                    print(f"[NEB DEBUG] Review {review_index}: neb_buffer exists but empty (len={len(neb_buffer)})", flush=True)
+                elif not neb_buffer:
+                    pass  # NEB disabled
+
+                # Get vocabulary diversity context (cumulative phrase tracking)
+                vocab_context = vocab_tracker.get_formatted_context()
+
+                # Reference style injection (sample 2-3 real review sentences as phrasing examples)
+                style_examples = ""
+                if reference_sentences and len(reference_sentences) >= 3:
+                    k_style = random.randint(2, 3)
+                    sampled_refs = random.sample(reference_sentences, min(k_style, len(reference_sentences)))
+                    examples_list = "\n".join(f'- "{s.strip()}"' for s in sampled_refs if s.strip())
+                    if examples_list:
+                        style_examples = (
+                            "## Phrasing Style Reference\n"
+                            "The following are excerpts from real reviews. Write in a similar natural, human tone.\n"
+                            "Do NOT copy their content -- only mimic their phrasing style, word choices, and tone:\n\n"
+                            f"{examples_list}\n\n"
+                            "Match this level of informality, sentence structure variety, and vocabulary."
+                        )
+
+                # Per-review feature subsampling with core features for subject coherence
+                if all_features:
+                    core = all_features[:2]
+                    extras = all_features[2:]
+                    k_extra = min(random.randint(1, 2), len(extras)) if extras else 0
+                    review_features = core + random.sample(extras, k_extra) if k_extra > 0 else list(core)
                 else:
-                    print(f"[NEB DEBUG] Review {review_index}: neb_buffer is None!", flush=True)
+                    review_features = []
+                k_pros = min(random.randint(1, 2), len(all_pros)) if all_pros else 0
+                k_cons = min(random.randint(1, 2), len(all_cons)) if all_cons else 0
+                review_pros = random.sample(all_pros, k_pros) if k_pros > 0 else []
+                review_cons = random.sample(all_cons, k_cons) if k_cons > 0 else []
 
-                # Roll polarity for each sentence independently based on distribution
-                sentence_polarities_list = []
-                for sent_idx in range(num_sentences):
-                    rand = random.random()
-                    neg_threshold = polarity_dist["negative"]
-                    neu_threshold = neg_threshold + polarity_dist["neutral"]
-                    if rand < neg_threshold:
-                        polarity = "negative"
-                    elif rand < neu_threshold:
-                        polarity = "neutral"
-                    else:
-                        polarity = "positive"
-                    sentence_polarities_list.append(polarity)
+                # Build aspect-based sentence plan (replaces per-sentence polarity)
+                sentence_plan = build_sentence_plan(num_sentences, aspect_cats, polarity_dist)
+                aspect_sentence_plan_str = format_sentence_plan(sentence_plan)
 
-                # Format sentence polarities for prompt
-                sentence_polarities_str = "\n".join(
-                    f"- Sentence {i+1}: {pol}" for i, pol in enumerate(sentence_polarities_list)
-                )
+                # Get persona for this review (from pre-assigned shuffled round-robin pool)
+                reviewer_age = None
+                reviewer_sex = "unspecified"
+                if persona_assignments and review_index < len(persona_assignments):
+                    persona = persona_assignments[review_index]
+                    persona_text = format_persona_text(persona)
+                    reviewer_age = persona.get("age")
+                    reviewer_sex = persona.get("sex", "unspecified")
+                else:
+                    # Fallback: use RGM-generated profile with shared background
+                    reviewer = rgm.generate_profile()
+                    reviewer_age = reviewer.age
+                    reviewer_sex = reviewer.sex
+                    fallback_parts = []
+                    if reviewer.age is not None:
+                        fallback_parts.append(f"- Age: {reviewer.age}")
+                    if reviewer.sex and reviewer.sex.lower() != "unspecified":
+                        fallback_parts.append(f"- Sex: {reviewer.sex}")
+                    region = subject_context.get("region", "")
+                    if region:
+                        fallback_parts.append(f"- Region: {region}")
+                    additional_ctx = reviewers_context.get("additional_context", "general consumer")
+                    if additional_ctx:
+                        fallback_parts.append(f"- Background: {additional_ctx}")
+                    persona_text = "\n".join(fallback_parts) if fallback_parts else "- Background: general consumer"
 
-                # Build reviewer profile conditionally (omit age if None, omit sex if "unspecified")
-                reviewer_profile_parts = []
-                if reviewer.age is not None:
-                    reviewer_profile_parts.append(f"- Age: {reviewer.age}")
-                if reviewer.sex and reviewer.sex.lower() != "unspecified":
-                    reviewer_profile_parts.append(f"- Sex: {reviewer.sex}")
-                region = subject_context.get("region", "")
-                if region:
-                    reviewer_profile_parts.append(f"- Region: {region}")
-                additional_ctx = reviewers_context.get("additional_context", "general consumer")
-                if additional_ctx:
-                    reviewer_profile_parts.append(f"- Background: {additional_ctx}")
-                reviewer_profile_str = "\n".join(reviewer_profile_parts) if reviewer_profile_parts else "- Background: general consumer"
+                # Assign writing patterns for this review
+                writing_pattern_assignments_str = assign_writing_patterns(writing_patterns)
+
+                # Strip URLs from SIL features for clean Subject Intelligence block
+                features_clean = strip_url_citations(", ".join(review_features)) if review_features else "N/A"
 
                 prompt_vars = {
                     "subject": subject_context["query"],
-                    "domain": subject_context.get("domain", subject_context.get("category", "product")),
-                    "subject_context": subject_context_text,
-                    "features": ", ".join(features_list) if features_list else "various features",
-                    "pros": ", ".join(pros_list) if pros_list else "quality and value",
-                    "cons": ", ".join(cons_list) if cons_list else "minor issues",
+                    "domain": _domain,
+                    "region": subject_context.get("region", ""),
+                    "features_no_urls": features_clean,
+                    "persona_text": persona_text,
+                    "pros": strip_url_citations(", ".join(review_pros)) if review_pros else "quality and value",
+                    "cons": strip_url_citations(", ".join(review_cons)) if review_cons else "minor issues",
                     "num_sentences": num_sentences,
-                    "sentence_polarities": sentence_polarities_str,
-                    "reviewer_profile": reviewer_profile_str,
-                    "aspect_categories": "\n".join(f"- {cat}" for cat in aspect_cats),
+                    "aspect_sentence_plan": aspect_sentence_plan_str,
                     "dataset_mode_instruction": dataset_mode_instruction,
                     "output_example": output_example,
-                    "temperature": f"{temperature:.1f}",
                     "neb_context": neb_context,
+                    "vocab_diversity": vocab_context,
+                    "style_examples": style_examples,
                     "opening_directive": opening_directive,
                     "capitalization_style": capitalization_style,
+                    "writing_pattern_assignments": writing_pattern_assignments_str,
                 }
 
                 system_prompt = format_prompt(system_template, **prompt_vars)
@@ -3146,7 +4009,7 @@ Requirements:
                             model=model,
                             messages=messages,
                             temperature=temperature if validation_retries == 0 else max(0.3, temperature - 0.2),
-                            max_tokens=1500,
+                            max_tokens=4096,
                         )
 
                         parsed_review, validation_error = validate_review_json(review_text, dataset_mode)
@@ -3156,10 +4019,11 @@ Requirements:
                         else:
                             validation_retries += 1
                             if validation_retries <= MAX_VALIDATION_RETRIES:
-                                print(f"[Generation] Review {review_index+1} validation failed (retry {validation_retries})")
+                                print(f"[Generation] Review {review_index+1} validation failed (retry {validation_retries}): {validation_error}")
                                 continue
                             else:
                                 local_malformed = True
+                                print(f"[Generation] Review {review_index+1} abandoned after {validation_retries} retries: {validation_error}")
                                 break
 
                     except Exception as e:
@@ -3183,7 +4047,8 @@ Requirements:
                     "error": local_error,
                     "malformed": local_malformed,
                     "error_msg": local_error_msg,
-                    "reviewer": reviewer,
+                    "reviewer_age": reviewer_age,
+                    "reviewer_sex": reviewer_sex,
                     "num_sentences": num_sentences,
                     "temperature": temperature,
                     "parsed_review": parsed_review,
@@ -3233,6 +4098,7 @@ Requirements:
             for result in batch_results:
                 if isinstance(result, Exception):
                     error_count += 1
+                    print(f"[Generation] Review exception: {type(result).__name__}: {result}", flush=True)
                     continue
 
                 if result["error"]:
@@ -3282,8 +4148,8 @@ Requirements:
                                 "neutral": int(polarity_dist["neutral"] * 100),
                                 "negative": int(polarity_dist["negative"] * 100),
                             },
-                            "age": result["reviewer"].age,
-                            "sex": result["reviewer"].sex,
+                            "age": result["reviewer_age"],
+                            "sex": result["reviewer_sex"],
                             "num_sentences": result["num_sentences"],
                             "temperature": round(result["temperature"], 2),
                         },
@@ -3309,8 +4175,8 @@ Requirements:
                                 "neutral": int(polarity_dist["neutral"] * 100),
                                 "negative": int(polarity_dist["negative"] * 100),
                             },
-                            "age": result["reviewer"].age,
-                            "sex": result["reviewer"].sex,
+                            "age": result["reviewer_age"],
+                            "sex": result["reviewer_sex"],
                             "num_sentences": result["num_sentences"],
                             "temperature": round(result["temperature"], 2),
                         },
@@ -3318,30 +4184,35 @@ Requirements:
                     generated_count += 1
                     total_sentences_generated += result["num_sentences"]
 
-            # Update NEB buffer with this batch's successful reviews
+            # Update NEB buffer and vocab tracker with this batch's successful reviews
+            batch_review_texts = []
+            successful_count = 0
+            error_in_batch = 0
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    error_in_batch += 1
+                    continue
+                if not result.get("error") and not result.get("malformed"):
+                    parsed_review = result.get("parsed_review")
+                    if parsed_review and "sentences" in parsed_review:
+                        successful_count += 1
+                        texts = [s.get("text", "") for s in parsed_review["sentences"] if s.get("text")]
+                        if texts:
+                            review_text = " ".join(texts)
+                            batch_review_texts.append(review_text)
+                            vocab_tracker.update(review_text)
+
             if neb_buffer is not None:
-                batch_review_texts = []
-                successful_count = 0
-                error_in_batch = 0
-                for result in batch_results:
-                    if isinstance(result, Exception):
-                        error_in_batch += 1
-                        continue
-                    if not result.get("error") and not result.get("malformed"):
-                        # Use parsed_review (already validated) to extract clean text
-                        parsed_review = result.get("parsed_review")
-                        if parsed_review and "sentences" in parsed_review:
-                            successful_count += 1
-                            texts = [s.get("text", "") for s in parsed_review["sentences"] if s.get("text")]
-                            if texts:
-                                review_text = " ".join(texts)
-                                batch_review_texts.append(review_text)
                 print(f"[NEB DEBUG] Batch {batch_start}-{batch_end}: {successful_count} successful, {error_in_batch} errors, {len(batch_review_texts)} texts collected", flush=True)
                 if batch_review_texts:
                     neb_buffer.add_batch(batch_review_texts)
                     print(f"[NEB] Buffer updated: {len(neb_buffer)} reviews in memory", flush=True)
                 else:
                     print(f"[NEB DEBUG] No review texts to add to buffer!", flush=True)
+
+            if vocab_tracker.review_count > 0 and vocab_tracker.review_count % 50 == 0:
+                stats = vocab_tracker.get_stats()
+                print(f"[VDT] Tracked {stats['reviews_tracked']} reviews, {stats['unique_bigrams']} unique bigrams, {stats['overused_count']} overused phrases", flush=True)
 
             # Update progress after batch
             elapsed = time.time() - start_time
@@ -3352,7 +4223,10 @@ Requirements:
             progress = min(int(progress_float), 99)
             rate = generated_count / elapsed * 60 if elapsed > 0 else 0
 
-            if convex:
+            if progress_callback:
+                # Multi-model mode: use per-model callback instead of global progress
+                await progress_callback(generated_count, error_count, progress)
+            elif convex:
                 await convex.update_progress(job_id, progress, "AML")
                 await convex.update_generated_count(job_id, generated_count)
                 # Update sentence count for sentence mode UI tracking
@@ -3426,10 +4300,12 @@ Requirements:
             """Save all selected format files for a given mode."""
             fmt_saved = []
             file_suffix = f"-{mode}" if suffix else ""
+            # Multi-model: prefix with --{model_tag} (e.g. reviews--gemini-3-flash.jsonl)
+            model_prefix = f"--{model_tag}" if model_tag else ""
 
             # Save JSONL only if selected by user
             if "jsonl" in output_formats:
-                jsonl_path = dataset_path / f"reviews{file_suffix}.jsonl"
+                jsonl_path = dataset_path / f"reviews{model_prefix}{file_suffix}.jsonl"
                 with open(jsonl_path, "w", encoding="utf-8") as f:
                     for idx, review in enumerate(reviews_data):
                         sentences = build_review_sentences(review, mode)
@@ -3458,7 +4334,7 @@ Requirements:
             # Save CSV (if selected) - flattened per-opinion
             if "csv" in output_formats:
                 import csv as csv_module
-                csv_path = dataset_path / f"reviews{file_suffix}.csv"
+                csv_path = dataset_path / f"reviews{model_prefix}{file_suffix}.csv"
                 with open(csv_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv_module.writer(f)
                     writer.writerow(["review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"])
@@ -3481,7 +4357,7 @@ Requirements:
 
             # Save SemEval XML (if selected)
             if "semeval_xml" in output_formats or "semeval" in output_formats:
-                xml_path = dataset_path / f"reviews{file_suffix}.xml"
+                xml_path = dataset_path / f"reviews{model_prefix}{file_suffix}.xml"
                 xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
                 xml_content += '<Reviews>\n'
                 for idx, review in enumerate(reviews_data):
@@ -3868,6 +4744,56 @@ class PipelineRequest(BaseModel):
     heuristicConfig: Optional[HeuristicConfig] = None
 
 
+def _recover_truncated_json_array(content: str) -> list | None:
+    """Try to recover complete objects from a truncated JSON array.
+
+    When the LLM output is cut off mid-JSON, this finds the last complete
+    top-level object in the array and returns all complete objects.
+    """
+    import json
+    if not content or not content.strip().startswith('['):
+        return None
+
+    # Find the position of the last complete object by looking for "},\n  {"
+    # or "}\n]" patterns working backwards
+    last_complete = -1
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i, ch in enumerate(content):
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 1:  # Closed a top-level object inside the array
+                last_complete = i
+
+    if last_complete <= 0:
+        return None
+
+    # Slice up to the last complete object and close the array
+    truncated = content[:last_complete + 1].rstrip().rstrip(',') + '\n]'
+    try:
+        result = json.loads(truncated)
+        if isinstance(result, list) and len(result) > 0:
+            return result
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
 async def execute_heuristic_pipeline(
     job_id: str,
     job_name: str,
@@ -4041,7 +4967,7 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                                 model=heuristic_config.model,
                                 messages=[{"role": "user", "content": prompt}],
                                 temperature=0.8,
-                                max_tokens=8192,
+                                max_tokens=16384,
                             )
 
                             # Try to extract JSON array from response
@@ -4061,9 +4987,17 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                             break  # Success
 
                         except (json.JSONDecodeError, ValueError, KeyError) as e:
+                            # Try to recover truncated JSON — find last complete review object
+                            recovered = _recover_truncated_json_array(content if 'content' in dir() else '')
+                            if recovered:
+                                batch_reviews = recovered
+                                print(f"[Heuristic] Batch {batch_num} recovered {len(recovered)} reviews from truncated JSON")
+                                if convex:
+                                    await convex.add_log(job_id, "WARN", "Heuristic", f"Batch {batch_num} truncated — recovered {len(recovered)} reviews")
+                                break
+
                             retries += 1
                             print(f"[Heuristic] Batch {batch_num} parse error: {str(e)[:200]}")
-                            print(f"[Heuristic] Content was: {content[:300] if 'content' in dir() else 'N/A'}...")
                             if convex:
                                 await convex.add_log(job_id, "WARN", "Heuristic", f"Batch {batch_num} parse error (retry {retries}/{max_retries}): {str(e)[:100]}")
                             if retries >= max_retries:
@@ -4439,6 +5373,17 @@ async def execute_pipeline(
                 if convex:
                     await convex.add_log(job_id, "WARN", "Pipeline", f"Source job contexts not found: {source_contexts_dir}")
 
+            # Copy reviewer personas from source job
+            source_personas_dir = Path(reused_from_job_dir) / "reviewer-personas"
+            target_personas_dir = Path(job_paths["root"]) / "reviewer-personas"
+            if source_personas_dir.exists() and any(source_personas_dir.iterdir()):
+                target_personas_dir.mkdir(parents=True, exist_ok=True)
+                for persona_file in source_personas_dir.glob("*.md"):
+                    shutil.copy2(persona_file, target_personas_dir / persona_file.name)
+                if convex:
+                    count = len(list(target_personas_dir.glob("*.md")))
+                    await convex.add_log(job_id, "INFO", "Pipeline", f"Copied {count} reviewer personas from source job")
+
             # Copy reference dataset files from source job (for MDQA evaluation)
             source_dataset_dir = Path(reused_from_job_dir) / "dataset"
             target_dataset_dir = Path(job_paths["dataset"])
@@ -4580,9 +5525,9 @@ async def execute_pipeline(
             validation_conformity = round(valid_count / total_reviews, 4) if total_reviews > 0 else 0.0
 
             # Temperature conformity (check if temperature was in range)
-            temp_range = getattr(job_config.attributes_profile, 'temp_range', [0.7, 0.9])
+            temp_range = getattr(job_config.attributes_profile, 'temp_range', [0.85, 0.95])
             if not temp_range:
-                temp_range = [0.7, 0.9]
+                temp_range = [0.85, 0.95]
             in_temp_range = 0
             for r in reviews:
                 temp = r.get("assigned", {}).get("temperature")
@@ -4598,7 +5543,292 @@ async def execute_pipeline(
                 "temperature": temperature_conformity,
             }
 
-        if "generation" in phases:
+        # Determine if this is a multi-model job
+        if config and config.generation:
+            _all_models = config.generation.models or [config.generation.model]
+        else:
+            _all_models = []
+        _is_multi_model = len(_all_models) > 1
+        _multi_model_done = False
+        if config and config.generation:
+            print(f"[Pipeline] Multi-model check: config.generation.models={config.generation.models}, "
+                  f"_all_models={_all_models}, _is_multi_model={_is_multi_model}")
+
+        if "generation" in phases and _is_multi_model:
+            # ============================================================
+            # MULTI-MODEL PIPELINE: gen + eval per model, parallel or seq
+            # ============================================================
+            import asyncio as _asyncio
+            import copy as _copy
+
+            parallel_models = getattr(config.generation, 'parallel_models', False)
+
+            if convex:
+                job_status = await convex.get_job(job_id)
+                if job_status and job_status.get("status") == "terminated":
+                    print(f"[Pipeline] Job was terminated - skipping generation phase")
+                    await convex.add_log(job_id, "INFO", "Pipeline", "Job terminated - generation phase skipped")
+                    return
+
+                models_str = ", ".join(m.split("/")[-1] for m in _all_models)
+                await convex.add_log(job_id, "INFO", "AML",
+                    f"Starting multi-model generation ({len(_all_models)} models{'  parallel' if parallel_models else ''}: {models_str})")
+                await convex.run_mutation("jobs:startGeneration", {"id": job_id})
+
+                # Initialize modelProgress for all models
+                for m in _all_models:
+                    slug = m.split("/")[-1]
+                    target = config.generation.count
+                    await convex.update_model_progress(
+                        job_id, m, slug, 0, 0, target, 0, "pending", 0
+                    )
+
+            async def _run_model_pipeline(model_id: str):
+                """Run generation + evaluation for a single model."""
+                model_slug = model_id.split("/")[-1]
+                target = config.generation.count
+                print(f"\n[Multi-Model] Starting model: {model_slug}", flush=True)
+
+                # Create model-specific config (override the model field)
+                model_config = config.model_copy(deep=True)
+                model_config.generation.model = model_id
+
+                model_gen_results = []  # per-run gen results
+                model_conformity = []   # per-run conformity
+
+                # Progress callback for this model
+                async def _progress_cb(generated, failed, progress):
+                    if convex:
+                        await convex.update_model_progress(
+                            job_id, model_id, model_slug,
+                            generated, failed, target, progress, "generating", 0
+                        )
+
+                # --- GENERATION per run ---
+                for current_run in range(1, total_runs + 1):
+                    if convex:
+                        job_status = await convex.get_job(job_id)
+                        if job_status and job_status.get("status") == "terminated":
+                            print(f"[Multi-Model] Job terminated - stopping {model_slug}")
+                            return
+
+                    if total_runs > 1 and convex:
+                        await convex.add_log(job_id, "INFO", "AML",
+                            f"[{model_slug}] Starting run {current_run}/{total_runs}")
+
+                    gen_result = await execute_generation(
+                        job_id=job_id,
+                        job_dir=job_paths["root"],
+                        config=model_config,
+                        api_key=api_key,
+                        convex_url=convex_url,
+                        convex_token=convex_token,
+                        should_complete_job=False,
+                        model_tag=model_slug,
+                        progress_callback=_progress_cb,
+                        current_run=current_run,
+                        total_runs=total_runs,
+                    )
+
+                    model_gen_results.append(gen_result)
+
+                    # Conformity
+                    if gen_result and gen_result.get("reviews"):
+                        try:
+                            run_conf = calculate_conformity_from_reviews(gen_result["reviews"], config)
+                            run_conf["run"] = current_run
+                            run_conf["reviewCount"] = len(gen_result["reviews"])
+                            model_conformity.append(run_conf)
+                        except Exception as e:
+                            print(f"[Multi-Model] Warning: conformity error for {model_slug} run {current_run}: {e}")
+
+                    # Rename files for multi-run
+                    if total_runs > 1 and gen_result and gen_result.get("reviews"):
+                        import shutil
+                        from pathlib import Path
+                        dataset_dir = Path(job_paths["dataset"])
+                        import re as _re
+                        for ext in [".jsonl", ".csv", ".xml"]:
+                            for f in dataset_dir.glob(f"reviews--{model_slug}*{ext}"):
+                                if _re.search(r'-run\d+', f.stem):
+                                    continue
+                                stem_suffix = f.stem.replace(f"reviews--{model_slug}", "")
+                                new_name = f"reviews--{model_slug}-run{current_run}{stem_suffix}{ext}"
+                                shutil.move(str(f), str(dataset_dir / new_name))
+
+                # Update status to evaluating
+                if convex:
+                    await convex.update_model_progress(
+                        job_id, model_id, model_slug,
+                        target, 0, target, 100, "evaluating", 0
+                    )
+                    await convex.add_log(job_id, "INFO", "AML",
+                        f"[{model_slug}] Generation complete, starting evaluation")
+
+                # --- EVALUATION ---
+                if "evaluation" not in phases:
+                    # No evaluation requested
+                    if convex:
+                        await convex.update_model_progress(
+                            job_id, model_id, model_slug,
+                            target, 0, target, 100, "completed", 100
+                        )
+                    return
+
+                from pathlib import Path
+                dataset_dir = Path(job_paths["dataset"])
+                model_run_metrics = []
+
+                if total_runs > 1:
+                    for eval_run in range(1, total_runs + 1):
+                        run_file = None
+                        for pattern in [
+                            f"reviews--{model_slug}-run{eval_run}.jsonl",
+                            f"reviews--{model_slug}-run{eval_run}-explicit.jsonl",
+                        ]:
+                            candidate = dataset_dir / pattern
+                            if candidate.exists():
+                                run_file = candidate
+                                break
+
+                        if run_file:
+                            eval_metrics = await execute_evaluation(
+                                job_id=job_id,
+                                job_paths=job_paths,
+                                evaluation_config=evaluation_config,
+                                dataset_file=str(run_file),
+                                convex=convex,
+                                run_number=eval_run,
+                                save_files=False,
+                            )
+                            if eval_metrics:
+                                model_run_metrics.append(eval_metrics)
+
+                        # Update eval progress
+                        eval_pct = int(eval_run / total_runs * 100)
+                        if convex:
+                            await convex.update_model_progress(
+                                job_id, model_id, model_slug,
+                                target, 0, target, 100, "evaluating", eval_pct
+                            )
+                else:
+                    # Single run — find dataset file
+                    run_file = None
+                    for pattern in [
+                        f"reviews--{model_slug}.jsonl",
+                        f"reviews--{model_slug}-explicit.jsonl",
+                    ]:
+                        candidate = dataset_dir / pattern
+                        if candidate.exists():
+                            run_file = candidate
+                            break
+
+                    if run_file:
+                        eval_metrics = await execute_evaluation(
+                            job_id=job_id,
+                            job_paths=job_paths,
+                            evaluation_config=evaluation_config,
+                            dataset_file=str(run_file),
+                            convex=convex,
+                            reviews_data=model_gen_results[0].get("reviews") if model_gen_results and model_gen_results[0] else None,
+                            save_files=False,
+                        )
+                        if eval_metrics:
+                            model_run_metrics.append(eval_metrics)
+
+                # Aggregate metrics for this model
+                import numpy as np
+                avg_metrics = {}
+                if model_run_metrics:
+                    metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                    for key in metric_keys:
+                        values = [m.get(key) for m in model_run_metrics if m.get(key) is not None]
+                        if values:
+                            avg_metrics[key] = float(round(np.mean(values), 6))
+
+                # Build conformity average
+                avg_conformity = None
+                if model_conformity:
+                    conf_keys = ["polarity", "length", "noise", "validation", "temperature"]
+                    avg_conformity = {}
+                    for key in conf_keys:
+                        values = [c[key] for c in model_conformity if key in c]
+                        if values:
+                            avg_conformity[key] = float(round(np.mean(values), 4))
+
+                # Build per-run metrics for Convex
+                per_run_convex = None
+                if total_runs > 1 and len(model_run_metrics) > 1:
+                    per_run_convex = []
+                    for run_idx, rm in enumerate(model_run_metrics, 1):
+                        entry_metrics = {
+                            k: float(round(float(v), 6))
+                            for k, v in rm.items()
+                            if v is not None and k in ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                        }
+                        per_run_convex.append({
+                            "run": run_idx,
+                            "datasetFile": f"reviews--{model_slug}-run{run_idx}.jsonl",
+                            "metrics": entry_metrics,
+                        })
+
+                # Save per-model metrics to Convex
+                if convex and avg_metrics:
+                    await convex.save_per_model_metrics(
+                        job_id, model_id, model_slug,
+                        avg_metrics, avg_conformity, per_run_convex
+                    )
+
+                # Save metrics to disk
+                metrics_dir = Path(job_paths["root"]) / "metrics"
+                metrics_dir.mkdir(parents=True, exist_ok=True)
+                metrics_path = metrics_dir / f"mdqa-results--{model_slug}.json"
+                import json as _json
+                with open(metrics_path, "w") as f:
+                    _json.dump({
+                        "model": model_id,
+                        "metrics": avg_metrics,
+                        "conformity": avg_conformity,
+                        "runs": len(model_run_metrics),
+                    }, f, indent=2)
+
+                # Save conformity to disk
+                reports_dir = Path(job_paths["reports"])
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                conf_path = reports_dir / f"conformity-report--{model_slug}.json"
+                if avg_conformity:
+                    with open(conf_path, "w") as f:
+                        _json.dump({
+                            "model": model_id,
+                            **avg_conformity,
+                            "reviewCount": sum(c.get("reviewCount", 0) for c in model_conformity),
+                        }, f, indent=2)
+
+                # Done
+                if convex:
+                    await convex.update_model_progress(
+                        job_id, model_id, model_slug,
+                        target, 0, target, 100, "completed", 100
+                    )
+                print(f"[Multi-Model] {model_slug} complete: {avg_metrics}", flush=True)
+
+            # Run all models (parallel or sequential)
+            if parallel_models:
+                await _asyncio.gather(*[_run_model_pipeline(m) for m in _all_models])
+            else:
+                for m in _all_models:
+                    await _run_model_pipeline(m)
+
+            if convex:
+                await convex.add_log(job_id, "INFO", "Pipeline",
+                    f"Multi-model pipeline complete ({len(_all_models)} models)")
+
+            _multi_model_done = True
+
+        if "generation" in phases and not _multi_model_done:
+            # ============================================================
+            # SINGLE-MODEL PIPELINE (existing behavior, unchanged)
+            # ============================================================
             # Check if job was terminated during composition
             if convex:
                 job_status = await convex.get_job(job_id)
@@ -4641,6 +5871,8 @@ async def execute_pipeline(
                     convex_url=convex_url,
                     convex_token=convex_token,
                     should_complete_job=False,  # Pipeline handles completion after evaluation
+                    current_run=current_run,
+                    total_runs=total_runs,
                 )
 
                 # Calculate conformity from in-memory reviews (before files are renamed)
@@ -4742,7 +5974,7 @@ async def execute_pipeline(
                 validation_conformity = round(valid_json_count / total_reviews, 4) if total_reviews > 0 else 1.0
 
                 # Temperature Conformity: fraction of reviews with temperature within target range
-                temp_range = getattr(config.attributes_profile, "temperature_range", None) or [0.7, 0.9]
+                temp_range = getattr(config.attributes_profile, "temperature_range", None) or [0.85, 0.95]
                 min_temp, max_temp = temp_range[0], temp_range[1]
                 temp_within_range = 0
                 temp_total = 0
@@ -4870,8 +6102,9 @@ async def execute_pipeline(
 
         # ========================================
         # Phase 3: EVALUATION (MDQA) - with multi-run support
+        # (Skipped for multi-model jobs — evaluation handled per-model above)
         # ========================================
-        if "evaluation" in phases:
+        if "evaluation" in phases and not _multi_model_done:
             # Check if job was terminated during generation
             if convex:
                 job_status = await convex.get_job(job_id)
@@ -6355,7 +7588,79 @@ async def read_metrics(request: ReadMetricsRequest):
     }
 
     # Try to read from JSON first (preferred for multi-run)
+    # Check both CERA format (mdqa-results.json) and heuristic format (mdqa_metrics_average.json)
     json_path = metrics_dir / "mdqa-results.json"
+    heuristic_avg_path = metrics_dir / "mdqa_metrics_average.json"
+    if not json_path.exists() and heuristic_avg_path.exists():
+        # Heuristic format: flat {key: value, key_std: value} + per-run files
+        import glob as glob_mod
+        raw_avg = json.loads(heuristic_avg_path.read_text(encoding="utf-8"))
+
+        # Read per-run files (mdqa_metrics-run1.json, mdqa_metrics-run2.json, etc.)
+        run_files = sorted(metrics_dir.glob("mdqa_metrics-run*.json"))
+        if run_files:
+            is_multi_run = True
+            category_map = {
+                "bleu": "lexical", "rouge_l": "lexical",
+                "bertscore": "semantic", "moverscore": "semantic",
+                "distinct_1": "diversity", "distinct_2": "diversity", "self_bleu": "diversity",
+            }
+            for run_file in run_files:
+                run_num = int(run_file.stem.split("run")[-1])
+                run_data = json.loads(run_file.read_text(encoding="utf-8"))
+                for metric, score in run_data.items():
+                    if metric.endswith("_std") or metric.startswith("_"):
+                        continue
+                    cat = category_map.get(metric, "other")
+                    if cat not in per_run_metrics:
+                        per_run_metrics[cat] = {}
+                    if f"run{run_num}" not in per_run_metrics[cat]:
+                        per_run_metrics[cat][f"run{run_num}"] = []
+                    per_run_metrics[cat][f"run{run_num}"].append(
+                        {"metric": metric, "score": score, "description": metric_descriptions.get(metric, "")}
+                    )
+
+            # Build average and std from the average file
+            for metric, score in raw_avg.items():
+                if metric.endswith("_std") or metric.startswith("_"):
+                    continue
+                cat = category_map.get(metric, "other")
+                if cat not in average_metrics:
+                    average_metrics[cat] = []
+                average_metrics[cat].append(
+                    {"metric": metric, "score": score, "description": metric_descriptions.get(metric, "")}
+                )
+                std_val = raw_avg.get(f"{metric}_std")
+                if std_val is not None:
+                    if cat not in std_metrics:
+                        std_metrics[cat] = []
+                    std_metrics[cat].append(
+                        {"metric": metric, "score": std_val, "description": "Standard deviation"}
+                    )
+
+            result["isMultiRun"] = True
+            result["totalRuns"] = len(run_files)
+            result["perRun"] = per_run_metrics
+            result["average"] = average_metrics
+            result["std"] = std_metrics
+            for category in ["lexical", "semantic", "diversity"]:
+                if category in average_metrics:
+                    result[category] = average_metrics[category]
+        else:
+            # Single average file, no per-run data
+            category_map = {
+                "bleu": "lexical", "rouge_l": "lexical",
+                "bertscore": "semantic", "moverscore": "semantic",
+                "distinct_1": "diversity", "distinct_2": "diversity", "self_bleu": "diversity",
+            }
+            for metric, score in raw_avg.items():
+                if metric.endswith("_std") or metric.startswith("_"):
+                    continue
+                cat = category_map.get(metric, "other")
+                if cat not in result:
+                    result[cat] = []
+                result[cat].append({"metric": metric, "score": score, "description": metric_descriptions.get(metric, "")})
+
     if json_path.exists():
         raw = json.loads(json_path.read_text(encoding="utf-8"))
 

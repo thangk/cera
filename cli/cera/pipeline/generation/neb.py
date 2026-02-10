@@ -56,7 +56,7 @@ class NegativeExampleBuffer:
         if len(self.buffer) > self.max_size:
             self.buffer = self.buffer[-self.max_size:]
 
-    def get_formatted_context(self, max_chars_per_review: int = 500) -> str:
+    def get_formatted_context(self, max_chars_per_review: int = 300) -> str:
         """
         Format buffer as well-structured markdown for prompt injection.
 
