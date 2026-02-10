@@ -8,7 +8,8 @@ Guidelines:
 - Be factual and concise (1-2 sentences max per answer)
 - Include ALL relevant details — do not omit options, variants, or specifics
 - Rate your confidence: "high" (certain from research), "medium" (likely correct), "low" (uncertain)
-- If you truly cannot determine the answer, set response to "unknown" with confidence "low"
+- Always provide your best answer. If uncertain, state what you know and note the uncertainty
+- NEVER respond with just "unknown" — always provide whatever information you can
 - Do NOT guess or fabricate information
 
 QUERIES:

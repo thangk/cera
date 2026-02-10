@@ -4,7 +4,7 @@ This module implements the query-based MAV (Multi-Agent Verification) architectu
 1. Each model independently researches the subject and generates neutral factual queries
 2. All queries are pooled and deduplicated
 3. Each model independently answers ALL pooled queries
-4. Per-query 2/3 majority voting achieves consensus on short focused answers
+4. Each model judges agreement on others' answers (LLM-based consensus with point voting)
 5. Verified answers are classified into categories (characteristics, positives, negatives, use_cases)
 """
 
@@ -25,7 +25,7 @@ class MAVConfig:
     enabled: bool = True
     models: list[str] = None  # N models for cross-validation (minimum 2)
     similarity_threshold: float = 0.75  # Query deduplication threshold
-    answer_threshold: float = 0.80  # Per-query answer consensus threshold
+    answer_threshold: float = 0.80  # Legacy: embedding similarity (used in fallback dedup)
     max_queries: int = 30  # Soft cap on pooled queries after dedup
     min_verification_rate: float = 0.30  # Minimum consensus rate before fallback
 
@@ -87,11 +87,15 @@ class QueryConsensusResult:
     query_id: str
     query: str
     answers: list[QueryAnswer]  # All model answers
-    consensus_reached: bool  # Whether ceil(2/3*N) agreed
+    consensus_reached: bool  # Whether sufficient mutual agreement exists
     consensus_answer: Optional[str]  # The agreed-upon answer (most complete)
-    agreeing_models: list[str]  # Models that agreed
-    pairwise_similarities: dict[str, float]  # Model pair -> similarity score
-    agreement_count: int  # How many models agreed
+    agreeing_models: list[str]  # Models whose answers passed
+    pairwise_similarities: dict[str, float]  # Legacy: kept for backward compat (empty for new runs)
+    agreement_count: int  # How many models' answers passed
+    # LLM-judged consensus fields (new)
+    agreement_votes: dict[str, list[str]] = field(default_factory=dict)  # judge -> [models they agreed with]
+    total_points: int = 0  # Aggregated agreement edges across all judges
+    points_by_source: dict[str, int] = field(default_factory=dict)  # model -> incoming vote count
 
 
 @dataclass
@@ -103,7 +107,7 @@ class MAVQueryPoolReport:
     queries_with_consensus: int = 0  # How many reached agreement
     queries_without_consensus: int = 0  # How many did not
     per_query_results: list[QueryConsensusResult] = field(default_factory=list)
-    threshold_used: float = 0.80
+    threshold_used: float = 0.80  # Legacy: embedding threshold
     used_fallback: bool = False
 
 
@@ -606,22 +610,174 @@ class SubjectIntelligenceLayer:
                 answers.append(QueryAnswer(
                     query_id=ans.get("query_id", ""),
                     model=model,
-                    response=ans.get("response", "unknown"),
+                    response=ans.get("response", "No information available"),
                     confidence=ans.get("confidence", "low"),
                 ))
         except json.JSONDecodeError:
-            # If parsing fails, create empty answers for all queries
+            # If parsing fails, create descriptive fallback answers
             for q in queries:
                 answers.append(QueryAnswer(
                     query_id=q.id,
                     model=model,
-                    response="unknown",
+                    response=f"Unable to answer: {q.query}",
                     confidence="low",
                 ))
 
         return answers
 
-    # ─── Round 4: Per-Query Consensus ───────────────────────────────────
+    # ─── Round 4: LLM-Judged Consensus ──────────────────────────────────
+
+    async def _judge_agreement(
+        self,
+        judge_model: str,
+        subject: str,
+        topics: list[dict],
+    ) -> dict[str, dict[str, int]]:
+        """
+        Ask a single model to judge agreement between all models' answers.
+
+        Args:
+            judge_model: The model acting as judge
+            subject: The subject being researched
+            topics: List of topic dicts with all answers
+
+        Returns:
+            Dict mapping query_id -> {model_name: 0 or 1}
+        """
+        from cera.llm.openrouter import OpenRouterClient
+
+        prompt = load_and_format(
+            "sil", "judge_agreement",
+            subject=subject,
+            judge_model=judge_model,
+            topics_json=json.dumps(topics, indent=2, ensure_ascii=False),
+        )
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=judge_model,
+                temperature=0.1,
+                max_tokens=8192,
+            )
+
+        # Parse response
+        judgments: dict[str, dict[str, int]] = {}
+        try:
+            json_match = re.search(r"\{[\s\S]*\}", response)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                data = json.loads(response)
+
+            for item in data.get("judgments", []):
+                query_id = item.get("query_id", "")
+                scores = item.get("scores", {})
+                # Validate: remove self-scores and normalize to 0/1
+                clean_scores = {}
+                for model_name, score in scores.items():
+                    if model_name != judge_model:
+                        clean_scores[model_name] = 1 if score == 1 else 0
+                judgments[query_id] = clean_scores
+        except json.JSONDecodeError:
+            pass  # Return empty judgments → zero votes from this model
+
+        return judgments
+
+    def _compute_llm_consensus(
+        self,
+        query: FactualQuery,
+        answers: list[QueryAnswer],
+        all_judgments: dict[str, dict[str, dict[str, int]]],
+        n_models: int,
+    ) -> QueryConsensusResult:
+        """
+        Determine consensus for a single query using LLM judgment votes.
+
+        Uses the >=2 points from >=2 different sources rule:
+        A model's answer passes if it received agreement votes (score=1)
+        from at least ceil(2/3 * (N-1)) different source models.
+
+        Args:
+            query: The query being evaluated
+            answers: All model answers for this query
+            all_judgments: judge_model -> {query_id -> {model: 0/1}}
+            n_models: Total number of responding models
+
+        Returns:
+            QueryConsensusResult with consensus details
+        """
+        valid_answers = answers
+
+        if len(valid_answers) < 2:
+            return QueryConsensusResult(
+                query_id=query.id,
+                query=query.query,
+                answers=answers,
+                consensus_reached=False,
+                consensus_answer=None,
+                agreeing_models=[],
+                pairwise_similarities={},
+                agreement_count=0,
+                agreement_votes={},
+                total_points=0,
+                points_by_source={},
+            )
+
+        answer_models = {a.model for a in valid_answers}
+
+        # Collect agreement votes per judge for this query
+        agreement_votes: dict[str, list[str]] = {}  # judge -> [models they gave 1 to]
+        incoming_votes: dict[str, set[str]] = {m: set() for m in answer_models}
+
+        for judge_model, query_judgments in all_judgments.items():
+            if judge_model not in answer_models:
+                continue
+            scores = query_judgments.get(query.id, {})
+            agreed_with = []
+            for target_model, score in scores.items():
+                if target_model in answer_models and target_model != judge_model and score == 1:
+                    agreed_with.append(target_model)
+                    incoming_votes[target_model].add(judge_model)
+            agreement_votes[judge_model] = agreed_with
+
+        # Points per model = number of distinct incoming agreement votes
+        points_by_source = {m: len(incoming_votes[m]) for m in answer_models}
+        total_points = sum(points_by_source.values())
+
+        # Mutual agreement rule: answer passes if it received votes from
+        # >= ceil(2/3 * (N-1)) different models (with N=3, needs >=2 sources)
+        min_sources = max(1, ceil(2 / 3 * (len(answer_models) - 1)))
+        passing_models = [m for m in answer_models if points_by_source[m] >= min_sources]
+
+        consensus_reached = len(passing_models) >= 1
+
+        # Select canonical answer: passing model with most incoming votes (tiebreak: longest)
+        consensus_answer = None
+        agreeing_models = []
+        if consensus_reached:
+            agreeing_models = passing_models
+            best = max(
+                [a for a in valid_answers if a.model in passing_models],
+                key=lambda a: (points_by_source[a.model], len(a.response.strip()))
+            )
+            consensus_answer = best.response
+
+        return QueryConsensusResult(
+            query_id=query.id,
+            query=query.query,
+            answers=answers,
+            consensus_reached=consensus_reached,
+            consensus_answer=consensus_answer,
+            agreeing_models=agreeing_models,
+            pairwise_similarities={},
+            agreement_count=len(passing_models),
+            agreement_votes=agreement_votes,
+            total_points=total_points,
+            points_by_source=points_by_source,
+        )
+
+    # ─── Round 4 Legacy: Embedding-Based Consensus (fallback) ─────────
 
     def _compute_query_consensus(
         self,
@@ -642,8 +798,7 @@ class SubjectIntelligenceLayer:
         Returns:
             QueryConsensusResult with consensus details
         """
-        # Filter out "unknown" answers
-        valid_answers = [a for a in answers if a.response.lower().strip() != "unknown"]
+        valid_answers = answers
         effective_n = len(valid_answers)
 
         min_agreement = ceil(2 / 3 * effective_n) if effective_n >= 2 else effective_n
@@ -1034,20 +1189,65 @@ class SubjectIntelligenceLayer:
 
             await self._emit_log("INFO", "MAV", f"Round 3 complete: {len(model_answers)} models responded", progress=30)
 
-            # ─── ROUND 4: Per-Query Consensus ───────────────────────
-            await self._emit_log("INFO", "MAV", "Round 4: Computing consensus on answers...", progress=31)
-            effective_n_models = len([r for r in round3_results if not isinstance(r, Exception)])
-            consensus_results: list[QueryConsensusResult] = []
-            total_pooled = len(pooled_queries)
-            consensus_log_interval = max(1, total_pooled // 5)  # Log every ~20%
+            # ─── ROUND 4: LLM-Judged Consensus ───────────────────────
+            await self._emit_log("INFO", "MAV", "Round 4: Sending answers to models for agreement judgment...", progress=31)
 
-            for idx, pq in enumerate(pooled_queries):
-                # Log progress periodically during consensus computation
-                if idx % consensus_log_interval == 0 or idx == total_pooled - 1:
-                    await self._emit_log("INFO", "MAV", f"Computing consensus... ({idx + 1}/{total_pooled})")
+            responding_models = [m for m in self.mav_config.models if m in model_answers]
+            effective_n_models = len(responding_models)
+
+            # Build topics structure for judgment prompt
+            topics_for_judgment = []
+            for pq in pooled_queries:
+                qa_list = all_answers.get(pq.id, [])
+                topics_for_judgment.append({
+                    "query_id": pq.id,
+                    "query": pq.query,
+                    "answers": [
+                        {"model": a.model, "response": a.response}
+                        for a in qa_list
+                    ],
+                })
+
+            JUDGMENT_TIMEOUT = 120  # 2 minutes per model
+
+            async def judge_with_timeout(model: str):
+                try:
+                    result = await asyncio.wait_for(
+                        self._judge_agreement(model, query, topics_for_judgment),
+                        timeout=JUDGMENT_TIMEOUT,
+                    )
+                    return model, result
+                except asyncio.TimeoutError:
+                    model_name = model.split("/")[-1] if "/" in model else model
+                    await self._emit_log("WARN", "MAV", f"Round 4: {model_name} judgment timed out")
+                    return model, {}
+                except Exception as e:
+                    model_name = model.split("/")[-1] if "/" in model else model
+                    await self._emit_log("WARN", "MAV", f"Round 4: {model_name} judgment failed: {e}")
+                    return model, {}
+
+            judgment_tasks = [judge_with_timeout(m) for m in responding_models]
+            judgment_results = await asyncio.gather(*judgment_tasks)
+
+            # Collect all judgments: model -> {query_id -> {model: 0/1}}
+            all_judgments: dict[str, dict[str, dict[str, int]]] = {}
+            for model, judgments in judgment_results:
+                all_judgments[model] = judgments
+                model_name = model.split("/")[-1] if "/" in model else model
+                n_agreements = sum(
+                    sum(1 for s in scores.values() if s == 1)
+                    for scores in judgments.values()
+                )
+                await self._emit_log("INFO", "MAV", f"Round 4: {model_name} judged {len(judgments)} topics ({n_agreements} agreements)")
+
+            await self._emit_log("INFO", "MAV", f"Round 4: All {len(all_judgments)} model judgments collected", progress=34)
+
+            # Compute consensus per query using LLM votes
+            consensus_results: list[QueryConsensusResult] = []
+            for pq in pooled_queries:
                 query_answers = all_answers.get(pq.id, [])
-                result = self._compute_query_consensus(
-                    pq, query_answers, self.mav_config.answer_threshold, effective_n_models
+                result = self._compute_llm_consensus(
+                    pq, query_answers, all_judgments, effective_n_models
                 )
                 consensus_results.append(result)
 
@@ -1055,7 +1255,7 @@ class SubjectIntelligenceLayer:
             verified_results = [r for r in consensus_results if r.consensus_reached]
             unverified_results = [r for r in consensus_results if not r.consensus_reached]
 
-            await self._emit_log("INFO", "MAV", f"Round 4 complete: {len(verified_results)}/{len(pooled_queries)} queries reached consensus", progress=35)
+            await self._emit_log("INFO", "MAV", f"Round 4 complete: {len(verified_results)}/{len(pooled_queries)} queries reached consensus (LLM-judged)", progress=35)
 
             # Build report
             report = MAVQueryPoolReport(
@@ -1076,8 +1276,7 @@ class SubjectIntelligenceLayer:
                 all_answer_texts = []
                 for pq in pooled_queries:
                     for ans in all_answers.get(pq.id, []):
-                        if ans.response.lower().strip() != "unknown":
-                            all_answer_texts.append(ans.response)
+                        all_answer_texts.append(ans.response)
 
                 deduped = self._deduplicate_items(all_answer_texts, 0.80)
 
@@ -1175,18 +1374,17 @@ class SubjectIntelligenceLayer:
             # Classify answers directly (no consensus needed)
             pseudo_results = []
             for ans in answers:
-                if ans.response.lower().strip() != "unknown":
-                    pq = next((q for q in pooled if q.id == ans.query_id), None)
-                    pseudo_results.append(QueryConsensusResult(
-                        query_id=ans.query_id,
-                        query=pq.query if pq else "",
-                        answers=[ans],
-                        consensus_reached=True,
-                        consensus_answer=ans.response,
-                        agreeing_models=[fallback_model],
-                        pairwise_similarities={},
-                        agreement_count=1,
-                    ))
+                pq = next((q for q in pooled if q.id == ans.query_id), None)
+                pseudo_results.append(QueryConsensusResult(
+                    query_id=ans.query_id,
+                    query=pq.query if pq else "",
+                    answers=[ans],
+                    consensus_reached=True,
+                    consensus_answer=ans.response,
+                    agreeing_models=[fallback_model],
+                    pairwise_similarities={},
+                    agreement_count=1,
+                ))
 
             classified = await self._classify_verified_answers(pseudo_results, query)
 
