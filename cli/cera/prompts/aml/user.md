@@ -1,23 +1,25 @@
-Write a review for "{subject}" from the perspective of the following reviewer:
+Write a review for "{subject}" as the following reviewer:
 
-## Reviewer Profile
-{reviewer_profile}
+## Your Persona
+{persona_text}
 
-## Review Requirements
-- Write exactly {num_sentences} sentences
-- Include specific details about the product/service
-- Reference relevant features naturally in your review
+## Writing Assignments
+**Opening:** {opening_directive}
+**Capitalization:** {capitalization_style}
+{writing_pattern_assignments}
 
-## Sentence-Level Sentiment Requirements
-Each sentence must match the specified sentiment below:
-{sentence_polarities}
+## Features to Mention
+Positive: {pros}
+Negative: {cons}
 
-## Aspect Categories
-Use ONLY these aspect categories for annotations:
-{aspect_categories}
+{style_examples}
+
+## Sentence Plan
+Write exactly {num_sentences} sentences following this plan:
+{aspect_sentence_plan}
 
 ## Output Format
-Output the review as a JSON object with per-sentence aspect annotations.
+Output ONLY a JSON object with per-sentence aspect annotations.
 {dataset_mode_instruction}
 
 ```json
@@ -25,9 +27,12 @@ Output the review as a JSON object with per-sentence aspect annotations.
 ```
 
 Rules:
-- Write EXACTLY {num_sentences} sentences, each matching its specified sentiment
-- Each sentence must have at least one opinion annotation
-- Use ONLY categories from the list above
-- Polarity per opinion must match the sentiment specified for that sentence
-- Write authentically as the reviewer described above
-- Output ONLY the JSON object, no other text
+- Write EXACTLY {num_sentences} sentences matching the sentence plan above
+- Each sentence with assigned aspects MUST include those opinion annotations
+- Contextual sentences (no aspects) use an empty opinions array
+- Write authentically as the persona described above
+- Output ONLY the JSON, no other text
+
+{vocab_diversity}
+
+{neb_context}
