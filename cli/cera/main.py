@@ -638,20 +638,11 @@ def _format_model_pricing(model: dict) -> str:
 
 
 def _supports_online_search(model_id: str) -> bool:
-    """Check if model supports :online suffix for web search."""
-    # Perplexity models have built-in search (always on)
-    if model_id.startswith("perplexity/"):
-        return True
-    # These providers support :online suffix via OpenRouter
-    online_providers = ["anthropic", "openai", "google"]
-    provider = model_id.split("/")[0] if "/" in model_id else ""
-    if provider in online_providers:
-        return True
-    # Specific search models
-    search_models = ["openai/gpt-4o-search-preview", "openai/gpt-4o-mini-search-preview"]
-    if model_id in search_models:
-        return True
-    return False
+    """Check if model supports :online suffix for web search.
+
+    All models support :online via OpenRouter (native or Exa fallback).
+    """
+    return True
 
 
 def _build_model_badges(model: dict) -> str:

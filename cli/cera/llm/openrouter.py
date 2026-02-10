@@ -27,34 +27,6 @@ class ChatResponse:
     id: Optional[str] = None  # generation ID
 
 
-# Models that support the :online suffix for web search
-# Each provider uses their own search infrastructure
-ONLINE_CAPABLE_MODELS = {
-    # Anthropic - uses Anthropic Web Search
-    "anthropic/claude-sonnet-4",
-    "anthropic/claude-opus-4",
-    "anthropic/claude-3.5-sonnet",
-    "anthropic/claude-3.5-haiku",
-    # OpenAI - uses Exa search
-    "openai/gpt-4o",
-    "openai/gpt-4o-mini",
-    "openai/gpt-4-turbo",
-    "openai/o1",
-    "openai/o1-mini",
-    "openai/o3-mini",
-    # Google - uses Google Search (grounding)
-    "google/gemini-2.5-pro-preview",
-    "google/gemini-2.5-flash-preview",
-    "google/gemini-2.0-flash-001",
-    "google/gemini-pro",
-    # xAI - uses Grok's search
-    "x-ai/grok-3",
-    "x-ai/grok-3-mini",
-    # Mistral
-    "mistralai/mistral-large",
-    "mistralai/mistral-medium",
-}
-
 # Models with NATIVE search (always have search, no :online needed)
 NATIVE_SEARCH_MODELS = {
     "perplexity/sonar",
@@ -68,21 +40,11 @@ def supports_online_search(model: str) -> bool:
     """
     Check if a model supports web search.
 
-    Args:
-        model: Model ID (e.g., "anthropic/claude-sonnet-4")
-
-    Returns:
-        True if model supports :online suffix or has native search
+    All models support web search via OpenRouter's :online suffix,
+    which uses native provider search (Anthropic, Google, OpenAI, xAI)
+    or Exa as a fallback for other models.
     """
-    # Strip any existing :online suffix
-    base_model = model.replace(":online", "")
-
-    # Check native search first
-    if base_model in NATIVE_SEARCH_MODELS:
-        return True
-
-    # Check online-capable models
-    return base_model in ONLINE_CAPABLE_MODELS
+    return True
 
 
 def get_search_model_id(model: str) -> str:
@@ -93,7 +55,7 @@ def get_search_model_id(model: str) -> str:
         model: Base model ID
 
     Returns:
-        Model ID with :online suffix if needed, or native search model as-is
+        Model ID with :online suffix, or native search model as-is
     """
     base_model = model.replace(":online", "")
 
@@ -101,12 +63,8 @@ def get_search_model_id(model: str) -> str:
         # Native search models don't need suffix
         return base_model
 
-    if base_model in ONLINE_CAPABLE_MODELS:
-        # Add :online suffix for web search
-        return f"{base_model}:online"
-
-    # Model doesn't support web search
-    return None
+    # All models support :online via OpenRouter (native or Exa fallback)
+    return f"{base_model}:online"
 
 
 class OpenRouterClient:

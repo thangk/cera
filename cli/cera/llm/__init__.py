@@ -4,7 +4,6 @@ from .openrouter import (
     OpenRouterClient,
     supports_online_search,
     get_search_model_id,
-    ONLINE_CAPABLE_MODELS,
     NATIVE_SEARCH_MODELS,
 )
 from .mav import MultiAgentVerification
@@ -14,7 +13,6 @@ __all__ = [
     "OpenRouterClient",
     "supports_online_search",
     "get_search_model_id",
-    "ONLINE_CAPABLE_MODELS",
     "NATIVE_SEARCH_MODELS",
     "MultiAgentVerification",
     "WebSearchClient",
