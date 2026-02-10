@@ -113,7 +113,7 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,  # Lower temperature for more consistent extraction
-                max_tokens=500,
+                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
             )
 
         # Clean up response (remove any markdown formatting if present)
@@ -161,7 +161,7 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=500,
+                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
             )
 
         # Clean up response
@@ -208,7 +208,7 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=50,  # Short response expected
+                max_tokens=1024,  # Reasoning models need headroom for thinking tokens
             )
 
         # Clean up response - just the query, no quotes or extra text
@@ -255,21 +255,16 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=100,
+                max_tokens=1024,  # Reasoning models need headroom for thinking tokens
             )
 
-        # Parse JSON response
+        # Parse JSON response using robust extractor
         try:
-            # Clean up response - remove markdown code blocks if present
-            clean_response = response.strip()
-            if clean_response.startswith("```"):
-                lines = clean_response.split("\n")
-                clean_response = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
-
-            result = json.loads(clean_response)
+            from cera.api import _extract_json_from_llm
+            result = _extract_json_from_llm(response, expected_type="object")
             domain = result.get("domain", "General")
             confidence = float(result.get("confidence", 0.5))
-        except (json.JSONDecodeError, ValueError):
+        except Exception:
             logger.warning("domain_extraction_parse_error", response=response[:200])
             domain = "General"
             confidence = 0.3
@@ -311,21 +306,17 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=200,  # Allow longer multi-region responses
+                max_tokens=1024,  # Reasoning models need headroom for thinking tokens
             )
 
-        # Parse JSON response
+        # Parse JSON response using robust extractor
         try:
-            clean_response = response.strip()
-            if clean_response.startswith("```"):
-                lines = clean_response.split("\n")
-                clean_response = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
-
-            result = json.loads(clean_response)
+            from cera.api import _extract_json_from_llm
+            result = _extract_json_from_llm(response, expected_type="object")
             region = result.get("region")  # Can be None
             confidence = float(result.get("confidence", 0.0))
             reason = result.get("reason")
-        except (json.JSONDecodeError, ValueError):
+        except Exception:
             logger.warning("region_extraction_parse_error", response=response[:200])
             region = None
             confidence = 0.0

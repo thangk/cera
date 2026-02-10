@@ -131,6 +131,7 @@ class OpenRouterClient:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         stream: bool = False,
+        reasoning: dict | None = None,
     ) -> str | AsyncIterator[str]:
         """
         Send a chat completion request.
@@ -141,11 +142,22 @@ class OpenRouterClient:
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
             stream: Whether to stream the response
+            reasoning: Optional reasoning config, e.g. {"effort": "high"}
 
         Returns:
             Generated text or async iterator if streaming
         """
         model_id = self._get_model_id(model)
+
+        body = {
+            "model": model_id,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
+        if reasoning:
+            body["reasoning"] = reasoning
 
         response = await self.client.post(
             f"{self.BASE_URL}/chat/completions",
@@ -155,14 +167,8 @@ class OpenRouterClient:
                 "X-Title": self.site_name,
                 "Content-Type": "application/json",
             },
-            json={
-                "model": model_id,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": stream,
-            },
-            timeout=120.0,
+            json=body,
+            timeout=180.0,
         )
         response.raise_for_status()
 

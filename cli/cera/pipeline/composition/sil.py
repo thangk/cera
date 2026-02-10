@@ -13,9 +13,12 @@ from math import ceil
 from typing import Optional
 import asyncio
 import json
+import logging
 import re
 
 from cera.prompts import load_and_format
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -308,11 +311,8 @@ class SubjectIntelligenceLayer:
             )
 
         try:
-            json_match = re.search(r"\{[\s\S]*\}", response)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = json.loads(response)
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
 
             understanding = SubjectUnderstanding(
                 model=model,
@@ -321,7 +321,7 @@ class SubjectIntelligenceLayer:
                 search_queries=data.get("search_queries", [f"{subject} reviews"]),
                 raw_response=response,
             )
-        except json.JSONDecodeError:
+        except Exception:
             understanding = SubjectUnderstanding(
                 model=model,
                 subject_type="general",
@@ -402,16 +402,13 @@ class SubjectIntelligenceLayer:
 
         # Parse JSON response
         try:
-            json_match = re.search(r"\{[\s\S]*\}", response)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = json.loads(response)
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
 
             queries = data.get("queries", [])
             # Ensure all queries are strings
             return [str(q) for q in queries if q]
-        except json.JSONDecodeError:
+        except Exception:
             # Try to extract queries from plain text (one per line)
             lines = [line.strip().strip("-•*").strip() for line in response.split("\n")]
             return [line for line in lines if line and "?" in line]
@@ -585,9 +582,10 @@ class SubjectIntelligenceLayer:
             queries_json=queries_json,
         )
 
-        # Use search-capable model if available
-        search_model = self._get_search_model(model)
-        use_model = search_model if search_model else model
+        # Round 3 does NOT need web search — models already have research_context
+        # from Round 1 injected in the prompt. Using :online here is redundant
+        # and can cause JSON parse failures (e.g., Opus with :online suffix).
+        use_model = model
 
         async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
             response = await client.chat(
@@ -596,14 +594,11 @@ class SubjectIntelligenceLayer:
                 temperature=0.0,
             )
 
-        # Parse JSON response
+        # Parse JSON response using robust extractor
         answers = []
         try:
-            json_match = re.search(r"\{[\s\S]*\}", response)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = json.loads(response)
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
 
             raw_answers = data.get("answers", [])
             for ans in raw_answers:
@@ -613,7 +608,12 @@ class SubjectIntelligenceLayer:
                     response=ans.get("response", "No information available"),
                     confidence=ans.get("confidence", "low"),
                 ))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, Exception) as e:
+            # Log the raw response for debugging
+            logger.warning(
+                f"MAV Round 3: Failed to parse JSON from {model} "
+                f"(error: {e}). Response preview: {response[:500]}"
+            )
             # If parsing fails, create descriptive fallback answers
             for q in queries:
                 answers.append(QueryAnswer(
@@ -657,18 +657,16 @@ class SubjectIntelligenceLayer:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=judge_model,
-                temperature=0.1,
-                max_tokens=8192,
+                temperature=1.0,
+                max_tokens=16384,
+                reasoning={"effort": "high"},
             )
 
         # Parse response
         judgments: dict[str, dict[str, int]] = {}
         try:
-            json_match = re.search(r"\{[\s\S]*\}", response)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = json.loads(response)
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
 
             for item in data.get("judgments", []):
                 query_id = item.get("query_id", "")
@@ -679,7 +677,8 @@ class SubjectIntelligenceLayer:
                     if model_name != judge_model:
                         clean_scores[model_name] = 1 if score == 1 else 0
                 judgments[query_id] = clean_scores
-        except json.JSONDecodeError:
+        except Exception:
+            logger.warning(f"MAV Round 4: Failed to parse judgments from {judge_model}. Response preview: {response[:300]}")
             pass  # Return empty judgments → zero votes from this model
 
         return judgments
@@ -934,11 +933,8 @@ class SubjectIntelligenceLayer:
             )
 
         try:
-            json_match = re.search(r"\{[\s\S]*\}", response)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = json.loads(response)
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
 
             return {
                 "characteristics": data.get("characteristics", []),
@@ -946,7 +942,7 @@ class SubjectIntelligenceLayer:
                 "negatives": data.get("negatives", []),
                 "use_cases": data.get("use_cases", []),
             }
-        except json.JSONDecodeError:
+        except Exception:
             # Fallback: put all facts in characteristics
             return {
                 "characteristics": [r.consensus_answer for r in verified_results if r.consensus_answer],
