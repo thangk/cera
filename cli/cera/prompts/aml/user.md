@@ -8,6 +8,8 @@ Write a review for "{subject}" as the following reviewer:
 **Capitalization:** {capitalization_style}
 {writing_pattern_assignments}
 
+{structure_variant}
+
 ## Features to Mention
 Positive: {pros}
 Negative: {cons}

@@ -74,10 +74,18 @@ class PolarityConfig(BaseModel):
     negative: float
 
 
+class EdgeLengths(BaseModel):
+    min_length: int = 1
+    min_chance: float = 0.15  # 15% combined chance for minEdge range [min_length, normal_floor - 1]
+    max_length: int = 15
+    max_chance: float = 0.05  # 5% combined chance for maxEdge range [normal_ceiling + 1, max_length]
+
+
 class AttributesProfile(BaseModel):
     polarity: PolarityConfig
     noise: NoiseConfig
     length_range: list[int]
+    edge_lengths: Optional[EdgeLengths] = None
     temp_range: list[float] = [0.85, 0.95]  # LLM temperature range, optional with default
     cap_weights: Optional[dict] = None  # e.g., {"standard": 0.55, "lowercase": 0.20, "mixed": 0.15, "emphasis": 0.10}
 
@@ -87,7 +95,7 @@ class GenerationConfig(BaseModel):
     count_mode: str = "reviews"  # "reviews" or "sentences" - target mode
     target_sentences: Optional[int] = None  # Target sentence count when count_mode="sentences"
     batch_size: int
-    request_size: int = 5
+    request_size: int = 25
     provider: str
     model: str
     output_formats: Optional[list[str]] = None  # e.g., ["jsonl", "csv", "semeval_xml"]
@@ -95,7 +103,7 @@ class GenerationConfig(BaseModel):
     total_runs: int = 1  # Number of times to run generation (for research variability assessment)
     # NEB (Negative Example Buffer) - prevents generating similar reviews across batches
     neb_enabled: bool = True  # Enable NEB for diversity enforcement
-    neb_depth: int = 3  # How many batches to remember (1-10). Buffer size = neb_depth * request_size
+    neb_depth: int = 0  # How many batches to remember (0=unlimited). Buffer size = neb_depth * request_size
     # Multi-model comparison
     models: Optional[list[str]] = None  # Multiple generation models (when set, overrides `model`)
     parallel_models: bool = False  # Run models concurrently
@@ -197,6 +205,17 @@ def create_job_directory(jobs_dir: str, job_id: str, job_name: str) -> dict[str,
     return paths
 
 
+def _serialize_edge_lengths(edge_lengths) -> Optional[dict]:
+    """Convert EdgeLengths (Pydantic model or dict) to a plain dict for JSON serialization."""
+    if edge_lengths is None:
+        return None
+    if hasattr(edge_lengths, 'model_dump'):
+        return edge_lengths.model_dump()
+    if isinstance(edge_lengths, dict):
+        return edge_lengths
+    return None
+
+
 def save_job_config(
     job_paths: dict,
     job_name: str,
@@ -257,6 +276,7 @@ def save_job_config(
                 "unspecified": config.reviewer_profile.sex_distribution.unspecified,
             } if hasattr(config.reviewer_profile.sex_distribution, 'male') else config.reviewer_profile.sex_distribution,
             "additional_context": getattr(config.reviewer_profile, 'additional_context', ''),
+            "persona_ratio": getattr(config.reviewer_profile, 'persona_ratio', 0.9),
         }
 
     # Add attributes_profile if available
@@ -276,6 +296,7 @@ def save_job_config(
             "length_range": config.attributes_profile.length_range,
             "temperature_range": getattr(config.attributes_profile, 'temp_range', None) or getattr(config.attributes_profile, 'temperature_range', [0.85, 0.95]),
             "cap_weights": getattr(config.attributes_profile, 'cap_weights', None),
+            "edge_lengths": _serialize_edge_lengths(getattr(config.attributes_profile, 'edge_lengths', None)),
         }
 
     # Add generation config if available
@@ -283,7 +304,7 @@ def save_job_config(
         config_data["generation"] = {
             "count": config.generation.count,
             "batch_size": config.generation.batch_size,
-            "request_size": getattr(config.generation, 'request_size', 5),
+            "request_size": getattr(config.generation, 'request_size', 25),
             "model": config.generation.model,
             "provider": config.generation.provider,
             "output_formats": getattr(config.generation, 'output_formats', ["semeval_xml"]),
@@ -291,7 +312,7 @@ def save_job_config(
             "total_runs": getattr(config.generation, 'total_runs', 1),
             # NEB (Negative Example Buffer) settings
             "neb_enabled": getattr(config.generation, 'neb_enabled', True),
-            "neb_depth": getattr(config.generation, 'neb_depth', 3),
+            "neb_depth": getattr(config.generation, 'neb_depth', 0),
         }
 
     # Add ablation settings if provided
@@ -1188,6 +1209,7 @@ async def execute_composition(
                 "preset": config.attributes_profile.noise.preset,
             },
             "length_range": config.attributes_profile.length_range,
+            "edge_lengths": getattr(config.attributes_profile, 'edge_lengths', None) and getattr(config.attributes_profile, 'edge_lengths').model_dump(),
         }
 
         # Save attributes context
@@ -1420,6 +1442,66 @@ async def execute_composition(
             print(f"[Patterns] Warning: Writing pattern generation failed: {e}", flush=True)
             if convex:
                 await convex.add_log(job_id, "WARN", "Patterns", f"Pattern generation failed ({e}), patterns will be omitted from AMLs")
+
+        # ========================================
+        # Phase 6: Structure Variant Generation
+        # ========================================
+        if convex:
+            await convex.update_composition_progress(job_id, 96, "Structures")
+            await convex.add_log(job_id, "INFO", "Structures", "Generating review structure variants...")
+
+        try:
+            from cera.llm.openrouter import OpenRouterClient
+            from cera.prompts import load_prompt, format_prompt
+
+            _llm = OpenRouterClient(api_key=api_key)
+            _gen_model = config.generation.model
+            _domain = subject_context.get("domain", subject_context.get("category", "general"))
+            _region = subject_context.get("region", "unknown")
+
+            reviewer_ctx = reviewers_context.get("additional_context", "general consumer")
+
+            count_mode = getattr(config.generation, 'count_mode', 'reviews')
+            if count_mode == "sentences":
+                length_range = attributes_context["length_range"]
+                avg_sent = (length_range[0] + length_range[1]) / 2
+                target_sent = getattr(config.generation, 'target_sentences', None) or 1000
+                est_reviews = int(target_sent / avg_sent)
+            else:
+                est_reviews = config.generation.count
+            variant_count = max(6, min(30, math.ceil(est_reviews * 0.15)))
+
+            structure_template = load_prompt("composition", "structure_variants")
+            structure_prompt = format_prompt(structure_template,
+                variant_count=variant_count,
+                domain=_domain,
+                subject=subject_context.get("query", ""),
+                region=_region,
+                reviewer_context=reviewer_ctx,
+            )
+
+            response = await _llm.chat(
+                model=_gen_model,
+                messages=[{"role": "user", "content": structure_prompt}],
+                temperature=0.9,
+                max_tokens=4096,
+            )
+
+            structure_variants = _extract_json_from_llm(response, expected_type="array")
+
+            structures_path = Path(job_paths["contexts"]) / "structure-variants.json"
+            with open(structures_path, "w") as f:
+                json.dump(structure_variants, f, indent=2)
+
+            print(f"[Structures] Generated {len(structure_variants)} review structure variants", flush=True)
+            if convex:
+                await convex.update_composition_progress(job_id, 98, "Structures")
+                await convex.add_log(job_id, "INFO", "Structures", f"Generated {len(structure_variants)} review structure variants")
+
+        except Exception as e:
+            print(f"[Structures] Warning: Structure variant generation failed: {e}", flush=True)
+            if convex:
+                await convex.add_log(job_id, "WARN", "Structures", f"Structure generation failed ({e}), structure variants will be omitted from AMLs")
 
         # ========================================
         # Complete composition
@@ -1969,6 +2051,7 @@ async def execute_composition_simple(
             "preset": config.attributes_profile.noise.preset,
         },
         "length_range": config.attributes_profile.length_range,
+        "edge_lengths": getattr(config.attributes_profile, 'edge_lengths', None) and getattr(config.attributes_profile, 'edge_lengths').model_dump(),
     }
 
     # Save attributes context
@@ -2180,6 +2263,61 @@ async def execute_composition_simple(
     except Exception as e:
         print(f"[Patterns] Warning: Writing pattern generation failed: {e}", flush=True)
         await log_progress("Patterns", f"Pattern generation failed ({e}), patterns will be omitted from AMLs", level="WARN")
+
+    # ========================================
+    # Phase 6: Structure Variant Generation
+    # ========================================
+    await log_progress("Structures", "Generating review structure variants...", 96)
+
+    try:
+        from cera.llm.openrouter import OpenRouterClient
+        from cera.prompts import load_prompt, format_prompt
+
+        _llm = OpenRouterClient(api_key=api_key)
+        _gen_model = config.generation.model
+        _domain = subject_context.get("domain", subject_context.get("category", "general"))
+        _region = subject_context.get("region", "unknown")
+
+        reviewer_ctx = reviewers_context.get("additional_context", "general consumer")
+
+        # Generate 8-12 variants depending on review count
+        count_mode = getattr(config.generation, 'count_mode', 'reviews')
+        if count_mode == "sentences":
+            length_range = attributes_context["length_range"]
+            avg_sent = (length_range[0] + length_range[1]) / 2
+            target_sent = getattr(config.generation, 'target_sentences', None) or 1000
+            est_reviews = int(target_sent / avg_sent)
+        else:
+            est_reviews = config.generation.count
+        variant_count = max(6, min(30, math.ceil(est_reviews * 0.15)))
+
+        structure_template = load_prompt("composition", "structure_variants")
+        structure_prompt = format_prompt(structure_template,
+            variant_count=variant_count,
+            domain=_domain,
+            subject=subject_context.get("query", ""),
+            region=_region,
+            reviewer_context=reviewer_ctx,
+        )
+
+        response = await _llm.chat(
+            model=_gen_model,
+            messages=[{"role": "user", "content": structure_prompt}],
+            temperature=0.9,
+            max_tokens=4096,
+        )
+
+        structure_variants = _extract_json_from_llm(response, expected_type="array")
+
+        structures_path = Path(job_paths["contexts"]) / "structure-variants.json"
+        with open(structures_path, "w") as f:
+            json.dump(structure_variants, f, indent=2)
+
+        await log_progress("Structures", f"Generated {len(structure_variants)} review structure variants", 98)
+
+    except Exception as e:
+        print(f"[Structures] Warning: Structure variant generation failed: {e}", flush=True)
+        await log_progress("Structures", f"Structure generation failed ({e}), structure variants will be omitted from AMLs", level="WARN")
 
     await log_progress("ACM", "Composition complete!", 100)
 
@@ -3389,6 +3527,24 @@ def assign_writing_patterns(patterns_data: dict) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def format_structure_variant(variant: dict) -> str:
+    """Format a structure variant dict into the text block for the AML prompt."""
+    parts = []
+    if variant.get("name"):
+        parts.append(f"**Structure: {variant['name']}**")
+    if variant.get("flow"):
+        parts.append(f"- Flow: {variant['flow']}")
+    if variant.get("sentiment_arc"):
+        parts.append(f"- Sentiment arc: {variant['sentiment_arc']}")
+    if variant.get("connectives"):
+        parts.append(f"- Connectives: {variant['connectives']}")
+    if variant.get("evidence"):
+        parts.append(f"- Evidence style: {variant['evidence']}")
+    if variant.get("rhythm"):
+        parts.append(f"- Sentence rhythm: {variant['rhythm']}")
+    return "\n".join(parts) if parts else ""
+
+
 async def execute_generation(
     job_id: str,
     job_dir: str,
@@ -3494,6 +3650,17 @@ async def execute_generation(
             except Exception as e:
                 print(f"[Generation] Warning: Could not load writing patterns: {e}")
 
+        # Load structure variants (generated during composition)
+        structure_variants: list[dict] = []
+        structures_path = contexts_path / "structure-variants.json"
+        if structures_path.exists():
+            try:
+                with open(structures_path) as f:
+                    structure_variants = json.load(f)
+                print(f"[Generation] Loaded {len(structure_variants)} structure variants")
+            except Exception as e:
+                print(f"[Generation] Warning: Could not load structure variants: {e}")
+
         if convex:
             await convex.add_log(job_id, "INFO", "AML", "Starting generation phase...")
             await convex.add_log(job_id, "INFO", "AML", f"Subject: {subject_context.get('query', 'N/A')}")
@@ -3503,6 +3670,8 @@ async def execute_generation(
                 await convex.add_log(job_id, "INFO", "AML", f"Personas loaded: {len(personas_pool)} from pool")
             if writing_patterns:
                 await convex.add_log(job_id, "INFO", "AML", f"Writing patterns loaded: {len(writing_patterns.get('patterns', {}))} categories")
+            if structure_variants:
+                await convex.add_log(job_id, "INFO", "AML", f"Structure variants loaded: {len(structure_variants)} templates")
             await convex.update_progress(job_id, 5, "AML")
 
         # ========================================
@@ -3546,6 +3715,12 @@ async def execute_generation(
         if personas_pool:
             persona_assignments = build_persona_assignments(personas_pool, total_reviews)
             print(f"[Generation] Pre-assigned {len(persona_assignments)} persona slots from pool of {len(personas_pool)}")
+
+        # Pre-assign structure variants to reviews via shuffled round-robin
+        structure_assignments: list[dict] = []
+        if structure_variants:
+            structure_assignments = build_persona_assignments(structure_variants, total_reviews)
+            print(f"[Generation] Pre-assigned {len(structure_assignments)} structure variant slots from pool of {len(structure_variants)}")
 
         # Build model ID - check if model already has provider prefix
         model_name = config.generation.model
@@ -3851,7 +4026,30 @@ Output ONLY the JSON object, no other text."""
             # Use explicitly passed neb_buffer to avoid closure capture issues
             neb_buffer = neb_buffer_param
             async with semaphore:
-                num_sentences = random.randint(length_range[0], length_range[1])
+                # Edge length sampling: range-based probability distribution
+                # minEdge range: [min_length, normal_floor - 1] (floor inclusive, ceiling exclusive of normal)
+                # normal range:  [normal_floor, normal_ceiling] (both inclusive)
+                # maxEdge range: [normal_ceiling + 1, max_length] (floor exclusive of normal, ceiling inclusive)
+                edge_cfg = attributes_context.get("edge_lengths")
+                if edge_cfg:
+                    roll = random.random()
+                    min_chance = edge_cfg.get("min_chance", 0)
+                    max_chance = edge_cfg.get("max_chance", 0)
+                    min_length = edge_cfg.get("min_length", 1)
+                    max_length = edge_cfg.get("max_length", 15)
+                    # Build edge ranges relative to normal length_range
+                    min_edge_floor = min_length
+                    min_edge_ceil = length_range[0] - 1  # exclusive of normal floor
+                    max_edge_floor = length_range[1] + 1  # exclusive of normal ceiling
+                    max_edge_ceil = max_length
+                    if roll < min_chance and min_edge_floor <= min_edge_ceil:
+                        num_sentences = random.randint(min_edge_floor, min_edge_ceil)
+                    elif roll < min_chance + max_chance and max_edge_floor <= max_edge_ceil:
+                        num_sentences = random.randint(max_edge_floor, max_edge_ceil)
+                    else:
+                        num_sentences = random.randint(length_range[0], length_range[1])
+                else:
+                    num_sentences = random.randint(length_range[0], length_range[1])
                 # Sample temperature in 0.1 increments (e.g., 0.7, 0.8, 0.9)
                 temp_steps = [round(temp_range[0] + i * 0.1, 1)
                               for i in range(int((temp_range[1] - temp_range[0]) / 0.1) + 1)]
@@ -3928,6 +4126,11 @@ Output ONLY the JSON object, no other text."""
                 # Assign writing patterns for this review
                 writing_pattern_assignments_str = assign_writing_patterns(writing_patterns)
 
+                # Assign structure variant for this review
+                structure_variant_str = ""
+                if structure_assignments and review_index < len(structure_assignments):
+                    structure_variant_str = format_structure_variant(structure_assignments[review_index])
+
                 # Strip URLs from SIL features for clean Subject Intelligence block
                 features_clean = strip_url_citations(", ".join(review_features)) if review_features else "N/A"
 
@@ -3949,6 +4152,7 @@ Output ONLY the JSON object, no other text."""
                     "opening_directive": opening_directive,
                     "capitalization_style": capitalization_style,
                     "writing_pattern_assignments": writing_pattern_assignments_str,
+                    "structure_variant": structure_variant_str,
                 }
 
                 system_prompt = format_prompt(system_template, **prompt_vars)
@@ -4692,6 +4896,7 @@ async def create_contexts_only(request: CreateContextsOnlyRequest):
             "preset": request.config.attributes_profile.noise.preset,
         },
         "length_range": request.config.attributes_profile.length_range,
+        "edge_lengths": getattr(request.config.attributes_profile, 'edge_lengths', None) and getattr(request.config.attributes_profile, 'edge_lengths').model_dump(),
     }
 
     attributes_context_path = Path(job_paths["contexts"]) / "attributes-context.json"
@@ -4722,6 +4927,32 @@ class HeuristicConfig(BaseModel):
     model: str
     outputFormat: str  # "semeval_xml", "jsonl", "csv"
     totalRuns: int = 1  # Number of times to run generation (for research variability assessment)
+    parallelRuns: bool = True  # Run all runs concurrently
+    knowledgeSourceJobId: Optional[str] = None  # Job ID to import SIL knowledge from
+
+
+def _format_knowledge_for_heuristic(subject_context: dict) -> str:
+    """Format SIL subject-context.json as a knowledge section for heuristic prompts."""
+    sections = []
+
+    sections.append("--- DOMAIN KNOWLEDGE (verified facts from CERA composition) ---")
+
+    if subject_context.get("characteristics"):
+        sections.append("\nVERIFIED DOMAIN FACTS (use ONLY these when mentioning specific technical details, specs, prices, or features — do NOT invent specifications or brand claims outside this list):")
+        for fact in subject_context["characteristics"]:
+            sections.append(f"- {fact}")
+
+    if subject_context.get("positives"):
+        sections.append("\nPOSITIVE FEATURES TO WEAVE IN (for positive/mixed reviews):")
+        for pos in subject_context["positives"]:
+            sections.append(f"- {pos}")
+
+    if subject_context.get("negatives"):
+        sections.append("\nNEGATIVE FEATURES TO WEAVE IN (for negative/mixed reviews):")
+        for neg in subject_context["negatives"]:
+            sections.append(f"- {neg}")
+
+    return "\n".join(sections)
 
 
 class PipelineRequest(BaseModel):
@@ -4871,6 +5102,27 @@ async def execute_heuristic_pipeline(
         if convex:
             await convex.add_log(job_id, "INFO", "Heuristic", f"Target: {total_reviews} reviews in {total_batches} batches")
 
+        # Inject knowledge from source CERA job if provided
+        knowledge_suffix = ""
+        if heuristic_config.knowledgeSourceJobId:
+            source_job_id = heuristic_config.knowledgeSourceJobId
+            source_dirs = list(Path(jobs_directory).glob(f"{source_job_id}-*"))
+            if source_dirs:
+                context_file = source_dirs[0] / "contexts" / "subject-context.json"
+                if context_file.exists():
+                    with open(context_file) as f:
+                        source_context = json.load(f)
+                    knowledge_suffix = "\n\n" + _format_knowledge_for_heuristic(source_context)
+                    if convex:
+                        fact_count = len(source_context.get("characteristics", []))
+                        await convex.add_log(job_id, "INFO", "Heuristic", f"Injected {fact_count} domain facts from knowledge source job")
+                else:
+                    if convex:
+                        await convex.add_log(job_id, "WARN", "Heuristic", f"Knowledge source job directory found but no subject-context.json")
+            else:
+                if convex:
+                    await convex.add_log(job_id, "WARN", "Heuristic", f"Knowledge source job directory not found for {source_job_id}")
+
         # Inject variables into prompt template
         prompt = heuristic_config.prompt
         prompt = prompt.replace("{review_count}", str(heuristic_config.reviewsPerBatch))
@@ -4930,29 +5182,36 @@ Important:
 - A sentence can have zero opinions if it's neutral/general
 Return ONLY the JSON array, no other text, no markdown code blocks."""
 
-        # Multi-run loop
-        for current_run in range(1, total_runs + 1):
-            # Update run progress in Convex
+        # Append domain knowledge from source job (after user prompt + format instructions)
+        if knowledge_suffix:
+            prompt += knowledge_suffix
+
+        # ========================================
+        # Single run coroutine (generation + save + evaluation)
+        # ========================================
+        # GPU evaluation lock — BERTScore/MoverScore need exclusive GPU access
+        eval_lock = asyncio.Lock() if total_runs > 1 else None
+
+        async def execute_single_run(current_run: int) -> Optional[dict]:
+            """Execute one heuristic generation run. Returns metrics dict or None."""
             if convex and total_runs > 1:
-                await convex.update_current_run(job_id, current_run, total_runs)
                 await convex.add_log(job_id, "INFO", "Heuristic", f"Starting run {current_run}/{total_runs}...")
-                # Reset progress for this run
-                await convex.run_mutation("jobs:updateHeuristicProgress", {
-                    "jobId": job_id,
-                    "currentBatch": 0,
-                    "totalBatches": total_batches,
-                    "reviewsCollected": 0,
-                })
+                # Initialize per-run progress
+                if parallel_runs:
+                    await convex.run_mutation("jobs:updateRunProgress", {
+                        "jobId": job_id, "run": current_run, "status": "generating",
+                        "currentBatch": 0, "totalBatches": total_batches, "reviewsCollected": 0,
+                    })
 
             all_reviews = []
             request_size = heuristic_config.requestSize
-            completed_batches = 0
 
             # Single batch generation coroutine
-            async def generate_batch(batch_num: int, semaphore: asyncio.Semaphore) -> list:
-                async with semaphore:
+            async def generate_batch(batch_num: int, sem: asyncio.Semaphore) -> list:
+                async with sem:
                     if convex:
-                        await convex.add_log(job_id, "INFO", "Heuristic", f"Generating batch {batch_num}/{total_batches}...")
+                        run_prefix = f"[Run {current_run}] " if total_runs > 1 else ""
+                        await convex.add_log(job_id, "INFO", "Heuristic", f"{run_prefix}Generating batch {batch_num}/{total_batches}...")
 
                     retries = 0
                     max_retries = 3
@@ -4970,39 +5229,25 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                                 max_tokens=16384,
                             )
 
-                            # Try to extract JSON array from response
-                            content = re.sub(r'```json\s*', '', content)
-                            content = re.sub(r'```\s*', '', content)
-                            content = content.strip()
+                            print(f"[Heuristic] Run {current_run} Batch {batch_num} raw content length: {len(content)}")
 
-                            print(f"[Heuristic] Batch {batch_num} raw content length: {len(content)}")
-                            print(f"[Heuristic] Batch {batch_num} content preview: {content[:500]}...")
+                            # Use robust JSON extraction (handles markdown fences, truncation, trailing commas)
+                            batch_reviews = _extract_json_from_llm(content, expected_type="array")
 
-                            batch_reviews = json.loads(content)
+                            if not batch_reviews:
+                                raise ValueError("Could not extract JSON array from response")
 
-                            if not isinstance(batch_reviews, list):
-                                raise ValueError("Response is not a JSON array")
-
-                            print(f"[Heuristic] Batch {batch_num} parsed {len(batch_reviews)} reviews")
+                            print(f"[Heuristic] Run {current_run} Batch {batch_num} parsed {len(batch_reviews)} reviews")
                             break  # Success
 
                         except (json.JSONDecodeError, ValueError, KeyError) as e:
-                            # Try to recover truncated JSON — find last complete review object
-                            recovered = _recover_truncated_json_array(content if 'content' in dir() else '')
-                            if recovered:
-                                batch_reviews = recovered
-                                print(f"[Heuristic] Batch {batch_num} recovered {len(recovered)} reviews from truncated JSON")
-                                if convex:
-                                    await convex.add_log(job_id, "WARN", "Heuristic", f"Batch {batch_num} truncated — recovered {len(recovered)} reviews")
-                                break
-
                             retries += 1
-                            print(f"[Heuristic] Batch {batch_num} parse error: {str(e)[:200]}")
+                            print(f"[Heuristic] Run {current_run} Batch {batch_num} parse error: {str(e)[:200]}")
                             if convex:
-                                await convex.add_log(job_id, "WARN", "Heuristic", f"Batch {batch_num} parse error (retry {retries}/{max_retries}): {str(e)[:100]}")
+                                await convex.add_log(job_id, "WARN", "Heuristic", f"Run {current_run} Batch {batch_num} parse error (retry {retries}/{max_retries}): {str(e)[:100]}")
                             if retries >= max_retries:
                                 if convex:
-                                    await convex.add_log(job_id, "ERROR", "Heuristic", f"Batch {batch_num} failed after {max_retries} retries")
+                                    await convex.add_log(job_id, "ERROR", "Heuristic", f"Run {current_run} Batch {batch_num} failed after {max_retries} retries")
                                 batch_reviews = []
 
                     return [(batch_num, review) for review in batch_reviews]
@@ -5010,7 +5255,8 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
             # Parallel batch generation with request_size concurrency
             semaphore = asyncio.Semaphore(request_size)
             if convex:
-                await convex.add_log(job_id, "INFO", "Heuristic", f"Parallel generation: {request_size} concurrent requests")
+                run_prefix = f"[Run {current_run}] " if total_runs > 1 else ""
+                await convex.add_log(job_id, "INFO", "Heuristic", f"{run_prefix}Parallel generation: {request_size} concurrent requests")
 
             # Process batches in waves of request_size for progress tracking
             for wave_start in range(1, total_batches + 1, request_size):
@@ -5020,12 +5266,12 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
 
                 for result in wave_results:
                     if isinstance(result, Exception):
-                        print(f"[Heuristic] Batch exception: {result}")
+                        print(f"[Heuristic] Run {current_run} Batch exception: {result}")
                         if convex:
-                            await convex.add_log(job_id, "ERROR", "Heuristic", f"Batch exception: {str(result)[:100]}")
+                            await convex.add_log(job_id, "ERROR", "Heuristic", f"Run {current_run} Batch exception: {str(result)[:100]}")
                         continue
                     for batch_num, review in result:
-                        review_id = f"{job_id}-{len(all_reviews):05d}"
+                        review_id = f"{job_id}-r{current_run}-{len(all_reviews):05d}"
                         if "sentences" in review:
                             all_reviews.append({
                                 "id": review_id,
@@ -5052,14 +5298,23 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                                 "batch": batch_num,
                             })
 
-                completed_batches = wave_end - 1
                 if convex:
-                    await convex.run_mutation("jobs:updateHeuristicProgress", {
-                        "jobId": job_id,
-                        "currentBatch": completed_batches,
-                        "totalBatches": total_batches,
-                        "reviewsCollected": len(all_reviews),
-                    })
+                    completed_batches = min(wave_end - 1, total_batches)
+                    if parallel_runs and total_runs > 1:
+                        # Per-run progress bar
+                        await convex.run_mutation("jobs:updateRunProgress", {
+                            "jobId": job_id, "run": current_run, "status": "generating",
+                            "currentBatch": completed_batches, "totalBatches": total_batches,
+                            "reviewsCollected": len(all_reviews),
+                        })
+                    else:
+                        # Single progress bar (sequential)
+                        await convex.run_mutation("jobs:updateHeuristicProgress", {
+                            "jobId": job_id,
+                            "currentBatch": completed_batches,
+                            "totalBatches": total_batches,
+                            "reviewsCollected": len(all_reviews),
+                        })
 
             # Normalize targets: single-word, lowercase, fix offsets
             for review in all_reviews:
@@ -5068,15 +5323,11 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                     for opinion in sentence.get("opinions", []):
                         target = opinion.get("target")
                         if target and target != "NULL":
-                            # Strip whitespace
                             target = target.strip()
-                            # If multi-word, extract the last word (typically the noun)
                             words = target.split()
                             if len(words) > 1:
                                 target = words[-1]
-                            # Lowercase
                             target = target.lower()
-                            # Recalculate offsets
                             idx = text.lower().find(target)
                             if idx >= 0:
                                 opinion["target"] = target
@@ -5103,15 +5354,12 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
 
             # Save dataset in both explicit and implicit formats
             dataset_dir = Path(job_paths["dataset"])
-
-            # Run suffix for multi-run
             run_suffix = f"-run{current_run}" if total_runs > 1 else ""
 
             def save_absa_dataset(reviews, mode_suffix: str, implicit: bool = False):
                 """Save dataset in ABSA format, optionally converting to implicit (NULL targets)."""
                 output_format = heuristic_config.outputFormat
 
-                # Create copies for implicit if needed
                 if implicit:
                     import copy
                     reviews = copy.deepcopy(reviews)
@@ -5122,16 +5370,13 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                                 opinion["from"] = 0
                                 opinion["to"] = 0
 
-                # Full suffix includes mode and optional run number
                 full_suffix = f"{mode_suffix}{run_suffix}"
 
-                # Save JSONL (always, for internal use)
                 jsonl_path = dataset_dir / f"reviews-{full_suffix}.jsonl"
                 with open(jsonl_path, "w") as f:
                     for review in reviews:
                         f.write(json.dumps(review, ensure_ascii=False) + "\n")
 
-                # Save in requested format
                 if output_format == "csv":
                     import csv as csv_module
                     csv_path = dataset_dir / f"reviews-{full_suffix}.csv"
@@ -5183,48 +5428,65 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                     with open(xml_path, "w", encoding="utf-8") as f:
                         f.write("\n".join(xml_content))
 
-            # Save explicit version (with real targets and offsets)
             save_absa_dataset(all_reviews, "explicit", implicit=False)
-
-            # Save implicit version (targets=NULL, from=0, to=0)
             save_absa_dataset(all_reviews, "implicit", implicit=True)
 
             if convex:
-                await convex.add_log(job_id, "INFO", "Heuristic", f"Dataset saved to {dataset_dir}")
+                await convex.add_log(job_id, "INFO", "Heuristic", f"Run {current_run} dataset saved")
 
             # ========================================
             # Run MDQA Evaluation for this run (if configured)
             # ========================================
+            metrics_result = None
+            if not all_reviews:
+                # No reviews generated — skip evaluation, mark as failed
+                if convex:
+                    await convex.add_log(job_id, "WARN", "Heuristic", f"Run {current_run} produced 0 reviews — skipping evaluation")
+                    if parallel_runs and total_runs > 1:
+                        await convex.run_mutation("jobs:updateRunProgress", {
+                            "jobId": job_id, "run": current_run, "status": "failed",
+                            "currentBatch": total_batches, "totalBatches": total_batches,
+                            "reviewsCollected": 0,
+                        })
+                return None
+
             if evaluation_config and evaluation_config.get("metrics"):
                 if convex:
-                    if current_run == 1:
+                    if not parallel_runs and current_run == 1:
                         await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
                     if total_runs > 1:
                         await convex.add_log(job_id, "INFO", "MDQA", f"Evaluating run {current_run}/{total_runs}...")
+                    # Update per-run status to evaluating
+                    if parallel_runs and total_runs > 1:
+                        await convex.run_mutation("jobs:updateRunProgress", {
+                            "jobId": job_id, "run": current_run, "status": "evaluating",
+                            "currentBatch": total_batches, "totalBatches": total_batches,
+                            "reviewsCollected": len(all_reviews), "evalProgress": 0,
+                        })
 
-                # Use shared execute_evaluation() for consistent metric computation
-                metrics_result = await execute_evaluation(
-                    job_id=job_id,
-                    job_paths=job_paths,
-                    evaluation_config=evaluation_config,
-                    convex=convex,
-                    reviews_data=all_reviews,
-                    run_number=current_run if total_runs > 1 else None,
-                    save_files=(total_runs == 1),  # Only save files for single run; multi-run saves at end
-                )
+                # Serialize GPU evaluations across parallel runs (BERTScore/MoverScore need exclusive GPU)
+                if eval_lock:
+                    await eval_lock.acquire()
+                try:
+                    metrics_result = await execute_evaluation(
+                        job_id=job_id,
+                        job_paths=job_paths,
+                        evaluation_config=evaluation_config,
+                        convex=convex if not parallel_runs else None,
+                        reviews_data=all_reviews,
+                        run_number=current_run if total_runs > 1 else None,
+                        save_files=(total_runs == 1),
+                    )
+                finally:
+                    if eval_lock and eval_lock.locked():
+                        eval_lock.release()
 
-                if metrics_result:
-                    # Save per-run metrics file for multi-run
-                    if total_runs > 1:
-                        metrics_suffix = f"-run{current_run}"
-                        metrics_path = Path(job_paths["metrics"]) / f"mdqa_metrics{metrics_suffix}.json"
-                        with open(metrics_path, "w") as f:
-                            json.dump(metrics_result, f, indent=2)
+                if metrics_result and total_runs > 1:
+                    metrics_path = Path(job_paths["metrics"]) / f"mdqa_metrics-run{current_run}.json"
+                    with open(metrics_path, "w") as f:
+                        json.dump(metrics_result, f, indent=2)
 
-                    all_run_metrics.append(metrics_result)
-
-                    # Save per-run metrics to Convex for multi-run
-                    if total_runs > 1 and convex:
+                    if convex:
                         try:
                             per_run_metrics = {
                                 k: float(round(float(v), 6))
@@ -5240,7 +5502,59 @@ Return ONLY the JSON array, no other text, no markdown code blocks."""
                         except Exception as e:
                             print(f"[Heuristic] Warning: Could not save run {current_run} metrics: {e}")
 
-        # End of multi-run loop
+                # Mark per-run as completed
+                if convex and parallel_runs and total_runs > 1:
+                    await convex.run_mutation("jobs:updateRunProgress", {
+                        "jobId": job_id, "run": current_run, "status": "completed",
+                        "currentBatch": total_batches, "totalBatches": total_batches,
+                        "reviewsCollected": len(all_reviews), "evalProgress": 100,
+                    })
+            elif convex and parallel_runs and total_runs > 1:
+                # No evaluation — mark as completed after generation
+                await convex.run_mutation("jobs:updateRunProgress", {
+                    "jobId": job_id, "run": current_run, "status": "completed",
+                    "currentBatch": total_batches, "totalBatches": total_batches,
+                    "reviewsCollected": len(all_reviews),
+                })
+
+            return metrics_result
+
+        # ========================================
+        # Execute runs (parallel or sequential)
+        # ========================================
+        parallel_runs = heuristic_config.parallelRuns if hasattr(heuristic_config, 'parallelRuns') else True
+
+        if parallel_runs and total_runs > 1:
+            if convex:
+                await convex.add_log(job_id, "INFO", "Heuristic", f"Running {total_runs} runs in parallel...")
+                await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
+            run_results = await asyncio.gather(
+                *[execute_single_run(r) for r in range(1, total_runs + 1)],
+                return_exceptions=True,
+            )
+            for r in run_results:
+                if isinstance(r, Exception):
+                    print(f"[Heuristic] Run exception: {r}")
+                    if convex:
+                        await convex.add_log(job_id, "ERROR", "Heuristic", f"Run exception: {str(r)[:100]}")
+                elif r is not None:
+                    all_run_metrics.append(r)
+        else:
+            # Sequential runs
+            for current_run in range(1, total_runs + 1):
+                if convex and total_runs > 1:
+                    await convex.update_current_run(job_id, current_run, total_runs)
+                    await convex.run_mutation("jobs:updateHeuristicProgress", {
+                        "jobId": job_id,
+                        "currentBatch": 0,
+                        "totalBatches": total_batches,
+                        "reviewsCollected": 0,
+                    })
+                result = await execute_single_run(current_run)
+                if result is not None:
+                    all_run_metrics.append(result)
+
+        # End of multi-run execution
 
         # ========================================
         # Compute average metrics (for multi-run)
@@ -5457,6 +5771,30 @@ async def execute_pipeline(
                     "attributesContext": result.get("attributesContext"),
                 })
                 await convex.add_log(job_id, "INFO", "SIL", "Composition phase complete.")
+
+            # Update config.json with composition metadata
+            try:
+                config_json_path = Path(job_paths["root"]) / "config.json"
+                if config_json_path.exists():
+                    with open(config_json_path, "r") as f:
+                        config_data = json.load(f)
+                    # Count personas
+                    personas_dir = Path(job_paths["root"]) / "reviewer-personas"
+                    persona_count = len(list(personas_dir.glob("*.md"))) if personas_dir.exists() else 0
+                    # Count structure templates
+                    structures_path = Path(job_paths["contexts"]) / "structure-variants.json"
+                    structure_count = 0
+                    if structures_path.exists():
+                        with open(structures_path) as f:
+                            structure_count = len(json.load(f))
+                    config_data["composition_meta"] = {
+                        "persona_count": persona_count,
+                        "structure_template_count": structure_count,
+                    }
+                    with open(config_json_path, "w", encoding="utf-8") as f:
+                        json.dump(config_data, f, indent=2, default=str)
+            except Exception as e:
+                print(f"[Pipeline] Warning: Could not update config.json with composition metadata: {e}", flush=True)
 
         # ========================================
         # Phase 2: GENERATION (AML) - with multi-run support
