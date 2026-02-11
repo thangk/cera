@@ -1,0 +1,21 @@
+{
+  "_comment": "Default domain patterns (fallback when API unavailable). Edit via Dataset Tools > Domain Patterns.",
+  "domains": [
+    {
+      "name": "Restaurant",
+      "keywords": ["FOOD", "SERVICE", "AMBIANCE", "RESTAURANT", "DRINKS", "MENU", "PRICE"]
+    },
+    {
+      "name": "Laptop",
+      "keywords": ["LAPTOP", "DISPLAY", "KEYBOARD", "BATTERY", "PERFORMANCE", "DESIGN", "PORTABILITY"]
+    },
+    {
+      "name": "Electronics",
+      "keywords": ["PHONE", "CAMERA", "SOFTWARE", "HARDWARE", "SCREEN", "CONNECTIVITY"]
+    },
+    {
+      "name": "Hotel",
+      "keywords": ["ROOM", "ROOMS", "CLEANLINESS", "LOCATION", "STAFF", "AMENITIES", "CHECK-IN", "HOTEL", "LOBBY", "BREAKFAST", "BED", "BATHROOM", "POOL", "GYM", "RECEPTION", "HOUSEKEEPING", "FACILITIES"]
+    }
+  ]
+}
