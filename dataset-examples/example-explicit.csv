@@ -1,8 +1,0 @@
-review_id,sentence_id,text,target,category,polarity,from,to
-0,0:0,"The pasta carbonara at Bella Vita was absolutely divine, creamy and perfectly seasoned.",pasta carbonara,FOOD#QUALITY,positive,4,19
-0,0:1,"Our waiter was attentive and friendly, making the dining experience really enjoyable.",waiter,SERVICE#GENERAL,positive,4,10
-1,1:0,"The ambiance was cozy with soft lighting and comfortable seating.",ambiance,AMBIENCE#GENERAL,positive,4,12
-1,1:1,"However, the grilled salmon tasted bland and lacked seasoning.",grilled salmon,FOOD#QUALITY,negative,13,27
-1,1:2,"Prices were reasonable for the portion sizes we received.",Prices,RESTAURANT#PRICES,positive,0,6
-2,2:0,"The service was incredibly slow and our server seemed completely disinterested.",service,SERVICE#GENERAL,negative,4,11
-2,2:1,"Even the house wine tasted like it had been open for days.",house wine,DRINKS#QUALITY,negative,9,19
