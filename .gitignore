@@ -69,4 +69,4 @@ htmlcov/
 .pytype/
 
 # Convex local env
-web/.env.convex
+gui/.env.convex

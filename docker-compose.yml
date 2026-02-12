@@ -78,10 +78,10 @@ services:
               count: all
               capabilities: [gpu]
 
-  # CERA Web GUI
-  web:
+  # CERA GUI
+  gui:
     build:
-      context: ./web
+      context: ./gui
       dockerfile: Dockerfile
       args:
         - VITE_CONVEX_URL=http://localhost:3210
@@ -89,7 +89,7 @@ services:
         - VITE_OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
         - VITE_TAVILY_API_KEY=${TAVILY_API_KEY:-}
         - VITE_CONVEX_ADMIN_KEY=${CONVEX_ADMIN_KEY:-}
-    container_name: web
+    container_name: gui
     ports:
       - "3001:3000"  # Use 3001 to avoid conflict with local dev server
     depends_on:

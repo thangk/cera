@@ -53,7 +53,7 @@
 
 5. **Deploy Convex schema**
    ```bash
-   cd web
+   cd gui
    npm install
    npx convex deploy --url http://localhost:3210 --admin-key YOUR_KEY
    cd ..
@@ -429,7 +429,7 @@ cera/
 │       ├── prompts/         # Prompt templates
 │       ├── models/          # Pydantic models
 │       └── utils/           # Utility functions
-├── web/                     # React frontend (Vite + Convex)
+├── gui/                     # React frontend (Vite + Convex)
 ├── configs/                 # Configuration files
 ├── jobs/                    # Generated job output directories
 ├── output/                  # Dataset outputs
