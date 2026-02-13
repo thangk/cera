@@ -180,7 +180,16 @@ class OpenRouterClient:
             logger.error("openrouter_api_error", model=model_id, error=error_msg)
             raise ValueError(f"OpenRouter API error: {error_msg}")
 
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+        content = message.get("content") or ""
+
+        # Reasoning models (e.g., Perplexity Sonar Reasoning Pro, DeepSeek R1)
+        # may return empty content with output in reasoning fields instead
+        if not content:
+            reasoning_content = message.get("reasoning_content") or message.get("reasoning") or ""
+            if reasoning_content:
+                logger.info("reasoning_model_content_fallback", model=model_id)
+                content = reasoning_content
 
         # Record usage if tracker is available
         if self.usage_tracker:
@@ -245,7 +254,16 @@ class OpenRouterClient:
             logger.error("openrouter_api_error", model=model_id, error=error_msg)
             raise ValueError(f"OpenRouter API error: {error_msg}")
 
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+        content = message.get("content") or ""
+
+        # Reasoning model fallback (same as chat())
+        if not content:
+            reasoning_content = message.get("reasoning_content") or message.get("reasoning") or ""
+            if reasoning_content:
+                logger.info("reasoning_model_content_fallback", model=model_id)
+                content = reasoning_content
+
         usage = data.get("usage")
         gen_id = data.get("id")
         actual_model = data.get("model", model_id)

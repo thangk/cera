@@ -452,13 +452,21 @@ class PipelineExecutor:
         # Get total runs from config (default to 1)
         total_runs = getattr(self.config.generation, 'total_runs', 1) or 1
 
+        # Multi-target support
+        effective_targets = self.config.generation.get_effective_targets() if hasattr(self.config.generation, 'get_effective_targets') else []
+        is_multi_target = len(effective_targets) > 1
+
         # Check if using real LLM or placeholder
         is_placeholder = self.aml._is_placeholder_mode()
         mode_str = "[yellow]placeholder[/yellow]" if is_placeholder else "[green]OpenRouter[/green]"
 
         self.console.print("\n[bold]Starting CERA Pipeline[/bold]")
         self.console.print(f"[dim]Subject: {self.config.subject_profile.query}[/dim]")
-        self.console.print(f"[dim]Count: {self.config.generation.count} reviews[/dim]")
+        if is_multi_target:
+            target_sizes = [f"{t.target_value} {t.count_mode}" for t in effective_targets]
+            self.console.print(f"[dim]Targets: {', '.join(target_sizes)}[/dim]")
+        else:
+            self.console.print(f"[dim]Count: {self.config.generation.count} reviews[/dim]")
         self.console.print(f"[dim]Model: {self.config.generation.provider}/{self.config.generation.model}[/dim]")
         self.console.print(f"[dim]Mode: {mode_str}[/dim]")
         if total_runs > 1:
@@ -468,39 +476,62 @@ class PipelineExecutor:
         all_metrics: list[MDQAMetrics] = []
 
         try:
-            # Phase 1: Composition (runs once regardless of total_runs)
+            # Phase 1: Composition (runs once regardless of total_runs/targets)
             subject_ctx, reviewer_contexts, attrs_ctx = await self._run_composition_phase()
 
-            # Phase 2 & 3: Generation + Evaluation (runs N times)
-            for run in range(1, total_runs + 1):
-                if total_runs > 1:
-                    self.console.print(f"\n[bold yellow]═══ Run {run}/{total_runs} ═══[/bold yellow]")
-                    if run_callback:
-                        run_callback(run, total_runs)
+            # Multi-target loop: iterate over each target size
+            target_list = effective_targets if is_multi_target else [None]
 
-                # Regenerate reviewer profiles for each run to get variability
-                if run > 1:
-                    self.console.print("[dim]  RGM[/dim] Regenerating reviewer profiles...")
-                    reviewer_contexts = self.rgm.generate_profiles(self.config.generation.count)
+            for target_idx, target in enumerate(target_list):
+                # Override config for this target
+                if target and is_multi_target:
+                    self.console.print(f"\n[bold magenta]═══ Target {target_idx+1}/{len(effective_targets)}: "
+                                       f"{target.target_value} {target.count_mode} ═══[/bold magenta]")
+                    # Override generation fields from target
+                    self.config.generation.count_mode = target.count_mode
+                    if target.count_mode == "sentences":
+                        self.config.generation.target_sentences = target.target_value
+                        self.config.generation.count = max(1, target.target_value // 5)
+                    else:
+                        self.config.generation.count = target.target_value
+                        self.config.generation.target_sentences = None
+                    self.config.generation.batch_size = target.batch_size
+                    self.config.generation.request_size = target.request_size
+                    self.config.generation.total_runs = target.total_runs
+                    self.config.generation.neb_enabled = target.neb_depth > 0
+                    self.config.generation.neb_depth = target.neb_depth
+                    total_runs = target.total_runs
 
-                # Generate reviews
-                reviews = await self._run_generation_phase(subject_ctx, reviewer_contexts, attrs_ctx)
+                # Phase 2 & 3: Generation + Evaluation (runs N times per target)
+                for run in range(1, total_runs + 1):
+                    if total_runs > 1:
+                        self.console.print(f"\n[bold yellow]═══ Run {run}/{total_runs} ═══[/bold yellow]")
+                        if run_callback:
+                            run_callback(run, total_runs)
 
-                # Evaluate if not skipped
-                metrics = None
-                if not skip_eval:
-                    metrics = await self._run_evaluation_phase(reviews)
-                    all_metrics.append(metrics)
-                else:
-                    if run == 1:
-                        self.console.print("\n[dim]Skipping evaluation (--skip-eval)[/dim]")
-                    self._update_progress(95, "skipped_eval")
+                    # Regenerate reviewer profiles for each run to get variability
+                    if run > 1:
+                        self.console.print("[dim]  RGM[/dim] Regenerating reviewer profiles...")
+                        reviewer_contexts = self.rgm.generate_profiles(self.config.generation.count)
 
-                # Save output with run number (only if multiple runs)
-                run_number = run if total_runs > 1 else None
-                output_path = self._save_output(reviews, metrics, run_number)
-                output_paths.append(output_path)
-                self.console.print(f"[green]  OK[/green] Saved to {output_path}")
+                    # Generate reviews
+                    reviews = await self._run_generation_phase(subject_ctx, reviewer_contexts, attrs_ctx)
+
+                    # Evaluate if not skipped
+                    metrics = None
+                    if not skip_eval:
+                        metrics = await self._run_evaluation_phase(reviews)
+                        all_metrics.append(metrics)
+                    else:
+                        if run == 1 and target_idx == 0:
+                            self.console.print("\n[dim]Skipping evaluation (--skip-eval)[/dim]")
+                        self._update_progress(95, "skipped_eval")
+
+                    # Save output with run number (only if multiple runs)
+                    run_number = run if total_runs > 1 else None
+                    output_path = self._save_output(reviews, metrics, run_number)
+                    output_paths.append(output_path)
+                    self.console.print(f"[green]  OK[/green] Saved to {output_path}")
 
             # Compute average metrics if multiple runs
             average_metrics = None

@@ -208,7 +208,7 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=1024,  # Reasoning models need headroom for thinking tokens
+                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
             )
 
         # Clean up response - just the query, no quotes or extra text
@@ -255,7 +255,7 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=1024,  # Reasoning models need headroom for thinking tokens
+                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
             )
 
         # Parse JSON response using robust extractor
@@ -306,21 +306,23 @@ class ContextExtractor:
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=1024,  # Reasoning models need headroom for thinking tokens
+                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
             )
 
         # Parse JSON response using robust extractor
         try:
+            if not response:
+                raise ValueError("Model returned empty response")
             from cera.api import _extract_json_from_llm
             result = _extract_json_from_llm(response, expected_type="object")
             region = result.get("region")  # Can be None
             confidence = float(result.get("confidence", 0.0))
             reason = result.get("reason")
-        except Exception:
-            logger.warning("region_extraction_parse_error", response=response[:200])
+        except Exception as e:
+            logger.warning("region_extraction_parse_error", response=(response or "")[:200], error=str(e))
             region = None
             confidence = 0.0
-            reason = "Failed to parse LLM response"
+            reason = "Empty response from model" if not response else "Failed to parse LLM response"
 
         logger.info("region_extracted", region=region, confidence=confidence)
         return {"value": region, "confidence": confidence, "reason": reason}

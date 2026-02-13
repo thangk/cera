@@ -137,6 +137,7 @@ class MAVResult:
     facts_verified: int = 0
     facts_rejected: int = 0
     query_pool_report: Optional[MAVQueryPoolReport] = None
+    verified_facts: Optional[dict] = None  # Entity-clustered facts (verified-facts.json content)
 
 
 class SubjectIntelligenceLayer:
@@ -951,6 +952,357 @@ class SubjectIntelligenceLayer:
                 "use_cases": [],
             }
 
+    # ─── Round 5: Entity Clustering (Multi-Model Consensus) ────────────
+
+    async def _cluster_facts_by_entity(
+        self,
+        model: str,
+        classified: dict[str, list[str]],
+        aspect_categories: list[str],
+        subject: str,
+    ) -> dict:
+        """
+        Round 5a: Single model independently clusters verified facts into entities.
+
+        Args:
+            model: The LLM model to use for clustering
+            classified: Dict with keys: characteristics, positives, negatives, use_cases
+            aspect_categories: List of aspect category strings (e.g., ["DISPLAY#GENERAL", ...])
+            subject: The subject being researched
+
+        Returns:
+            Dict with "entities" array following the verified-facts schema
+        """
+        from cera.llm.openrouter import OpenRouterClient
+
+        # Build facts list from classified data
+        all_facts = []
+        for category, facts in classified.items():
+            for fact in facts:
+                all_facts.append({"category": category, "text": fact})
+
+        if not all_facts:
+            return {"entities": []}
+
+        # Build output schema example
+        output_schema = json.dumps({
+            "entities": [
+                {
+                    "id": "entity-01",
+                    "name": "Entity Name",
+                    "type": "specific",
+                    "description": "Short description of this entity",
+                    "characteristics": ["fact about this entity"],
+                    "positives": ["positive fact"],
+                    "negatives": ["negative fact"],
+                    "applicable_aspects": ["CATEGORY#ATTRIBUTE"]
+                }
+            ]
+        }, indent=2)
+
+        prompt = load_and_format(
+            "sil", "cluster_facts",
+            subject=subject,
+            facts_json=json.dumps(all_facts, indent=2),
+            aspect_categories=json.dumps(aspect_categories, indent=2),
+            output_schema=output_schema,
+        )
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                temperature=0.0,
+            )
+
+        try:
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
+            entities = data.get("entities", [])
+
+            # Validate and assign IDs
+            for i, entity in enumerate(entities):
+                entity["id"] = f"entity-{i+1:02d}" if entity.get("type") != "generic" else "entity-generic"
+                if "type" not in entity:
+                    entity["type"] = "specific"
+                if "characteristics" not in entity:
+                    entity["characteristics"] = []
+                if "positives" not in entity:
+                    entity["positives"] = []
+                if "negatives" not in entity:
+                    entity["negatives"] = []
+                if "applicable_aspects" not in entity:
+                    entity["applicable_aspects"] = []
+
+            return {"entities": entities}
+        except Exception as e:
+            logger.warning(f"Failed to parse clustering from {model}: {e}")
+            # Fallback: single generic entity with all facts
+            return {"entities": [{
+                "id": "entity-generic",
+                "name": subject,
+                "type": "generic",
+                "description": f"All facts about {subject}",
+                "characteristics": classified.get("characteristics", []),
+                "positives": classified.get("positives", []),
+                "negatives": classified.get("negatives", []),
+                "applicable_aspects": aspect_categories,
+            }]}
+
+    async def _judge_clustering(
+        self,
+        judge_model: str,
+        source_model: str,
+        classified: dict[str, list[str]],
+        clustering: dict,
+        subject: str,
+    ) -> dict:
+        """
+        Round 5b: Judge another model's clustering output.
+
+        Args:
+            judge_model: Model doing the judging
+            source_model: Model that produced the clustering
+            classified: Original classified facts
+            clustering: The clustering output to judge
+            subject: The subject being researched
+
+        Returns:
+            Dict with "judgments" array of {entity_id, score, reason}
+        """
+        from cera.llm.openrouter import OpenRouterClient
+
+        # Build original facts for comparison
+        all_facts = []
+        for category, facts in classified.items():
+            for fact in facts:
+                all_facts.append({"category": category, "text": fact})
+
+        prompt = load_and_format(
+            "sil", "judge_clustering",
+            subject=subject,
+            facts_json=json.dumps(all_facts, indent=2),
+            source_model=source_model,
+            clustering_json=json.dumps(clustering, indent=2),
+        )
+
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            response = await client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=judge_model,
+                temperature=0.0,
+            )
+
+        try:
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
+            return {"judgments": data.get("judgments", [])}
+        except Exception as e:
+            logger.warning(f"Failed to parse clustering judgment from {judge_model}: {e}")
+            # Fallback: approve all entities
+            entities = clustering.get("entities", [])
+            return {"judgments": [
+                {"entity_id": e.get("id", f"entity-{i+1:02d}"), "score": 1, "reason": "fallback approval"}
+                for i, e in enumerate(entities)
+            ]}
+
+    def _compute_clustering_consensus(
+        self,
+        all_clusterings: dict[str, dict],
+        all_judgments: dict[str, dict[str, dict]],
+        n_models: int,
+        aspect_categories: list[str],
+        classified: dict[str, list[str]],
+    ) -> dict:
+        """
+        Round 5c: Merge clusterings using point-vote consensus.
+
+        Args:
+            all_clusterings: model_name -> clustering output
+            all_judgments: judge_model -> {source_model -> judgments}
+            n_models: Number of MAV models
+            aspect_categories: Full aspect categories list
+            classified: Original classified facts (for orphan reassignment)
+
+        Returns:
+            Final verified-facts.json content
+        """
+        min_votes = ceil(2 / 3 * (n_models - 1)) if n_models > 2 else 1
+
+        # ─── Score each entity across all models ───────────────
+        # For each source model's entities, count approval votes from judges
+        passing_entities: list[dict] = []  # Entities that pass judging
+        rejected_entities: list[dict] = []
+
+        for source_model, clustering in all_clusterings.items():
+            for entity in clustering.get("entities", []):
+                entity_id = entity.get("id", "")
+                votes = 0
+
+                # Count votes from all judges (excluding self)
+                for judge_model, source_judgments in all_judgments.items():
+                    if judge_model == source_model:
+                        continue
+                    judgments_for_source = source_judgments.get(source_model, {})
+                    judgment_list = judgments_for_source.get("judgments", [])
+                    for j in judgment_list:
+                        if j.get("entity_id") == entity_id and j.get("score", 0) == 1:
+                            votes += 1
+
+                if votes >= min_votes:
+                    passing_entities.append({**entity, "_source": source_model, "_votes": votes})
+                else:
+                    rejected_entities.append({**entity, "_source": source_model})
+
+        # ─── Deduplicate passing entities across models ────────
+        # Match entities by name similarity across models
+        final_entities: list[dict] = []
+        used_indices = set()
+
+        for i, entity_a in enumerate(passing_entities):
+            if i in used_indices:
+                continue
+
+            # Find duplicates of this entity across other models
+            group = [entity_a]
+            used_indices.add(i)
+
+            for j, entity_b in enumerate(passing_entities):
+                if j in used_indices:
+                    continue
+                if entity_a.get("_source") == entity_b.get("_source"):
+                    continue  # Same model, skip
+
+                # Compare entity names by semantic similarity
+                sim = self._compute_similarity(
+                    entity_a.get("name", ""),
+                    entity_b.get("name", ""),
+                )
+                if sim >= 0.80:
+                    group.append(entity_b)
+                    used_indices.add(j)
+
+            # If entity appears in >= 2 models' outputs, include it
+            source_models = set(e.get("_source") for e in group)
+            if len(source_models) >= 2 or n_models == 1:
+                # Pick the most complete version (most facts + aspects)
+                best = max(group, key=lambda e: (
+                    len(e.get("characteristics", [])) +
+                    len(e.get("positives", [])) +
+                    len(e.get("negatives", [])) +
+                    len(e.get("applicable_aspects", []))
+                ))
+                # Clean internal tracking fields
+                clean = {k: v for k, v in best.items() if not k.startswith("_")}
+                final_entities.append(clean)
+            else:
+                # Single-model entity that passed judging — still include if solo
+                # but only if no better alternative exists
+                rejected_entities.extend(group)
+
+        # ─── Handle edge case: no entities passed ─────────────
+        if not final_entities:
+            # Fallback: use the clustering with the most approvals
+            best_source = max(
+                all_clusterings.keys(),
+                key=lambda m: sum(
+                    1 for e in all_clusterings[m].get("entities", [])
+                    for judge, sj in all_judgments.items()
+                    if judge != m
+                    for j in sj.get(m, {}).get("judgments", [])
+                    if j.get("entity_id") == e.get("id") and j.get("score", 0) == 1
+                ),
+            )
+            final_entities = [
+                {k: v for k, v in e.items() if not k.startswith("_")}
+                for e in all_clusterings[best_source].get("entities", [])
+            ]
+
+        # ─── Reassign orphaned facts ──────────────────────────
+        # Collect all facts that are covered by final entities
+        covered_facts = set()
+        for entity in final_entities:
+            for fact in entity.get("characteristics", []):
+                covered_facts.add(fact)
+            for fact in entity.get("positives", []):
+                covered_facts.add(fact)
+            for fact in entity.get("negatives", []):
+                covered_facts.add(fact)
+
+        # Find orphaned facts from the original classified data
+        all_original_facts = (
+            classified.get("characteristics", []) +
+            classified.get("positives", []) +
+            classified.get("negatives", [])
+        )
+        orphans = [f for f in all_original_facts if f not in covered_facts]
+
+        if orphans:
+            # Find or create a generic entity for orphans
+            generic = next((e for e in final_entities if e.get("type") == "generic"), None)
+            if generic is None:
+                generic = {
+                    "id": "entity-generic",
+                    "name": "General observations",
+                    "type": "generic",
+                    "description": "Domain-level observations not tied to a specific entity",
+                    "characteristics": [],
+                    "positives": [],
+                    "negatives": [],
+                    "applicable_aspects": [],
+                }
+                final_entities.append(generic)
+
+            # Assign orphans to generic entity by their original category
+            for orphan in orphans:
+                if orphan in classified.get("positives", []):
+                    generic["positives"].append(orphan)
+                elif orphan in classified.get("negatives", []):
+                    generic["negatives"].append(orphan)
+                else:
+                    generic["characteristics"].append(orphan)
+
+        # ─── Aspect consensus: keep aspects agreed by ≥2 models ──
+        if n_models >= 2:
+            for entity in final_entities:
+                entity_name = entity.get("name", "")
+                # Collect aspects from matching entities across models
+                aspect_votes: dict[str, int] = {}
+                for source_model, clustering in all_clusterings.items():
+                    for src_entity in clustering.get("entities", []):
+                        sim = self._compute_similarity(entity_name, src_entity.get("name", ""))
+                        if sim >= 0.80 or entity_name == src_entity.get("name"):
+                            for aspect in src_entity.get("applicable_aspects", []):
+                                aspect_votes[aspect] = aspect_votes.get(aspect, 0) + 1
+
+                # Keep aspects with ≥2 votes (or ≥1 if only 1 model)
+                min_aspect_votes = min(2, n_models)
+                consensus_aspects = [
+                    asp for asp, count in aspect_votes.items()
+                    if count >= min_aspect_votes
+                ]
+                if consensus_aspects:
+                    entity["applicable_aspects"] = consensus_aspects
+                # If no aspects pass consensus, keep existing (from best entity)
+
+        # ─── Reassign entity IDs ──────────────────────────────
+        specific_count = 0
+        generic_count = 0
+        for entity in final_entities:
+            if entity.get("type") == "generic":
+                entity["id"] = f"entity-generic" if generic_count == 0 else f"entity-generic-{generic_count + 1}"
+                generic_count += 1
+            else:
+                specific_count += 1
+                entity["id"] = f"entity-{specific_count:02d}"
+
+        return {
+            "entities": final_entities,
+            "total_entities": len(final_entities),
+            "specific_count": specific_count,
+            "generic_count": generic_count,
+        }
+
     # ─── Utility Methods ────────────────────────────────────────────────
 
     async def _search_with_tavily(
@@ -1006,9 +1358,10 @@ class SubjectIntelligenceLayer:
         domain: str = "general",
         sentiment_depth: str = "praise and complain",
         additional_context: Optional[str] = None,
+        aspect_categories: Optional[list[str]] = None,
     ) -> MAVResult:
         """
-        Gather intelligence using the 4-round query-based MAV protocol.
+        Gather intelligence using the 5-round query-based MAV protocol.
 
         Round 1: Each model researches subject and generates neutral factual queries
         Round 2: All queries pooled, deduplicated, and capped
@@ -1319,6 +1672,78 @@ class SubjectIntelligenceLayer:
             n_cons = len(classified.get("negatives", []))
             await self._emit_log("INFO", "SIL", f"Classification complete: {n_features} features, {n_pros} pros, {n_cons} cons")
 
+            # ─── ROUND 5: Entity Clustering (multi-model consensus) ──
+            verified_facts = None
+            if aspect_categories:
+                await self._emit_log("INFO", "SIL", "Round 5: Clustering facts by entity...", progress=42)
+
+                # 5a: Each model clusters independently (parallel)
+                clustering_tasks = [
+                    self._cluster_facts_by_entity(model, classified, aspect_categories, query)
+                    for model in responding_models
+                ]
+                clustering_results = await asyncio.gather(*clustering_tasks, return_exceptions=True)
+
+                all_clusterings: dict[str, dict] = {}
+                for model, result in zip(responding_models, clustering_results):
+                    if isinstance(result, Exception):
+                        logger.warning(f"Clustering failed for {model}: {result}")
+                    else:
+                        all_clusterings[model] = result
+
+                if len(all_clusterings) >= 2:
+                    await self._emit_log("INFO", "SIL", f"Round 5a: {len(all_clusterings)} models produced clusterings, judging...", progress=44)
+
+                    # 5b: Cross-model judging (parallel)
+                    judge_tasks = []
+                    judge_pairs = []  # Track (judge, source) for each task
+                    for judge in all_clusterings:
+                        for source in all_clusterings:
+                            if judge != source:
+                                judge_tasks.append(
+                                    self._judge_clustering(judge, source, classified, all_clusterings[source], query)
+                                )
+                                judge_pairs.append((judge, source))
+
+                    judgment_results = await asyncio.gather(*judge_tasks, return_exceptions=True)
+
+                    # Restructure into judge -> {source -> judgments}
+                    structured_judgments: dict[str, dict[str, dict]] = {}
+                    for (judge, source), result in zip(judge_pairs, judgment_results):
+                        if isinstance(result, Exception):
+                            logger.warning(f"Judging failed for {judge} -> {source}: {result}")
+                            continue
+                        structured_judgments.setdefault(judge, {})[source] = result
+
+                    await self._emit_log("INFO", "SIL", "Round 5c: Computing entity consensus...", progress=46)
+
+                    # 5c: Consensus
+                    verified_facts = self._compute_clustering_consensus(
+                        all_clusterings, structured_judgments, len(all_clusterings),
+                        aspect_categories, classified,
+                    )
+
+                    n_entities = verified_facts.get("total_entities", 0)
+                    n_specific = verified_facts.get("specific_count", 0)
+                    n_generic = verified_facts.get("generic_count", 0)
+                    await self._emit_log(
+                        "INFO", "SIL",
+                        f"Entity clustering complete: {n_entities} entities ({n_specific} specific, {n_generic} generic)",
+                        progress=48,
+                    )
+
+                elif len(all_clusterings) == 1:
+                    # Single model produced clustering — use it directly (no judging)
+                    single_model = list(all_clusterings.keys())[0]
+                    verified_facts = all_clusterings[single_model]
+                    verified_facts.setdefault("total_entities", len(verified_facts.get("entities", [])))
+                    verified_facts.setdefault("specific_count", sum(1 for e in verified_facts.get("entities", []) if e.get("type") != "generic"))
+                    verified_facts.setdefault("generic_count", sum(1 for e in verified_facts.get("entities", []) if e.get("type") == "generic"))
+                    await self._emit_log("WARN", "SIL", f"Only 1 model produced clustering — using {single_model}'s output directly")
+
+                else:
+                    await self._emit_log("WARN", "SIL", "No models produced valid clusterings — skipping entity clustering")
+
             context = SubjectContext(
                 subject=query,
                 features=classified["characteristics"],
@@ -1336,6 +1761,7 @@ class SubjectIntelligenceLayer:
                 facts_verified=len(verified_results),
                 facts_rejected=len(unverified_results),
                 query_pool_report=report,
+                verified_facts=verified_facts,
             )
 
         # Fallback: Single model extraction without MAV
