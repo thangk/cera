@@ -480,8 +480,8 @@ Synthetic LLM-generated data achieves **up to 93.2%** of real human-annotated da
 
 ## Related Projects
 
-- [LADy-kap](https://github.com/thangk/LADy-kap) - Latent Aspect Detection toolkit
-- [LADy](https://github.com/fani-lab/LADy) - Original LADy framework
+- [cera-LADy](https://github.com/thangk/cera-LADy) — Latent Aspect Detection evaluation framework for benchmarking CERA datasets
+- [LADy](https://github.com/fani-lab/LADy) — Original LADy framework by fani-lab
 
 ---
 
