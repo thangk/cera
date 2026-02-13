@@ -31,6 +31,7 @@ import {
 } from 'lucide-react'
 
 import { useOpenRouterModels, type ProcessedModel } from '../hooks/use-openrouter-models'
+import { usePocketBaseProgress } from '../hooks/use-pocketbase'
 import { PYTHON_API_URL } from '../lib/api-urls'
 
 import { Button } from '../components/ui/button'
@@ -185,8 +186,32 @@ function PhaseTab({
 
 function JobDetailPage() {
   const { jobId } = Route.useParams()
-  const job = useQuery(api.jobs.get, { id: jobId as Id<'jobs'> })
+  const convexJob = useQuery(api.jobs.get, { id: jobId as Id<'jobs'> })
+  const pbProgress = usePocketBaseProgress(jobId)
   const dataset = useQuery(api.datasets.getByJob, { jobId: jobId as Id<'jobs'> })
+
+  // Merge PocketBase real-time progress with Convex job state.
+  // PocketBase handles high-frequency updates (progress, counts) for smooth animations.
+  // Convex remains source of truth for job config, status transitions, and final metrics.
+  const job = useMemo(() => {
+    if (!convexJob) return convexJob
+    const isActive = ['composing', 'running', 'evaluating'].includes(convexJob.status)
+    if (!isActive || !pbProgress) return convexJob
+    return {
+      ...convexJob,
+      progress: pbProgress.progress ?? convexJob.progress,
+      currentPhase: pbProgress.current_phase || convexJob.currentPhase,
+      generatedCount: pbProgress.generated_count ?? convexJob.generatedCount,
+      generatedSentences: pbProgress.generated_sentences ?? convexJob.generatedSentences,
+      failedCount: pbProgress.failed_count ?? convexJob.failedCount,
+      currentRun: pbProgress.current_run ?? convexJob.currentRun,
+      totalRuns: pbProgress.total_runs ?? convexJob.totalRuns,
+      modelProgress: pbProgress.model_progress ?? convexJob.modelProgress,
+      targetProgress: pbProgress.target_progress ?? (convexJob as any).targetProgress,
+      runProgress: pbProgress.run_progress ?? (convexJob as any).runProgress,
+      heuristicProgress: pbProgress.heuristic_progress ?? (convexJob as any).heuristicProgress,
+    }
+  }, [convexJob, pbProgress])
 
   // OpenRouter models for rich MAV display
   const { models: rawModels, processedModels } = useOpenRouterModels()

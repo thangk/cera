@@ -22,3 +22,4 @@ function resolveUrl(envUrl: string): string {
 
 export const CONVEX_URL = resolveUrl(import.meta.env.VITE_CONVEX_URL as string)
 export const PYTHON_API_URL = resolveUrl(import.meta.env.VITE_PYTHON_API_URL as string)
+export const POCKETBASE_URL = resolveUrl((import.meta.env.VITE_POCKETBASE_URL as string) || 'http://localhost:8090')

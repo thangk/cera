@@ -1,10 +1,8 @@
 import { useCallback, useRef } from 'react'
 import { ChevronDown, ChevronUp, Copy, Check } from 'lucide-react'
-import { useQuery } from 'convex/react'
-import { api } from '../../../convex/_generated/api'
-import type { Id } from '../../../convex/_generated/dataModel'
 import { LogStream } from './log-stream'
 import { useLogPanel, PHASE_LOG_FILTERS, type LogTab } from '@/hooks/use-log-panel'
+import { usePocketBaseLogs } from '@/hooks/use-pocketbase'
 import { useState } from 'react'
 
 // Phase color definitions (matching job detail page)
@@ -16,7 +14,7 @@ const PHASE_COLORS: Record<LogTab, { strong: string; light: string }> = {
 }
 
 interface PhaseLogPanelProps {
-  jobId: Id<'jobs'>
+  jobId: string
   /** Sync panel's active tab with the main phase tab */
   activePhaseTab?: LogTab
   /** Which phases are enabled for this job */
@@ -61,12 +59,8 @@ export function PhaseLogPanel({
   // Get phases to filter by based on active tab
   const phasesToFilter = PHASE_LOG_FILTERS[activeLogTab]
 
-  // Query logs with optional phase filtering
-  const logs = useQuery(api.logs.getByJobFiltered, {
-    jobId,
-    phases: phasesToFilter,
-    limit: 500,
-  })
+  // Real-time logs via PocketBase SSE (fast updates, no Convex mutation overhead)
+  const logs = usePocketBaseLogs(jobId, phasesToFilter)
 
   // Handle resize via pointer events
   const handleResizeStart = useCallback(
