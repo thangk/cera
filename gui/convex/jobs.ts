@@ -1227,21 +1227,23 @@ export const saveTargetMetrics = mutation({
     if (!job) throw new Error("Job not found");
 
     const existing = (job.perTargetMetrics as any[]) || [];
-    const entry = {
+    // Build entry from provided args only (undefined fields left out)
+    const entry: Record<string, unknown> = {
       targetIndex: args.targetIndex,
       targetLabel: args.targetLabel,
       targetValue: args.targetValue,
       countMode: args.countMode,
-      metrics: args.metrics,
-      perModelMetrics: args.perModelMetrics,
-      conformity: args.conformity,
-      perRunMetrics: args.perRunMetrics,
-      averageMetrics: args.averageMetrics,
     };
+    if (args.metrics !== undefined) entry.metrics = args.metrics;
+    if (args.perModelMetrics !== undefined) entry.perModelMetrics = args.perModelMetrics;
+    if (args.conformity !== undefined) entry.conformity = args.conformity;
+    if (args.perRunMetrics !== undefined) entry.perRunMetrics = args.perRunMetrics;
+    if (args.averageMetrics !== undefined) entry.averageMetrics = args.averageMetrics;
 
     const idx = existing.findIndex((e) => e.targetIndex === args.targetIndex);
     if (idx >= 0) {
-      existing[idx] = entry;
+      // Merge: preserve existing fields, override with new ones
+      existing[idx] = { ...existing[idx], ...entry };
     } else {
       existing.push(entry);
     }
