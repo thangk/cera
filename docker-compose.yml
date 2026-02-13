@@ -42,6 +42,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # PocketBase - Fast real-time progress updates & logs
+  pocketbase:
+    build:
+      context: ./pocketbase
+      dockerfile: Dockerfile
+    container_name: pocketbase
+    ports:
+      - "8090:8090"  # REST API + Admin UI + SSE
+    volumes:
+      - pocketbase_data:/pb/pb_data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8090/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # CERA Python CLI/API
   cli:
     build:
@@ -54,6 +71,7 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - CONVEX_URL=http://convex:3210
+      - POCKETBASE_URL=http://pocketbase:8090
     volumes:
       - ./output:/app/output
       - ./configs:/app/configs
@@ -89,6 +107,7 @@ services:
         - VITE_OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
         - VITE_TAVILY_API_KEY=${TAVILY_API_KEY:-}
         - VITE_CONVEX_ADMIN_KEY=${CONVEX_ADMIN_KEY:-}
+        - VITE_POCKETBASE_URL=http://localhost:8090
     container_name: gui
     ports:
       - "3001:3000"  # Use 3001 to avoid conflict with local dev server
@@ -101,6 +120,7 @@ services:
 
 volumes:
   convex_data:
+  pocketbase_data:
 
 # ===========================================
 # CERA Full Stack with Self-Hosted Convex
@@ -114,6 +134,7 @@ volumes:
 #    - Python API:       http://localhost:8000
 #    - Convex Backend:   http://localhost:3210
 #    - Convex Dashboard: http://localhost:6791
+#    - PocketBase:       http://localhost:8090
 #
 # CLI COMMANDS:
 # -------------

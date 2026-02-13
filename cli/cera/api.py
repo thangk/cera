@@ -7,6 +7,7 @@ from typing import Optional, Union
 import httpx
 import asyncio
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -506,13 +507,120 @@ async def check_openrouter_tier(api_key: str) -> dict:
     }
 
 
+class PocketBaseClient:
+    """Client for fast real-time progress updates via PocketBase SSE."""
+
+    def __init__(self, url: str):
+        self.url = url.rstrip("/")
+        self.client = httpx.AsyncClient(timeout=5.0)
+        self._records: dict[str, str] = {}   # job_id -> PB record ID
+        self._state: dict[str, dict] = {}    # job_id -> current progress state
+
+    async def update(self, job_id: str, **fields):
+        """Update progress fields. Merges into local state and PATCHes PocketBase."""
+        state = self._state.setdefault(job_id, {})
+        state.update(fields)
+        state["job_id"] = job_id
+
+        record_id = self._records.get(job_id)
+        try:
+            if record_id:
+                resp = await self.client.patch(
+                    f"{self.url}/api/collections/job_progress/records/{record_id}",
+                    json=state,
+                )
+                if resp.status_code == 404:
+                    # Record was deleted (e.g. cleanup), recreate
+                    self._records.pop(job_id, None)
+                    record_id = None
+            if not record_id:
+                # Try to find existing record
+                resp = await self.client.get(
+                    f"{self.url}/api/collections/job_progress/records",
+                    params={"filter": f'job_id="{job_id}"', "perPage": 1},
+                )
+                if resp.status_code == 200:
+                    items = resp.json().get("items", [])
+                    if items:
+                        record_id = items[0]["id"]
+                        self._records[job_id] = record_id
+                        await self.client.patch(
+                            f"{self.url}/api/collections/job_progress/records/{record_id}",
+                            json=state,
+                        )
+                    else:
+                        resp = await self.client.post(
+                            f"{self.url}/api/collections/job_progress/records",
+                            json=state,
+                        )
+                        if resp.status_code == 200:
+                            self._records[job_id] = resp.json()["id"]
+        except Exception as e:
+            print(f"[PocketBase] Warning: progress update failed: {e}")
+
+    async def add_log(self, job_id: str, level: str, phase: str, message: str):
+        """Append a log entry to PocketBase (fast SQLite INSERT + SSE push)."""
+        try:
+            await self.client.post(
+                f"{self.url}/api/collections/job_logs/records",
+                json={"job_id": job_id, "level": level, "phase": phase, "message": message},
+            )
+        except Exception as e:
+            print(f"[PocketBase] Warning: log write failed: {e}")
+
+    async def cleanup(self, job_id: str):
+        """Delete progress record for a completed job."""
+        record_id = self._records.pop(job_id, None)
+        self._state.pop(job_id, None)
+        if record_id:
+            try:
+                await self.client.delete(
+                    f"{self.url}/api/collections/job_progress/records/{record_id}",
+                )
+            except Exception:
+                pass
+
+    def get_state(self, job_id: str) -> dict:
+        """Get current local progress state for final sync."""
+        return self._state.get(job_id, {})
+
+    async def fetch_state(self, job_id: str) -> dict:
+        """Fetch actual progress state from PocketBase DB (not local cache).
+        Used by complete_job to get the real values written by all client instances."""
+        try:
+            resp = await self.client.get(
+                f"{self.url}/api/collections/job_progress/records",
+                params={"filter": f'job_id="{job_id}"', "perPage": 1},
+            )
+            if resp.status_code == 200:
+                items = resp.json().get("items", [])
+                if items:
+                    return items[0]
+        except Exception:
+            pass
+        return self._state.get(job_id, {})
+
+
 class ConvexClient:
     """Client for updating Convex database from Python."""
 
-    def __init__(self, url: str, token: str):
+    # Progress-related mutations routed to PocketBase when available
+    _PB_ROUTED_MUTATIONS = {
+        "jobs:updateHeuristicProgress",
+        "jobs:updateRunProgress",
+        "jobs:updateTargetProgress",
+    }
+
+    def __init__(self, url: str, token: str, pocketbase_url: str = None):
         self.url = url
         self.token = token
         self.client = httpx.AsyncClient()
+        self.pb = PocketBaseClient(pocketbase_url) if pocketbase_url else None
+
+    @property
+    def has_fast_updates(self) -> bool:
+        """True when PocketBase is available for high-frequency progress updates."""
+        return self.pb is not None
 
     async def get_job(self, job_id: str) -> Optional[dict]:
         """Fetch job data from Convex (public query, no auth needed)."""
@@ -578,7 +686,10 @@ class ConvexClient:
                 print(f"Warning: Failed to start composing in Convex: {e}")
 
     async def update_composition_progress(self, job_id: str, progress: int, phase: str):
-        """Update composition progress in Convex."""
+        """Update composition progress. Routes to PocketBase when available."""
+        if self.pb:
+            await self.pb.update(job_id, progress=progress, current_phase=phase)
+            return
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -596,7 +707,6 @@ class ConvexClient:
                 },
             )
             response.raise_for_status()
-            # Check for Convex-level errors in the response
             result = response.json()
             if result.get("status") == "error":
                 print(f"Warning: Convex mutation error: {result.get('errorMessage', 'Unknown error')}")
@@ -622,9 +732,11 @@ class ConvexClient:
             print(f"Warning: Failed to complete composition in Convex: {e}")
 
     async def update_progress(self, job_id: str, progress: int, phase: str):
-        """Update job progress in Convex."""
+        """Update job progress. Routes to PocketBase when available."""
+        if self.pb:
+            await self.pb.update(job_id, progress=progress, current_phase=phase)
+            return
         try:
-            # Convex HTTP API for mutations (self-hosted uses "Convex" auth scheme)
             response = await self.client.post(
                 f"{self.url}/api/mutation",
                 headers={
@@ -645,7 +757,10 @@ class ConvexClient:
             print(f"Warning: Failed to update Convex progress: {e}")
 
     async def add_log(self, job_id: str, level: str, phase: str, message: str):
-        """Add a log entry in Convex."""
+        """Add a log entry. Routes to PocketBase when available."""
+        if self.pb:
+            await self.pb.add_log(job_id, level, phase, message)
+            return
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -684,6 +799,50 @@ class ConvexClient:
             response.raise_for_status()
         except Exception as e:
             print(f"Warning: Failed to complete Convex job: {e}")
+        # Sync final progress snapshot to Convex and clean up PocketBase
+        if self.pb:
+            # fetch_state reads from PB's REST API (not local cache) to get
+            # values written by ALL ConvexClient instances (generation spawns
+            # separate clients per target/run, each with its own local _state)
+            state = await self.pb.fetch_state(job_id)
+            headers = {"Authorization": f"Convex {self.token}", "Content-Type": "application/json"}
+            # Sync counts
+            for field, path in [
+                ("generated_count", "jobs:updateGeneratedCount"),
+                ("generated_sentences", "jobs:updateGeneratedSentences"),
+            ]:
+                if state.get(field):
+                    try:
+                        await self.client.post(
+                            f"{self.url}/api/mutation", headers=headers,
+                            json={"path": path, "args": {"jobId": job_id, "count": state[field]}},
+                        )
+                    except Exception:
+                        pass
+            # Sync currentRun/totalRuns so completed jobs show correct run counter
+            if state.get("current_run") and state.get("total_runs"):
+                try:
+                    await self.client.post(
+                        f"{self.url}/api/mutation", headers=headers,
+                        json={"path": "jobs:updateCurrentRun", "args": {
+                            "jobId": job_id,
+                            "currentRun": state["current_run"],
+                            "totalRuns": state["total_runs"],
+                        }},
+                    )
+                except Exception:
+                    pass
+            # Sync target_progress so completed jobs show correct target statuses
+            if state.get("target_progress"):
+                for tp in state["target_progress"]:
+                    try:
+                        await self.client.post(
+                            f"{self.url}/api/mutation", headers=headers,
+                            json={"path": "jobs:updateTargetProgress", "args": {**tp, "jobId": job_id}},
+                        )
+                    except Exception:
+                        pass
+            await self.pb.cleanup(job_id)
 
     async def fail_job(self, job_id: str, error: str):
         """Mark job as failed in Convex."""
@@ -702,9 +861,15 @@ class ConvexClient:
             response.raise_for_status()
         except Exception as e:
             print(f"Warning: Failed to fail Convex job: {e}")
+        # Clean up PocketBase on failure too
+        if self.pb:
+            await self.pb.cleanup(job_id)
 
     async def run_mutation(self, path: str, args: dict):
-        """Run an arbitrary Convex mutation."""
+        """Run an arbitrary Convex mutation. Routes progress mutations to PocketBase."""
+        if self.pb and path in self._PB_ROUTED_MUTATIONS:
+            await self._route_progress_mutation(path, args)
+            return None
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -720,8 +885,47 @@ class ConvexClient:
             print(f"Warning: Failed to run Convex mutation {path}: {e}")
             return None
 
+    async def _route_progress_mutation(self, path: str, args: dict):
+        """Route progress-related mutations to PocketBase."""
+        job_id = args.get("jobId", "")
+        fields = {k: v for k, v in args.items() if k != "jobId"}
+
+        if path == "jobs:updateHeuristicProgress":
+            await self.pb.update(job_id, heuristic_progress=fields)
+
+        elif path == "jobs:updateRunProgress":
+            state = self.pb._state.setdefault(job_id, {})
+            runs = state.get("run_progress") or []
+            run_num = args.get("run")
+            found = False
+            for r in runs:
+                if r.get("run") == run_num:
+                    r.update(fields)
+                    found = True
+                    break
+            if not found:
+                runs.append(fields)
+            await self.pb.update(job_id, run_progress=runs)
+
+        elif path == "jobs:updateTargetProgress":
+            state = self.pb._state.setdefault(job_id, {})
+            targets = state.get("target_progress") or []
+            idx = args.get("targetIndex")
+            found = False
+            for t in targets:
+                if t.get("targetIndex") == idx:
+                    t.update(fields)
+                    found = True
+                    break
+            if not found:
+                targets.append(fields)
+            await self.pb.update(job_id, target_progress=targets)
+
     async def update_generated_count(self, job_id: str, count: int):
-        """Update the generated review count in Convex."""
+        """Update the generated review count. Routes to PocketBase when available."""
+        if self.pb:
+            await self.pb.update(job_id, generated_count=count)
+            return
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -739,7 +943,10 @@ class ConvexClient:
             print(f"Warning: Failed to update Convex generated count: {e}")
 
     async def update_failed_count(self, job_id: str, count: int):
-        """Update the failed review count in Convex."""
+        """Update the failed review count. Routes to PocketBase when available."""
+        if self.pb:
+            await self.pb.update(job_id, failed_count=count)
+            return
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -757,7 +964,10 @@ class ConvexClient:
             print(f"Warning: Failed to update Convex failed count: {e}")
 
     async def update_generated_sentences(self, job_id: str, count: int):
-        """Update the generated sentence count in Convex (for sentence mode)."""
+        """Update the generated sentence count. Routes to PocketBase when available."""
+        if self.pb:
+            await self.pb.update(job_id, generated_sentences=count)
+            return
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -918,7 +1128,25 @@ class ConvexClient:
         generated: int, failed: int, target: int, progress: int,
         status: str, eval_progress: int = 0,
     ):
-        """Update per-model progress for multi-model jobs."""
+        """Update per-model progress. Routes to PocketBase when available."""
+        if self.pb:
+            entry = {
+                "model": model, "modelSlug": model_slug,
+                "generated": generated, "failed": failed, "target": target,
+                "progress": progress, "status": status, "evalProgress": eval_progress,
+            }
+            state = self.pb._state.setdefault(job_id, {})
+            models = state.get("model_progress") or []
+            found = False
+            for m in models:
+                if m.get("model") == model:
+                    m.update(entry)
+                    found = True
+                    break
+            if not found:
+                models.append(entry)
+            await self.pb.update(job_id, model_progress=models)
+            return
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -1009,7 +1237,7 @@ async def execute_composition(
 
     convex = None
     if convex_url and convex_token:
-        convex = ConvexClient(convex_url, convex_token)
+        convex = ConvexClient(convex_url, convex_token, pocketbase_url=os.environ.get("POCKETBASE_URL"))
 
     # Create job directory structure
     job_paths = create_job_directory(jobs_directory, job_id, job_name)
@@ -1513,7 +1741,7 @@ async def compose_job(request: Union[CompositionRequest, CompositionRequestV2]):
         # Check if this is the simplified V2 request (no config field)
         if isinstance(request, CompositionRequestV2) or not hasattr(request, 'config') or request.config is None:
             # V2 format - fetch job and settings from Convex
-            convex = ConvexClient(request.convexUrl, request.convexToken)
+            convex = ConvexClient(request.convexUrl, request.convexToken, pocketbase_url=os.environ.get("POCKETBASE_URL"))
 
             # Fetch job data
             job = await convex.get_job(request.jobId)
@@ -1617,7 +1845,7 @@ async def execute_composition_simple(
     # Initialize Convex client for real-time updates
     convex = None
     if convex_url and convex_token:
-        convex = ConvexClient(url=convex_url, token=convex_token)
+        convex = ConvexClient(url=convex_url, token=convex_token, pocketbase_url=os.environ.get("POCKETBASE_URL"))
 
     # Create job directory structure first (needed for start_composing)
     job_paths = create_job_directory(jobs_directory, job_id, job_name)
@@ -3481,7 +3709,7 @@ async def execute_generation(
 
     convex = None
     if convex_url and convex_token:
-        convex = ConvexClient(convex_url, convex_token)
+        convex = ConvexClient(convex_url, convex_token, pocketbase_url=os.environ.get("POCKETBASE_URL"))
         print(f"[Generation] Convex client created for URL: {convex_url}")
     else:
         print(f"[Generation] WARNING: Convex client NOT created - url={convex_url}, token={'yes' if convex_token else 'no'}")
@@ -4351,6 +4579,20 @@ Requirements:
                 generate_single_review(i, neb_buffer, batch_directives[i - batch_start], batch_cap_styles[i - batch_start])
                 for i in range(batch_start, batch_end)
             ]
+
+            # When PocketBase is active, wrap each task with per-review progress updates.
+            # This gives smooth real-time progress as each LLM call completes (vs. per-batch jumps).
+            if convex and convex.has_fast_updates and not progress_callback:
+                _pb_completed = 0
+                async def _with_progress(coro):
+                    nonlocal _pb_completed
+                    result = await coro
+                    _pb_completed += 1
+                    pf = 5 + (batch_start + _pb_completed) / total_reviews * 94
+                    await convex.update_progress(job_id, min(int(pf), 99), "AML")
+                    return result
+                tasks = [_with_progress(t) for t in tasks]
+
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for result in batch_results:
@@ -5195,7 +5437,7 @@ async def execute_heuristic_pipeline(
 
     convex = None
     if convex_url and convex_token:
-        convex = ConvexClient(convex_url, convex_token)
+        convex = ConvexClient(convex_url, convex_token, pocketbase_url=os.environ.get("POCKETBASE_URL"))
 
     try:
         # Create job directory
@@ -6248,7 +6490,7 @@ async def execute_pipeline(
 
     convex = None
     if convex_url and convex_token:
-        convex = ConvexClient(convex_url, convex_token)
+        convex = ConvexClient(convex_url, convex_token, pocketbase_url=os.environ.get("POCKETBASE_URL"))
 
     # ========================================
     # HEURISTIC METHOD (RQ1 Baseline)
@@ -6331,6 +6573,8 @@ async def execute_pipeline(
                 "configPath": config_path,
             })
             await convex.add_log(job_id, "INFO", "Pipeline", f"Starting pipeline with phases: {', '.join(phases)}")
+            if convex.has_fast_updates:
+                await convex.add_log(job_id, "INFO", "Pipeline", "[PB] PocketBase real-time mode active (progress + logs)")
 
             # Early GPU/CPU detection - set immediately so UI shows the badge
             try:
