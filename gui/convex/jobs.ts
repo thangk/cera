@@ -194,11 +194,23 @@ export const create = mutation({
         model: v.string(),
         output_formats: v.optional(v.array(v.string())),
         dataset_mode: v.optional(v.string()),
-        total_runs: v.optional(v.number()), // Number of times to run generation (default: 1)
-        neb_enabled: v.optional(v.boolean()), // NEB (Negative Example Buffer) for diversity
-        neb_depth: v.optional(v.number()), // How many batches to remember (1-10)
-        models: v.optional(v.array(v.string())), // Multiple generation models
-        parallel_models: v.optional(v.boolean()), // Run models concurrently
+        total_runs: v.optional(v.number()),
+        neb_enabled: v.optional(v.boolean()),
+        neb_depth: v.optional(v.number()),
+        models: v.optional(v.array(v.string())),
+        parallel_models: v.optional(v.boolean()),
+        // Multi-target dataset support
+        target_prefix: v.optional(v.string()),
+        targets: v.optional(v.array(v.object({
+          count_mode: v.union(v.literal("reviews"), v.literal("sentences")),
+          target_value: v.number(),
+          batch_size: v.number(),
+          request_size: v.number(),
+          total_runs: v.number(),
+          runs_mode: v.union(v.literal("parallel"), v.literal("sequential")),
+          neb_depth: v.optional(v.number()),
+        }))),
+        parallel_targets: v.optional(v.boolean()),
       })),
       // Ablation settings for reproducibility
       ablation: v.optional(v.object({
@@ -278,9 +290,22 @@ export const create = mutation({
       avgSentencesPerReview: v.string(),
       model: v.string(),
       outputFormat: v.string(),
-      totalRuns: v.optional(v.number()), // Number of times to run generation (default: 1)
-      parallelRuns: v.optional(v.boolean()), // Run all runs concurrently (default: true)
-      knowledgeSourceJobId: v.optional(v.string()), // Job ID to import SIL knowledge from
+      totalRuns: v.optional(v.number()),
+      parallelRuns: v.optional(v.boolean()),
+      knowledgeSourceJobId: v.optional(v.string()),
+      // Multi-target dataset support
+      targetPrefix: v.optional(v.string()),
+      targets: v.optional(v.array(v.object({
+        targetMode: v.union(v.literal("reviews"), v.literal("sentences")),
+        targetValue: v.number(),
+        reviewsPerBatch: v.number(),
+        requestSize: v.number(),
+        totalRuns: v.number(),
+        runsMode: v.union(v.literal("parallel"), v.literal("sequential")),
+      }))),
+      parallelTargets: v.optional(v.boolean()),
+      models: v.optional(v.array(v.string())),
+      parallelModels: v.optional(v.boolean()),
     })),
   },
   handler: async (ctx, args) => {
@@ -803,12 +828,11 @@ export const completeHeuristicGeneration = mutation({
   },
   handler: async (ctx, args) => {
     const job = await ctx.db.get(args.jobId);
-    if (!job || job.status !== "running") {
-      throw new Error("Can only complete heuristic generation on running jobs");
+    if (!job || !["running", "evaluating"].includes(job.status as string)) {
+      throw new Error("Can only complete heuristic generation on running/evaluating jobs");
     }
     await ctx.db.patch(args.jobId, {
       generatedCount: args.reviewsCollected,
-      currentPhase: "Heuristic Generation complete",
     });
   },
 });
@@ -1096,6 +1120,134 @@ export const savePerModelMetrics = mutation({
 
     await ctx.db.patch(args.jobId, {
       perModelMetrics: existing,
+    });
+  },
+});
+
+// Update target-level progress (multi-target jobs)
+export const updateTargetProgress = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    targetIndex: v.number(),
+    targetLabel: v.string(),
+    status: v.string(),
+    progress: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const job = await ctx.db.get(args.jobId);
+    if (!job) throw new Error("Job not found");
+
+    const existing = (job.targetProgress as Array<{
+      targetIndex: number;
+      targetLabel: string;
+      status: string;
+      progress: number;
+    }>) || [];
+    const entry = {
+      targetIndex: args.targetIndex,
+      targetLabel: args.targetLabel,
+      status: args.status,
+      progress: args.progress,
+    };
+
+    const idx = existing.findIndex((e) => e.targetIndex === args.targetIndex);
+    if (idx >= 0) {
+      existing[idx] = entry;
+    } else {
+      existing.push(entry);
+    }
+
+    await ctx.db.patch(args.jobId, {
+      targetProgress: existing,
+    });
+  },
+});
+
+// Save per-target evaluation metrics (multi-target jobs)
+export const saveTargetMetrics = mutation({
+  args: {
+    jobId: v.id("jobs"),
+    targetIndex: v.number(),
+    targetLabel: v.string(),
+    targetValue: v.number(),
+    countMode: v.string(),
+    metrics: v.optional(v.object({
+      bleu: v.optional(v.number()),
+      rouge_l: v.optional(v.number()),
+      bertscore: v.optional(v.number()),
+      moverscore: v.optional(v.number()),
+      distinct_1: v.optional(v.number()),
+      distinct_2: v.optional(v.number()),
+      self_bleu: v.optional(v.number()),
+    })),
+    perModelMetrics: v.optional(v.array(v.object({
+      model: v.string(),
+      modelSlug: v.string(),
+      metrics: v.optional(v.object({
+        bleu: v.optional(v.number()),
+        rouge_l: v.optional(v.number()),
+        bertscore: v.optional(v.number()),
+        moverscore: v.optional(v.number()),
+        distinct_1: v.optional(v.number()),
+        distinct_2: v.optional(v.number()),
+        self_bleu: v.optional(v.number()),
+      })),
+    }))),
+    conformity: v.optional(v.object({
+      polarity: v.number(),
+      length: v.number(),
+      noise: v.number(),
+      validation: v.optional(v.number()),
+    })),
+    perRunMetrics: v.optional(v.array(v.object({
+      run: v.number(),
+      datasetFile: v.string(),
+      metrics: v.object({
+        bleu: v.optional(v.number()),
+        rouge_l: v.optional(v.number()),
+        bertscore: v.optional(v.number()),
+        moverscore: v.optional(v.number()),
+        distinct_1: v.optional(v.number()),
+        distinct_2: v.optional(v.number()),
+        self_bleu: v.optional(v.number()),
+      }),
+    }))),
+    averageMetrics: v.optional(v.object({
+      bleu: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+      rouge_l: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+      bertscore: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+      moverscore: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+      distinct_1: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+      distinct_2: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+      self_bleu: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+    })),
+  },
+  handler: async (ctx, args) => {
+    const job = await ctx.db.get(args.jobId);
+    if (!job) throw new Error("Job not found");
+
+    const existing = (job.perTargetMetrics as any[]) || [];
+    const entry = {
+      targetIndex: args.targetIndex,
+      targetLabel: args.targetLabel,
+      targetValue: args.targetValue,
+      countMode: args.countMode,
+      metrics: args.metrics,
+      perModelMetrics: args.perModelMetrics,
+      conformity: args.conformity,
+      perRunMetrics: args.perRunMetrics,
+      averageMetrics: args.averageMetrics,
+    };
+
+    const idx = existing.findIndex((e) => e.targetIndex === args.targetIndex);
+    if (idx >= 0) {
+      existing[idx] = entry;
+    } else {
+      existing.push(entry);
+    }
+
+    await ctx.db.patch(args.jobId, {
+      perTargetMetrics: existing,
     });
   },
 });

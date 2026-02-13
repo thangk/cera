@@ -84,6 +84,18 @@ export default defineSchema({
         neb_depth: v.optional(v.number()), // How many batches to remember (1-10)
         models: v.optional(v.array(v.string())), // Multiple generation models (multi-model comparison)
         parallel_models: v.optional(v.boolean()), // Run models concurrently
+        // Multi-target dataset support
+        target_prefix: v.optional(v.string()), // File naming prefix (e.g., "rq1-cera")
+        targets: v.optional(v.array(v.object({
+          count_mode: v.union(v.literal("reviews"), v.literal("sentences")),
+          target_value: v.number(),
+          batch_size: v.number(),
+          request_size: v.number(),
+          total_runs: v.number(),
+          runs_mode: v.union(v.literal("parallel"), v.literal("sequential")),
+          neb_depth: v.optional(v.number()),
+        }))),
+        parallel_targets: v.optional(v.boolean()),
       })),
       // Ablation settings for reproducibility
       ablation: v.optional(v.object({
@@ -329,6 +341,20 @@ export default defineSchema({
       totalRuns: v.optional(v.number()),     // Number of times to run generation (default: 1)
       parallelRuns: v.optional(v.boolean()), // Run all runs concurrently (default: true)
       knowledgeSourceJobId: v.optional(v.string()), // Job ID to import SIL knowledge from
+      // Multi-target dataset support
+      targetPrefix: v.optional(v.string()), // File naming prefix (e.g., "rq1-heuristic")
+      targets: v.optional(v.array(v.object({
+        targetMode: v.union(v.literal("reviews"), v.literal("sentences")),
+        targetValue: v.number(),
+        reviewsPerBatch: v.number(),
+        requestSize: v.number(),
+        totalRuns: v.number(),
+        runsMode: v.union(v.literal("parallel"), v.literal("sequential")),
+      }))),
+      parallelTargets: v.optional(v.boolean()),
+      // Multi-model support
+      models: v.optional(v.array(v.string())),
+      parallelModels: v.optional(v.boolean()),
     })),
 
     // Heuristic job progress tracking
@@ -337,6 +363,13 @@ export default defineSchema({
       totalBatches: v.number(),
       reviewsCollected: v.number(),
     })),
+    // Per-target progress tracking (multi-target dataset)
+    targetProgress: v.optional(v.array(v.object({
+      targetIndex: v.number(),
+      targetLabel: v.string(),         // e.g., "100 sentences", "500 reviews"
+      status: v.string(),             // "pending" | "generating" | "evaluating" | "completed" | "failed"
+      progress: v.number(),           // 0-100
+    }))),
     // Per-run progress tracking (parallel heuristic runs)
     runProgress: v.optional(v.array(v.object({
       run: v.number(),           // Run number (1-based)
@@ -345,6 +378,65 @@ export default defineSchema({
       totalBatches: v.number(),
       reviewsCollected: v.number(),
       evalProgress: v.optional(v.number()), // 0-100 for evaluation phase
+    }))),
+    // Per-target evaluation metrics (multi-target dataset)
+    perTargetMetrics: v.optional(v.array(v.object({
+      targetIndex: v.number(),
+      targetLabel: v.string(),           // e.g., "100 sentences"
+      targetValue: v.number(),           // e.g., 100
+      countMode: v.string(),             // "sentences" | "reviews"
+      metrics: v.optional(v.object({
+        bleu: v.optional(v.number()),
+        rouge_l: v.optional(v.number()),
+        bertscore: v.optional(v.number()),
+        moverscore: v.optional(v.number()),
+        distinct_1: v.optional(v.number()),
+        distinct_2: v.optional(v.number()),
+        self_bleu: v.optional(v.number()),
+      })),
+      perModelMetrics: v.optional(v.array(v.object({
+        model: v.string(),
+        modelSlug: v.string(),
+        metrics: v.optional(v.object({
+          bleu: v.optional(v.number()),
+          rouge_l: v.optional(v.number()),
+          bertscore: v.optional(v.number()),
+          moverscore: v.optional(v.number()),
+          distinct_1: v.optional(v.number()),
+          distinct_2: v.optional(v.number()),
+          self_bleu: v.optional(v.number()),
+        })),
+      }))),
+      conformity: v.optional(v.object({
+        polarity: v.number(),
+        length: v.number(),
+        noise: v.number(),
+        validation: v.optional(v.number()),
+      })),
+      // Per-run metrics within this target (when total_runs > 1)
+      perRunMetrics: v.optional(v.array(v.object({
+        run: v.number(),
+        datasetFile: v.string(),
+        metrics: v.object({
+          bleu: v.optional(v.number()),
+          rouge_l: v.optional(v.number()),
+          bertscore: v.optional(v.number()),
+          moverscore: v.optional(v.number()),
+          distinct_1: v.optional(v.number()),
+          distinct_2: v.optional(v.number()),
+          self_bleu: v.optional(v.number()),
+        }),
+      }))),
+      // Average metrics across runs within this target (with std deviation)
+      averageMetrics: v.optional(v.object({
+        bleu: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+        rouge_l: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+        bertscore: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+        moverscore: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+        distinct_1: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+        distinct_2: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+        self_bleu: v.optional(v.object({ mean: v.number(), std: v.optional(v.number()) })),
+      })),
     }))),
   }).index("by_status", ["status"]).index("by_reused_from", ["reusedFrom"]),
 

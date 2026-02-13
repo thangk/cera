@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Progress } from '@/components/ui/progress'
@@ -61,6 +61,13 @@ interface Review {
   }
 }
 
+interface TargetInfo {
+  size: number
+  datasetFiles: string[]
+  hasMetrics: boolean
+  hasConformity: boolean
+}
+
 interface JobInfo {
   dirName: string
   path: string
@@ -69,8 +76,10 @@ interface JobInfo {
   hasDataset: boolean
   hasMavs: boolean
   hasMetrics: boolean
+  hasConformity: boolean
   datasetFiles: string[]
   mavModels: string[]
+  targets: TargetInfo[]
 }
 
 interface MavModelData {
@@ -614,9 +623,25 @@ function DatasetViewer() {
                       <SelectValue placeholder="Select file" />
                     </SelectTrigger>
                     <SelectContent>
-                      {jobs.find(j => j.path === selectedJob)?.datasetFiles.map(f => (
-                        <SelectItem key={f} value={f}>{f}</SelectItem>
-                      ))}
+                      {(() => {
+                        const job = jobs.find(j => j.path === selectedJob)
+                        if (!job) return null
+                        if (job.targets && job.targets.length > 0) {
+                          return job.targets.map(t => (
+                            <SelectGroup key={t.size}>
+                              <SelectLabel className="text-xs font-semibold">{t.size} sentences</SelectLabel>
+                              {t.datasetFiles.map(f => (
+                                <SelectItem key={f} value={f}>
+                                  {f.split('/').slice(1).join('/')}
+                                </SelectItem>
+                              ))}
+                            </SelectGroup>
+                          ))
+                        }
+                        return job.datasetFiles.map(f => (
+                          <SelectItem key={f} value={f}>{f}</SelectItem>
+                        ))
+                      })()}
                     </SelectContent>
                   </Select>
                 </div>
@@ -1376,6 +1401,12 @@ interface JobWithConformity {
   completedAt?: number
   jobDir?: string
   conformityReport?: ConformityReport
+  config?: {
+    generation?: {
+      targets?: Array<{ count_mode: string; target_value: number }>
+    }
+  }
+  perTargetMetrics?: Array<{ targetIndex: number; targetValue: number; conformity?: ConformityReport }>
 }
 
 // Extended conformity report for multi-run
@@ -1439,6 +1470,7 @@ function ConformityViewer() {
   const [loading, setLoading] = useState(false)
   const [multiRunView, setMultiRunView] = useState<'summary' | 'per-run'>('summary')
   const [selectedRun, setSelectedRun] = useState<number>(1)
+  const [selectedTarget, setSelectedTarget] = useState<number | null>(null)
 
   // Filter jobs that have conformity reports or jobDir (may have file-based conformity)
   const jobsWithConformity = (jobs || []).filter(
@@ -1448,14 +1480,20 @@ function ConformityViewer() {
   // Get selected job
   const selectedJob = jobsWithConformity.find((j) => j._id === selectedJobId)
 
+  // Detect targets for selected job
+  const jobTargets = selectedJob?.config?.generation?.targets || []
+  const isMultiTarget = jobTargets.length > 1
+
   // Load conformity from files when job is selected
-  const loadConformityFromFile = useCallback(async (jobDir: string) => {
+  const loadConformityFromFile = useCallback(async (jobDir: string, targetSize?: number | null) => {
     setLoading(true)
     try {
+      const body: Record<string, unknown> = { jobDir }
+      if (targetSize != null) body.targetSize = targetSize
       const res = await fetch(`${PYTHON_API_URL}/api/read-conformity`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jobDir }),
+        body: JSON.stringify(body),
       })
       if (res.ok) {
         const data = await res.json()
@@ -1480,14 +1518,14 @@ function ConformityViewer() {
     }
   }, [jobsWithConformity, selectedJobId])
 
-  // Load file-based conformity when job changes
+  // Load file-based conformity when job or target changes
   useEffect(() => {
     if (selectedJob?.jobDir) {
-      loadConformityFromFile(selectedJob.jobDir)
+      loadConformityFromFile(selectedJob.jobDir, selectedTarget)
     } else {
       setFileConformity(null)
     }
-  }, [selectedJob?.jobDir, loadConformityFromFile])
+  }, [selectedJob?.jobDir, selectedTarget, loadConformityFromFile])
 
   // Get effective conformity data (file-based takes precedence for multi-run info)
   const conformityData: ExtendedConformityReport | null = fileConformity || (selectedJob?.conformityReport ? {
@@ -1532,7 +1570,10 @@ function ConformityViewer() {
             <div className="flex-1">
               <Select
                 value={selectedJobId}
-                onValueChange={setSelectedJobId}
+                onValueChange={(val) => {
+                  setSelectedJobId(val)
+                  setSelectedTarget(null)
+                }}
               >
                 <SelectTrigger>
                   <SelectValue placeholder={jobs === undefined ? 'Loading...' : 'Select a job'} />
@@ -1551,6 +1592,26 @@ function ConformityViewer() {
                 </SelectContent>
               </Select>
             </div>
+            {/* Target selector for multi-target jobs */}
+            {isMultiTarget && (
+              <div className="w-40">
+                <Select
+                  value={selectedTarget?.toString() || ''}
+                  onValueChange={(val) => setSelectedTarget(parseInt(val))}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Target" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {jobTargets.map((t: { target_value: number; count_mode: string }) => (
+                      <SelectItem key={t.target_value} value={t.target_value.toString()}>
+                        {t.target_value} {t.count_mode === 'sentences' ? 'sent' : 'rev'}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -1895,6 +1956,7 @@ function MetricsViewer() {
   const [isMultiRun, setIsMultiRun] = useState(false)
   const [multiRunView, setMultiRunView] = useState<'summary' | 'per-run'>('summary')
   const [selectedRun, setSelectedRun] = useState<string>('')
+  const [selectedTarget, setSelectedTarget] = useState<number | null>(null)
 
   // Restore state from localStorage on mount
   useEffect(() => {
@@ -1943,8 +2005,15 @@ function MetricsViewer() {
       // Auto-select latest job with metrics if available
       const jobsWithMetrics = jobsList.filter((j: JobInfo) => j.hasMetrics)
       if (jobsWithMetrics.length > 0 && !selectedJob) {
-        setSelectedJob(jobsWithMetrics[0].path)
-        loadMetrics(jobsWithMetrics[0].path)
+        const firstJob = jobsWithMetrics[0]
+        setSelectedJob(firstJob.path)
+        const firstTarget = firstJob.targets?.find((t: TargetInfo) => t.hasMetrics)
+        if (firstTarget) {
+          setSelectedTarget(firstTarget.size)
+          loadMetrics(firstJob.path, firstTarget.size)
+        } else {
+          loadMetrics(firstJob.path)
+        }
       }
     } catch {
       toast.error('Failed to load jobs list')
@@ -1961,13 +2030,15 @@ function MetricsViewer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings?.jobsDirectory]) // Only run on mount and when settings change
 
-  const loadMetrics = async (jobDir: string) => {
+  const loadMetrics = async (jobDir: string, targetSize?: number | null) => {
     setLoading(true)
     try {
+      const body: Record<string, unknown> = { jobDir }
+      if (targetSize != null) body.targetSize = targetSize
       const res = await fetch(`${PYTHON_API_URL}/api/read-metrics`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jobDir }),
+        body: JSON.stringify(body),
       })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
@@ -2144,7 +2215,15 @@ function MetricsViewer() {
                   value={selectedJob}
                   onValueChange={(val) => {
                     setSelectedJob(val)
-                    loadMetrics(val)
+                    setSelectedTarget(null)
+                    const job = jobs.find(j => j.path === val)
+                    const firstTarget = job?.targets?.find(t => t.hasMetrics)
+                    if (firstTarget) {
+                      setSelectedTarget(firstTarget.size)
+                      loadMetrics(val, firstTarget.size)
+                    } else {
+                      loadMetrics(val)
+                    }
                   }}
                 >
                   <SelectTrigger>
@@ -2159,6 +2238,35 @@ function MetricsViewer() {
                   </SelectContent>
                 </Select>
               </div>
+              {/* Target selector for multi-target jobs */}
+              {(() => {
+                const job = jobs.find(j => j.path === selectedJob)
+                const targetsWithMetrics = job?.targets?.filter(t => t.hasMetrics) || []
+                if (targetsWithMetrics.length <= 1) return null
+                return (
+                  <div className="w-40">
+                    <Select
+                      value={selectedTarget?.toString() || ''}
+                      onValueChange={(val) => {
+                        const size = parseInt(val)
+                        setSelectedTarget(size)
+                        loadMetrics(selectedJob, size)
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Target" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {targetsWithMetrics.map(t => (
+                          <SelectItem key={t.size} value={t.size.toString()}>
+                            {t.size} sent
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )
+              })()}
               <Button variant="outline" onClick={fetchJobs} disabled={jobsLoading}>
                 {jobsLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Refresh'}
               </Button>

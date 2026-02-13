@@ -28,12 +28,15 @@ interface CompositionPhase {
   conditional?: 'mavEnabled' | 'contextExtractionEnabled'
 }
 
+// Persona generation, writing patterns, and structure variants have been moved
+// to the Generation phase (per-target) for multi-target support.
+// Composition now only contains CTX, SIL, MAV, and ACM.
 const COMPOSITION_PHASES: CompositionPhase[] = [
   {
     id: 'ctx',
     label: 'CTX',
     phase: 'CTX',
-    overallRange: [0, 5],
+    overallRange: [0, 10],
     conditional: 'contextExtractionEnabled',
     substeps: [
       { range: [0, 20], text: 'Sampling reviews...' },
@@ -45,7 +48,7 @@ const COMPOSITION_PHASES: CompositionPhase[] = [
     id: 'sil',
     label: 'SIL',
     phase: 'SIL',
-    overallRange: [5, 25],
+    overallRange: [10, 50],
     substeps: [
       { range: [0, 15], text: 'Researching subject...' },
       { range: [15, 35], text: 'Generating queries...' },
@@ -58,7 +61,7 @@ const COMPOSITION_PHASES: CompositionPhase[] = [
     id: 'mav',
     label: 'MAV',
     phase: 'MAV',
-    overallRange: [25, 35],
+    overallRange: [50, 70],
     conditional: 'mavEnabled',
     substeps: [
       { range: [0, 40], text: 'Verifying queries...' },
@@ -67,20 +70,10 @@ const COMPOSITION_PHASES: CompositionPhase[] = [
     ],
   },
   {
-    id: 'rgm',
-    label: 'RGM',
-    phase: 'RGM',
-    overallRange: [50, 75],
-    substeps: [
-      { range: [0, 50], text: 'Sampling demographics...' },
-      { range: [50, 100], text: 'Creating reviewer profiles...' },
-    ],
-  },
-  {
     id: 'acm',
     label: 'ACM',
     phase: 'ACM',
-    overallRange: [75, 100],
+    overallRange: [70, 100],
     substeps: [
       { range: [0, 50], text: 'Configuring polarity...' },
       { range: [50, 100], text: 'Setting review attributes...' },

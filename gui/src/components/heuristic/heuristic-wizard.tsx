@@ -13,6 +13,9 @@ import {
   Loader2,
   FileText,
   Sparkles,
+  Plus,
+  X,
+  HelpCircle,
 } from 'lucide-react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
@@ -39,6 +42,7 @@ import {
   TooltipTrigger,
 } from '../ui/tooltip'
 import { DollarSign } from 'lucide-react'
+import { HeuristicTargetRow, DEFAULT_HEURISTIC_TARGET, type HeuristicTarget } from '../target-dataset-row'
 
 // Default prompt template with placeholders
 const DEFAULT_PROMPT_TEMPLATE = `Generate {review_count} product reviews for a restaurant. Each review should have approximately {avg_sentences} sentences.
@@ -100,16 +104,24 @@ export interface HeuristicConfig {
   prompt: string
   useFormatPrompt: boolean
   formatPrompt: string
+  avgSentencesPerReview: string
+  outputFormat: 'semeval_xml' | 'jsonl' | 'csv'
+  knowledgeSourceJobId: string | null // Job ID to import SIL knowledge from
+  // Multi-target dataset support
+  targetPrefix: string // File naming prefix (e.g., "rq1-heuristic")
+  targets: HeuristicTarget[]
+  parallelTargets: boolean
+  // Multi-model support
+  models: string[]
+  parallelModels: boolean
+  // Legacy fields (backward compat, derived from targets[0] and models[0])
+  model: string
   targetMode: 'reviews' | 'sentences'
   targetValue: number
   reviewsPerBatch: number
   requestSize: number // Number of parallel batch requests (default: 3)
-  avgSentencesPerReview: string
-  model: string
-  outputFormat: 'semeval_xml' | 'jsonl' | 'csv'
   totalRuns: number // Number of times to run generation (default: 1)
   parallelRuns: boolean // Run all runs concurrently (default: false)
-  knowledgeSourceJobId: string | null // Job ID to import SIL knowledge from
   // Evaluation settings
   referenceFile: string | null
   referenceFileName: string | null
@@ -129,19 +141,28 @@ const DEFAULT_HEURISTIC_CONFIG: HeuristicConfig = {
   prompt: DEFAULT_PROMPT_TEMPLATE,
   useFormatPrompt: true,
   formatPrompt: DEFAULT_FORMAT_PROMPT,
+  avgSentencesPerReview: '5',
+  outputFormat: 'semeval_xml',
+  knowledgeSourceJobId: null,
+  // Multi-target
+  targetPrefix: '',
+  targets: [{ ...DEFAULT_HEURISTIC_TARGET }],
+  parallelTargets: true,
+  // Multi-model
+  models: [''],
+  parallelModels: true,
+  // Legacy (backward compat)
+  model: '',
   targetMode: 'sentences',
   targetValue: 100,
-  reviewsPerBatch: 25,
-  requestSize: 3,
-  avgSentencesPerReview: '5',
-  model: '',
-  outputFormat: 'semeval_xml',
-  totalRuns: 1, // Default to single run
-  parallelRuns: true, // Run all runs concurrently
-  knowledgeSourceJobId: null,
+  reviewsPerBatch: 1,
+  requestSize: 25,
+  totalRuns: 1,
+  parallelRuns: true,
+  // Evaluation
   referenceFile: null,
   referenceFileName: null,
-  metrics: [...DIVERSITY_METRICS], // Only diversity metrics by default (no reference)
+  metrics: [...DIVERSITY_METRICS],
 }
 
 // Tab definitions
@@ -163,7 +184,7 @@ export function HeuristicWizard({ onBack, onReset }: HeuristicWizardProps) {
   const runPipeline = useAction(api.pipelineAction.runPipeline)
   const settings = useQuery(api.settings.get)
   const ceraJobs = useQuery(api.jobs.listCompletedCeraJobs)
-  const { loading: modelsLoading, rawModels } = useOpenRouterModels()
+  const { providers, groupedModels, models: rawModels, loading: modelsLoading } = useOpenRouterModels()
 
   // State (must be declared before any hooks that reference it)
   const [activeTab, setActiveTab] = useState(0)
@@ -182,15 +203,13 @@ export function HeuristicWizard({ onBack, onReset }: HeuristicWizardProps) {
 
   // Calculate derived values
   const avgSentencesNum = parseAvgSentences(config.avgSentencesPerReview)
-  const totalReviews = config.targetMode === 'reviews'
-    ? config.targetValue
-    : Math.ceil(config.targetValue / avgSentencesNum)
+  // Use first target for cost/batch estimates (legacy compat)
+  const firstTarget = config.targets?.[0] || DEFAULT_HEURISTIC_TARGET
+  const totalReviews = firstTarget.targetMode === 'reviews'
+    ? firstTarget.targetValue
+    : Math.ceil(firstTarget.targetValue / avgSentencesNum)
 
-  const totalSentences = config.targetMode === 'sentences'
-    ? config.targetValue
-    : config.targetValue * avgSentencesNum
-
-  const totalBatches = Math.ceil(totalReviews / config.reviewsPerBatch)
+  const totalBatches = Math.ceil(totalReviews / firstTarget.reviewsPerBatch)
 
   // Token estimates for heuristic generation
   const TOKEN_ESTIMATES = {
@@ -318,21 +337,33 @@ export function HeuristicWizard({ onBack, onReset }: HeuristicWizardProps) {
         config: {}, // Empty config for heuristic jobs (CERA config not used)
         phases: ['generation', 'evaluation'], // Heuristic skips composition
         method: 'heuristic',
-        heuristicConfig: {
-          prompt: config.prompt,
-          useFormatPrompt: config.useFormatPrompt,
-          formatPrompt: config.useFormatPrompt ? config.formatPrompt : undefined,
-          targetMode: config.targetMode,
-          targetValue: config.targetValue,
-          reviewsPerBatch: config.reviewsPerBatch,
-          requestSize: config.requestSize,
-          avgSentencesPerReview: config.avgSentencesPerReview,
-          model: config.model,
-          outputFormat: config.outputFormat,
-          totalRuns: config.totalRuns,
-          parallelRuns: config.parallelRuns,
-          knowledgeSourceJobId: config.knowledgeSourceJobId || undefined,
-        },
+        heuristicConfig: (() => {
+          const firstTarget = config.targets?.[0]
+          const effectiveModels = config.models?.filter(Boolean) || []
+          return {
+            prompt: config.prompt,
+            useFormatPrompt: config.useFormatPrompt,
+            formatPrompt: config.useFormatPrompt ? config.formatPrompt : undefined,
+            avgSentencesPerReview: config.avgSentencesPerReview,
+            outputFormat: config.outputFormat,
+            knowledgeSourceJobId: config.knowledgeSourceJobId || undefined,
+            // Multi-target fields
+            targetPrefix: config.targetPrefix || undefined,
+            targets: config.targets,
+            parallelTargets: config.parallelTargets,
+            // Multi-model fields
+            models: effectiveModels.length > 0 ? effectiveModels : undefined,
+            parallelModels: config.parallelModels,
+            // Legacy fields from targets[0] and models[0] for backward compat
+            targetMode: firstTarget?.targetMode || config.targetMode,
+            targetValue: firstTarget?.targetValue || config.targetValue,
+            reviewsPerBatch: firstTarget?.reviewsPerBatch || config.reviewsPerBatch,
+            requestSize: firstTarget?.requestSize || config.requestSize,
+            totalRuns: firstTarget?.totalRuns || config.totalRuns,
+            parallelRuns: firstTarget?.runsMode === 'parallel',
+            model: effectiveModels[0] || config.model,
+          }
+        })(),
         evaluationConfig: {
           metrics: config.metrics,
           reference_metrics_enabled: !!config.referenceFile,
@@ -427,24 +458,6 @@ export function HeuristicWizard({ onBack, onReset }: HeuristicWizardProps) {
       case 'prompt':
         return (
           <div className="space-y-6">
-            {/* LLM Model Selector */}
-            <div className="space-y-2">
-              <Label>LLM Model</Label>
-              <LLMSelector
-                value={config.model}
-                onChange={(model) => updateConfig('model', model)}
-                placeholder="Select a model for generation..."
-                loading={modelsLoading}
-                validationStatus={modelValidation.status}
-                validationError={modelValidation.error}
-              />
-              {modelValidation.error && (
-                <p className="text-sm text-destructive">{modelValidation.error}</p>
-              )}
-            </div>
-
-            <Separator />
-
             {/* Knowledge Source */}
             <div className="space-y-2">
               <Label>Knowledge Source</Label>
@@ -573,54 +586,41 @@ export function HeuristicWizard({ onBack, onReset }: HeuristicWizardProps) {
         )
 
       case 'settings':
+        const hTargets: HeuristicTarget[] = config.targets?.length > 0
+          ? config.targets
+          : [DEFAULT_HEURISTIC_TARGET]
+
+        const handleHTargetChange = (index: number, updated: HeuristicTarget) => {
+          const newTargets = [...hTargets]
+          newTargets[index] = updated
+          updateConfig('targets', newTargets)
+        }
+
+        const handleHTargetRemove = (index: number) => {
+          updateConfig('targets', hTargets.filter((_: HeuristicTarget, i: number) => i !== index))
+        }
+
+        const handleHAddTarget = () => {
+          const lastTarget = hTargets[hTargets.length - 1]
+          updateConfig('targets', [...hTargets, {
+            ...lastTarget,
+            targetValue: lastTarget.targetValue + 400,
+          }])
+        }
+
+        const hModels: string[] = config.models?.length > 0
+          ? config.models
+          : [config.model || '']
+
+        const isMultiModel = hModels.length > 0 && (hModels.length > 1 || config.models?.length > 0)
+
         return (
           <div className="space-y-6">
             {/* Generation Settings */}
             <div className="space-y-4">
               <h3 className="text-lg font-semibold">Generation Settings</h3>
 
-              {/* Target Mode */}
-              <div className="space-y-2">
-                <Label>Target Mode</Label>
-                <div className="flex gap-4">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="targetMode"
-                      checked={config.targetMode === 'sentences'}
-                      onChange={() => updateConfig('targetMode', 'sentences')}
-                      className="w-4 h-4"
-                    />
-                    <span>Total Sentences</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="targetMode"
-                      checked={config.targetMode === 'reviews'}
-                      onChange={() => updateConfig('targetMode', 'reviews')}
-                      className="w-4 h-4"
-                    />
-                    <span>Total Reviews</span>
-                  </label>
-                </div>
-              </div>
-
-              {/* Target Value */}
-              <div className="space-y-2">
-                <Label htmlFor="target-value">
-                  {config.targetMode === 'reviews' ? 'Total Reviews' : 'Total Sentences'}
-                </Label>
-                <Input
-                  id="target-value"
-                  type="number"
-                  min={1}
-                  value={config.targetValue}
-                  onChange={(e) => updateConfig('targetValue', parseInt(e.target.value) || 0)}
-                />
-              </div>
-
-              {/* Avg Sentences */}
+              {/* Avg Sentences per Review (global) */}
               <div className="space-y-2">
                 <Label htmlFor="avg-sentences">Avg Sentences per Review</Label>
                 <Input
@@ -629,89 +629,200 @@ export function HeuristicWizard({ onBack, onReset }: HeuristicWizardProps) {
                   placeholder="e.g., 5 or 4-7"
                   value={config.avgSentencesPerReview}
                   onChange={(e) => updateConfig('avgSentencesPerReview', e.target.value)}
+                  className="max-w-[120px]"
                 />
               </div>
 
-              {/* Calculated values */}
-              <div className="text-sm text-muted-foreground">
-                {config.targetMode === 'reviews' ? (
-                  <p>→ Calculated: ~{totalSentences.toLocaleString()} sentences</p>
-                ) : (
-                  <p>→ Calculated: ~{totalReviews.toLocaleString()} reviews</p>
-                )}
-              </div>
-
-              {/* Reviews per Batch */}
+              {/* Target Prefix */}
               <div className="space-y-2">
-                <Label htmlFor="reviews-per-batch">Reviews per Batch</Label>
-                <Input
-                  id="reviews-per-batch"
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={config.reviewsPerBatch}
-                  onChange={(e) => updateConfig('reviewsPerBatch', parseInt(e.target.value) || 1)}
-                />
-                <p className="text-sm text-muted-foreground">
-                  → Batches needed: {totalBatches}
-                </p>
-              </div>
-
-              {/* Request Size (parallel batches) */}
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="request-size">Request Size</Label>
-                  <Info className="h-4 w-4 text-muted-foreground cursor-help" title="Number of batches to send in parallel. Higher values = faster generation but more concurrent API calls." />
+                <div className="flex items-center gap-1">
+                  <Label>Target Prefix</Label>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <HelpCircle className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="max-w-xs text-xs">Prefix for generated dataset file names. Example: "rq1-heuristic" produces "rq1-heuristic-100-explicit.xml"</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 </div>
                 <Input
-                  id="request-size"
-                  type="number"
-                  min={1}
-                  value={config.requestSize}
-                  onChange={(e) => updateConfig('requestSize', parseInt(e.target.value) || 0)}
-                  onBlur={() => updateConfig('requestSize', Math.max(1, config.requestSize || 3))}
+                  type="text"
+                  placeholder={config.name ? config.name.toLowerCase().replace(/\s+/g, '-') : 'e.g., rq1-heuristic'}
+                  value={config.targetPrefix || ''}
+                  onChange={(e) => updateConfig('targetPrefix', e.target.value)}
+                  className="max-w-xs"
                 />
-                <p className="text-sm text-muted-foreground">
-                  → {config.requestSize > 1 ? `${config.requestSize} batches in parallel` : 'Sequential (1 batch at a time)'}
-                </p>
               </div>
 
-              {/* Total Runs */}
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <Label htmlFor="total-runs">Total Runs</Label>
-                  <Info className="h-4 w-4 text-muted-foreground cursor-help" title="Run generation N times to assess variability and compute average metrics with standard deviation" />
-                </div>
-                <Input
-                  id="total-runs"
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={config.totalRuns}
-                  onChange={(e) => updateConfig('totalRuns', parseInt(e.target.value) || 0)}
-                  onBlur={() => updateConfig('totalRuns', Math.max(1, Math.min(10, config.totalRuns || 1)))}
-                />
-                <p className="text-sm text-muted-foreground">
-                  {config.totalRuns > 1
-                    ? `→ Will produce ${config.totalRuns} datasets, evaluate each, then average (for research variability)`
-                    : '→ Single run (default)'}
-                </p>
-              </div>
-
-              {/* Parallel Runs toggle - only show when multiple runs */}
-              {config.totalRuns > 1 && (
-                <div className="flex items-center justify-between rounded-lg border p-3">
-                  <div className="space-y-0.5">
-                    <Label>Parallel Runs</Label>
-                    <p className="text-xs text-muted-foreground">
-                      Run all {config.totalRuns} runs concurrently for faster completion
-                    </p>
+              {/* Parallelize Target Datasets toggle (only when 2+ targets) */}
+              {hTargets.length > 1 && (
+                <div className="flex items-center justify-between rounded-lg border bg-muted/30 p-3">
+                  <div className="flex items-center gap-2">
+                    <Label className="text-sm">Parallelize Target Datasets</Label>
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <HelpCircle className="h-3 w-3 text-muted-foreground cursor-help" />
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p className="max-w-xs text-xs">Run all target dataset sizes concurrently.</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
                   </div>
                   <Switch
-                    checked={config.parallelRuns}
-                    onCheckedChange={(checked) => updateConfig('parallelRuns', checked)}
+                    checked={config.parallelTargets || false}
+                    onCheckedChange={(checked) => updateConfig('parallelTargets', checked)}
                   />
                 </div>
+              )}
+
+              {/* Target Dataset Rows */}
+              <div className="space-y-2">
+                {hTargets.map((target: HeuristicTarget, idx: number) => (
+                  <HeuristicTargetRow
+                    key={idx}
+                    index={idx}
+                    target={target}
+                    onChange={handleHTargetChange}
+                    onRemove={handleHTargetRemove}
+                    canRemove={hTargets.length > 1}
+                    avgSentencesPerReview={config.avgSentencesPerReview}
+                  />
+                ))}
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleHAddTarget}
+                >
+                  <Plus className="h-3.5 w-3.5 mr-1.5" />
+                  Add target dataset
+                </Button>
+              </div>
+            </div>
+
+            <Separator />
+
+            {/* Generation Model(s) — moved from Prompt tab */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <Label>Generation Model{hModels.length > 1 ? 's' : ''}</Label>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">Multi-Model</span>
+                  <Switch
+                    checked={isMultiModel}
+                    onCheckedChange={(checked) => {
+                      if (checked) {
+                        const currentModel = config.model || hModels[0] || ''
+                        updateConfig('models', currentModel ? [currentModel] : [''])
+                      } else {
+                        const first = hModels[0] || ''
+                        updateConfig('models', [])
+                        updateConfig('model', first)
+                        updateConfig('parallelModels', true)
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              {isMultiModel ? (
+                /* Multi-model mode */
+                <div className="space-y-3">
+                  {hModels.map((modelId: string, idx: number) => (
+                    <div key={idx} className="flex items-start gap-2">
+                      <span className="text-xs text-muted-foreground font-mono mt-3 w-5 shrink-0">{idx + 1}.</span>
+                      <div className="flex-1">
+                        <LLMSelector
+                          providers={providers}
+                          groupedModels={groupedModels}
+                          loading={modelsLoading}
+                          value={modelId}
+                          disabledModels={hModels.filter((_: string, i: number) => i !== idx).filter(Boolean)}
+                          onChange={(newModelId: string) => {
+                            const updated = [...hModels]
+                            updated[idx] = newModelId
+                            updateConfig('models', updated)
+                            if (idx === 0) {
+                              updateConfig('model', newModelId)
+                            }
+                          }}
+                          placeholder="Select model..."
+                        />
+                      </div>
+                      {idx > 0 && (
+                        <button
+                          type="button"
+                          className="text-muted-foreground hover:text-destructive mt-3 shrink-0"
+                          onClick={() => {
+                            const updated = hModels.filter((_: string, i: number) => i !== idx)
+                            updateConfig('models', updated)
+                            if (updated.length > 0) updateConfig('model', updated[0])
+                          }}
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => updateConfig('models', [...hModels, ''])}
+                  >
+                    <Plus className="h-3.5 w-3.5 mr-1.5" />
+                    Add Model
+                  </Button>
+
+                  {/* Parallel Model Execution toggle */}
+                  {hModels.filter(Boolean).length > 1 && (
+                    <div className="rounded-lg border bg-muted/30 p-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Label className="text-sm">Parallel Model Execution</Label>
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <HelpCircle className="h-3 w-3 text-muted-foreground cursor-help" />
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-xs">
+                                <p>Run all models concurrently. Each model gets its own request_size concurrent calls.</p>
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </div>
+                        <Switch
+                          checked={config.parallelModels ?? true}
+                          onCheckedChange={(checked) => updateConfig('parallelModels', checked)}
+                        />
+                      </div>
+                      {(config.parallelModels ?? true) && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400">
+                          {hModels.filter(Boolean).length} models x {hTargets[0]?.requestSize || 3} request_size = {hModels.filter(Boolean).length * (hTargets[0]?.requestSize || 3)} concurrent API calls
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                /* Single-model mode */
+                <LLMSelector
+                  providers={providers}
+                  groupedModels={groupedModels}
+                  loading={modelsLoading}
+                  value={config.model || ''}
+                  onChange={(modelId: string) => updateConfig('model', modelId)}
+                  placeholder="Select model..."
+                  validationStatus={modelValidation.status}
+                  validationError={modelValidation.error}
+                />
               )}
             </div>
 

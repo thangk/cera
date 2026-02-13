@@ -86,6 +86,7 @@ import { useUIConstraints, type UIConstraints } from '../hooks/use-ui-constraint
 import { LLMSelector, type ValidationStatus } from '../components/llm-selector'
 import { PresetSelector, type LLMPreset } from '../components/preset-selector'
 import { HeuristicWizard } from '../components/heuristic'
+import { CeraTargetRow, DEFAULT_CERA_TARGET, type CeraTarget } from '../components/target-dataset-row'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -437,6 +438,19 @@ const DEFAULT_CONFIG = {
     cap_weights: { standard: 0.55, lowercase: 0.20, mixed: 0.15, emphasis: 0.10 },
   },
   generation: {
+    // Multi-target dataset support
+    target_prefix: '' as string, // File naming prefix (defaults to sanitized job name if empty)
+    targets: [{
+      count_mode: 'sentences' as 'sentences' | 'reviews',
+      target_value: 100,
+      batch_size: 1,
+      request_size: 25,
+      total_runs: 1,
+      runs_mode: 'parallel' as 'parallel' | 'sequential',
+      neb_depth: 0,
+    }],
+    parallel_targets: true,
+    // Legacy fields (derived from targets[0] at submission time for backward compat)
     count: 100,
     count_mode: 'sentences' as 'reviews' | 'sentences',
     target_sentences: 100 as number | undefined,
@@ -446,11 +460,11 @@ const DEFAULT_CONFIG = {
     model: '',
     output_formats: ['jsonl', 'semeval_xml'] as string[],  // JSONL always included
     dataset_mode: 'both' as string,
-    total_runs: 1, // Number of times to run generation (for research variability assessment)
-    neb_enabled: true, // NEB (Negative Example Buffer) for diversity enforcement
-    neb_depth: 0, // How many batches to remember (0=unlimited)
+    total_runs: 1,
+    neb_enabled: false,
+    neb_depth: 0,
     models: [] as string[], // Multi-model comparison (overrides model when populated)
-    parallel_models: false, // Run models concurrently
+    parallel_models: true, // Run models concurrently (default ON)
   },
   // Evaluation configuration
   evaluation: {
@@ -1488,13 +1502,25 @@ function GenerateWizard() {
         cap_weights: config.attributes_profile.cap_weights,
         edge_lengths: config.attributes_profile.edge_lengths,
       } : undefined,
-      generation: selectedPhases.includes('generation') ? {
-        ...config.generation,
-        // Filter empty slots from multi-model array
-        models: config.generation.models?.filter(Boolean)?.length > 0
-          ? config.generation.models.filter(Boolean)
-          : undefined,
-      } : undefined,
+      generation: selectedPhases.includes('generation') ? (() => {
+        const firstTarget = config.generation.targets[0]
+        return {
+          ...config.generation,
+          // Filter empty slots from multi-model array
+          models: config.generation.models?.filter(Boolean)?.length > 0
+            ? config.generation.models.filter(Boolean)
+            : undefined,
+          // Legacy fields derived from targets[0] for backward compat
+          count_mode: firstTarget.count_mode,
+          count: firstTarget.count_mode === 'reviews' ? firstTarget.target_value : Math.ceil(firstTarget.target_value / 5),
+          target_sentences: firstTarget.count_mode === 'sentences' ? firstTarget.target_value : undefined,
+          batch_size: firstTarget.batch_size,
+          request_size: firstTarget.request_size,
+          total_runs: firstTarget.total_runs,
+          neb_enabled: firstTarget.neb_depth > 0,
+          neb_depth: firstTarget.neb_depth,
+        }
+      })() : undefined,
       // Ablation settings for reproducibility
       ablation: {
         sil_enabled: config.ablation.sil_enabled,
@@ -4327,7 +4353,12 @@ function GenerationPhase({
                 <div className="text-left">
                   <h3 className="font-semibold">Generation Settings</h3>
                   <p className="text-sm text-muted-foreground">
-                    {config.generation.count.toLocaleString()} reviews • {config.generation.model.split('/').pop()}
+                    {config.generation.targets?.length > 1
+                      ? `${config.generation.targets.length} targets: ${config.generation.targets.map((t: any) => t.target_value).join(', ')}`
+                      : config.generation.targets?.[0]
+                        ? `${config.generation.targets[0].target_value.toLocaleString()} ${config.generation.targets[0].count_mode}`
+                        : `${config.generation.count.toLocaleString()} reviews`
+                    } • {config.generation.model ? config.generation.model.split('/').pop() : 'no model'}
                   </p>
                 </div>
               </div>
@@ -6535,225 +6566,107 @@ function GenerationStepContent({
   const selectedModelInfo = processedModels.find(m => m.id === config.generation.model)
   const c = constraints.constraints
 
-  // Calculate estimated reviews for sentences mode
-  const sentencesPerReview = config.attributes_profile?.length_range
-    ? (config.attributes_profile.length_range[0] + config.attributes_profile.length_range[1]) / 2
-    : 3.5 // Default midpoint if not set
+  // Ensure targets array exists (backward compat)
+  const targets: CeraTarget[] = config.generation.targets?.length > 0
+    ? config.generation.targets
+    : [DEFAULT_CERA_TARGET]
 
-  const targetSentences = config.generation.target_sentences || c.sentence_count?.default || 1000
-  const estimatedReviews = Math.ceil(targetSentences / sentencesPerReview)
+  const handleTargetChange = (index: number, updated: CeraTarget) => {
+    const newTargets = [...targets]
+    newTargets[index] = updated
+    updateConfig('generation.targets', newTargets)
+  }
+
+  const handleTargetRemove = (index: number) => {
+    const newTargets = targets.filter((_: CeraTarget, i: number) => i !== index)
+    updateConfig('generation.targets', newTargets)
+  }
+
+  const handleAddTarget = () => {
+    const lastTarget = targets[targets.length - 1]
+    updateConfig('generation.targets', [...targets, {
+      ...lastTarget,
+      target_value: lastTarget.target_value + 400,
+    }])
+  }
+
+  // Summary for collapsible header
+  const targetsSummary = targets
+    .map((t: CeraTarget) => `${t.target_value.toLocaleString()} ${t.count_mode === 'sentences' ? 'sents' : 'reviews'}`)
+    .join(', ')
 
   return (
     <div className="space-y-6">
-      <TooltipProvider>
-          {/* Target Mode Toggle */}
-          <div className="space-y-3 mb-4">
-            <div className="flex items-center gap-1">
-              <Label>Target Mode</Label>
+        {/* Target Prefix */}
+        <div className="space-y-2">
+          <div className="flex items-center gap-1">
+            <Label>Target Prefix</Label>
+            <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <HelpCircle className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
                 </TooltipTrigger>
                 <TooltipContent>
-                  <p className="max-w-xs">
-                    SemEval datasets measure size in sentences. Use "Number of Sentences"
-                    for research comparability with SemEval 2015 benchmarks.
-                  </p>
+                  <p className="max-w-xs">Prefix for generated dataset file names. Example: "rq1-cera" produces "rq1-cera-100-explicit.xml"</p>
                 </TooltipContent>
               </Tooltip>
-            </div>
-
-            {/* Toggle buttons styled like tabs */}
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                variant={config.generation.count_mode === 'sentences' ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => updateConfig('generation.count_mode', 'sentences')}
-              >
-                Number of Sentences
-              </Button>
-              <Button
-                type="button"
-                variant={(config.generation.count_mode || 'sentences') === 'reviews' ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => updateConfig('generation.count_mode', 'reviews')}
-              >
-                Number of Reviews
-              </Button>
-            </div>
+            </TooltipProvider>
           </div>
+          <Input
+            type="text"
+            placeholder={config.name ? config.name.toLowerCase().replace(/\s+/g, '-') : 'e.g., rq1-cera'}
+            value={config.generation.target_prefix || ''}
+            onChange={(e) => updateConfig('generation.target_prefix', e.target.value)}
+            className="max-w-xs"
+          />
+        </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            {/* Conditional Input Based on Mode */}
-            {(config.generation.count_mode || 'sentences') === 'reviews' ? (
-              <div className="space-y-2">
-                <Label>Number of Reviews</Label>
-                <Input
-                  type="number"
-                  min={c.review_count.min}
-                  max={c.review_count.max}
-                  step={c.review_count.step}
-                  value={config.generation.count}
-                  onChange={(e) => updateConfig('generation.count', parseInt(e.target.value) || c.review_count.default)}
-                />
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <Label>Target Sentences</Label>
-                <Input
-                  type="number"
-                  min={c.sentence_count?.min || 50}
-                  max={c.sentence_count?.max || 50000}
-                  step={c.sentence_count?.step || 50}
-                  value={config.generation.target_sentences || c.sentence_count?.default || 1000}
-                  onChange={(e) => updateConfig('generation.target_sentences', parseInt(e.target.value) || c.sentence_count?.default || 1000)}
-                />
-                {/* Estimation Display */}
-                <p className="text-xs text-muted-foreground">
-                  ~{estimatedReviews.toLocaleString()} reviews estimated to reach {targetSentences.toLocaleString()} sentences
-                  <br />
-                  <span className="text-[10px]">
-                    (based on {sentencesPerReview.toFixed(1)} avg sentences/review)
-                  </span>
-                </p>
-              </div>
-            )}
-            <div className="space-y-2">
-              <div className="flex items-center gap-1">
-                <Label>Batch Size</Label>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <HelpCircle className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    <p className="max-w-xs">Number of AML prompts per single API request. Higher values reduce API calls but may hit context limits.</p>
-                  </TooltipContent>
-                </Tooltip>
-              </div>
-              <Input
-                type="number"
-                min={c.batch_size.min}
-                max={c.batch_size.max}
-                step={c.batch_size.step}
-                value={config.generation.batch_size}
-                onChange={(e) => updateConfig('generation.batch_size', parseInt(e.target.value) || c.batch_size.default)}
-              />
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center gap-1">
-                <Label>Request Size</Label>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <HelpCircle className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    <p className="max-w-xs">Number of parallel API calls. Higher values speed up generation but may hit rate limits.</p>
-                  </TooltipContent>
-                </Tooltip>
-              </div>
-              <Input
-                type="number"
-                min={c.request_size.min}
-                max={c.request_size.max}
-                step={c.request_size.step}
-                value={config.generation.request_size}
-                onChange={(e) => updateConfig('generation.request_size', parseInt(e.target.value) || c.request_size.default)}
-              />
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center gap-1">
-                <Label>Total Runs</Label>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <HelpCircle className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    <p className="max-w-xs font-medium mb-1">Why run multiple times?</p>
-                    <p className="max-w-xs">LLM generation has inherent variability. Running multiple times lets you assess consistency and compute average metrics with ± std.</p>
-                  </TooltipContent>
-                </Tooltip>
-              </div>
-              <div className="flex items-center gap-3">
-                <Input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={config.generation.total_runs || 1}
-                  onChange={(e) => updateConfig('generation.total_runs', Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
-                  className="w-20"
-                />
-                <span className="text-xs text-muted-foreground">
-                  {(config.generation.total_runs || 1) > 1
-                    ? `→ ${config.generation.total_runs} datasets`
-                    : 'Single run'}
-                </span>
-              </div>
-            </div>
-          </div>
-        </TooltipProvider>
-
-        <Separator />
-
-        {/* NEB (Negative Example Buffer) */}
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
+        {/* Parallelize Target Datasets toggle (only when 2+ targets) */}
+        {targets.length > 1 && (
+          <div className="flex items-center justify-between rounded-lg border bg-muted/30 p-3">
             <div className="flex items-center gap-2">
-              <Label>NEB (Negative Example Buffer)</Label>
+              <Label className="text-sm">Parallelize Target Datasets</Label>
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <HelpCircle className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
+                    <HelpCircle className="h-3 w-3 text-muted-foreground cursor-help" />
                   </TooltipTrigger>
-                  <TooltipContent className="max-w-sm">
-                    <p className="font-medium mb-1">Prevents repetitive reviews</p>
-                    <p>NEB includes previously generated reviews as "negative examples" in subsequent prompts, instructing the LLM to generate distinctly different content.</p>
+                  <TooltipContent>
+                    <p className="max-w-xs text-xs">Run all target dataset sizes concurrently. Each target gets its own generation pipeline.</p>
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>
             </div>
             <Switch
-              checked={config.generation.neb_enabled || false}
-              onCheckedChange={(checked) => updateConfig('generation.neb_enabled', checked)}
+              checked={config.generation.parallel_targets || false}
+              onCheckedChange={(checked) => updateConfig('generation.parallel_targets', checked)}
             />
           </div>
-          {config.generation.neb_enabled && (
-            <div className="pl-4 border-l-2 border-muted space-y-2">
-              <div className="flex items-center gap-2">
-                <Label className="text-sm">Depth</Label>
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <HelpCircle className="h-3 w-3 text-muted-foreground cursor-help" />
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-xs">
-                      <p>How many batches of reviews to remember. Set to 0 to disable NEB entirely. With request_size={config.generation.request_size} and depth={config.generation.neb_depth ?? 3}, each prompt will include up to {(config.generation.neb_depth ?? 3) * config.generation.request_size} previous reviews.</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              </div>
-              <div className="flex items-center gap-3">
-                <Input
-                  type="number"
-                  min={0}
-                  value={config.generation.neb_depth ?? 3}
-                  onChange={(e) => updateConfig('generation.neb_depth', Math.max(0, parseInt(e.target.value) || 0))}
-                  className="w-20"
-                />
-                <span className="text-xs text-muted-foreground">
-                  {config.generation.neb_depth === 0
-                    ? '= NEB disabled'
-                    : `= ${(config.generation.neb_depth ?? 3) * config.generation.request_size} reviews in buffer`
-                  }
-                </span>
-              </div>
-              {((config.generation.neb_depth ?? 3) * config.generation.request_size) >= 50 && (
-                <p className="text-xs text-amber-500">
-                  {(config.generation.neb_depth ?? 3) * config.generation.request_size} reviews per AML prompt — ensure your generation model supports a large enough context window (1M+ tokens recommended)
-                </p>
-              )}
-            </div>
-          )}
+        )}
+
+        {/* Target Dataset Rows */}
+        <div className="space-y-2">
+          {targets.map((target: CeraTarget, idx: number) => (
+            <CeraTargetRow
+              key={idx}
+              index={idx}
+              target={target}
+              onChange={handleTargetChange}
+              onRemove={handleTargetRemove}
+              canRemove={targets.length > 1}
+              lengthRange={config.attributes_profile.length_range as [number, number]}
+            />
+          ))}
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleAddTarget}
+          >
+            <Plus className="h-3.5 w-3.5 mr-1.5" />
+            Add target dataset
+          </Button>
         </div>
 
         <Separator />

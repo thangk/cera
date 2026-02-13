@@ -23,13 +23,23 @@ interface GenerationPhase {
   dynamic?: boolean // For phases with dynamic substep text
 }
 
-// Backend sends progress 5-99 during generation, 100 on completion
-// Mapped to local 0-100: (progress - 5) / 94 * 100
+// Backend sends progress 1-99 during generation, 100 on completion
+// Personas phase runs first (1-5%), then AML+Reviews (5-90%), then Output+Validate
 const GENERATION_PHASES: GenerationPhase[] = [
+  {
+    id: 'personas',
+    label: 'Personas',
+    overallRange: [0, 5],  // Persona generation + writing patterns + structure variants
+    substeps: [
+      { range: [0, 40], text: 'Generating reviewer personas...' },
+      { range: [40, 70], text: 'Generating writing patterns...' },
+      { range: [70, 100], text: 'Generating structure variants...' },
+    ],
+  },
   {
     id: 'aml',
     label: 'AML',
-    overallRange: [0, 5],  // ~5% of progress (building prompts)
+    overallRange: [5, 10],  // ~5% of progress (building prompts)
     substeps: [
       { range: [0, 50], text: 'Loading context docs...' },
       { range: [50, 100], text: 'Building AML prompts...' },
@@ -38,7 +48,7 @@ const GENERATION_PHASES: GenerationPhase[] = [
   {
     id: 'reviews',
     label: 'Reviews',
-    overallRange: [5, 90],  // Main generation phase (5-95% backend = 5-90% local)
+    overallRange: [10, 90],  // Main generation phase
     dynamic: true,
     substeps: [
       { range: [0, 100], text: 'Generating reviews...' },

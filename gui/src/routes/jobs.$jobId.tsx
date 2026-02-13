@@ -219,6 +219,86 @@ function JobDetailPage() {
   const enabledPhaseIds = useMemo(() => ['all', ...visiblePhases.map(p => p.id)] as LogTab[], [visiblePhases])
   const [activeTab, setActiveTab] = useState(visiblePhases[0]?.id || 'composition')
 
+  // Multi-target support
+  const targets = (job?.config?.generation?.targets || []) as Array<{
+    count_mode: 'sentences' | 'reviews'
+    target_value: number
+    batch_size: number
+    request_size: number
+    total_runs: number
+    runs_mode: 'parallel' | 'sequential'
+    neb_depth?: number
+  }>
+  const isMultiTarget = targets.length > 1
+  const [activeTarget, setActiveTarget] = useState<'all' | number>('all')
+
+  // Create a target-scoped job object for per-target progress components
+  // Maps target-specific progress/status/metrics onto job-level fields so existing
+  // GenerationProgress and EvaluationProgress components work without changes.
+  // For single-target jobs with perTargetMetrics, maps the first target's data automatically.
+  const targetScopedJob = useMemo(() => {
+    if (!job) return job
+    const perTargetMetrics = (job as any).perTargetMetrics as Array<Record<string, unknown>> | undefined
+
+    // For multi-target jobs with a specific target selected
+    if (isMultiTarget && typeof activeTarget === 'number') {
+      const tp = (job as any).targetProgress?.find((tp: { targetIndex: number }) => tp.targetIndex === activeTarget)
+      const targetConfig = targets[activeTarget]
+      if (!targetConfig) return job
+
+      const statusMap: Record<string, string> = {
+        pending: 'composing',
+        generating: 'running',
+        evaluating: 'evaluating',
+        completed: 'completed',
+      }
+
+      const ptMetrics = perTargetMetrics?.find(
+        (pt: { targetIndex?: number }) => pt.targetIndex === activeTarget
+      )
+
+      return {
+        ...job,
+        ...(tp ? {
+          status: statusMap[tp.status as string] || job.status,
+          progress: tp.progress,
+        } : {}),
+        ...(ptMetrics?.metrics ? { evaluationMetrics: ptMetrics.metrics } : {}),
+        ...(ptMetrics?.perModelMetrics ? { perModelMetrics: ptMetrics.perModelMetrics } : {}),
+        ...(ptMetrics?.conformity ? { conformityReport: ptMetrics.conformity } : {}),
+        ...(ptMetrics?.perRunMetrics ? { perRunMetrics: ptMetrics.perRunMetrics } : {}),
+        ...(ptMetrics?.averageMetrics ? { averageMetrics: ptMetrics.averageMetrics } : {}),
+        totalRuns: targetConfig.total_runs || job.totalRuns,
+        config: {
+          ...job.config,
+          generation: {
+            ...job.config.generation,
+            count_mode: targetConfig.count_mode,
+            target_sentences: targetConfig.count_mode === 'sentences' ? targetConfig.target_value : undefined,
+            n_reviews: targetConfig.count_mode === 'reviews' ? targetConfig.target_value : undefined,
+            total_runs: targetConfig.total_runs,
+          },
+        },
+      }
+    }
+
+    // For single-target jobs that have perTargetMetrics (new pipeline path):
+    // auto-map the first target's metrics onto job-level fields
+    if (!isMultiTarget && perTargetMetrics && perTargetMetrics.length > 0) {
+      const ptMetrics = perTargetMetrics[0]
+      return {
+        ...job,
+        ...(ptMetrics?.metrics ? { evaluationMetrics: ptMetrics.metrics } : {}),
+        ...(ptMetrics?.perModelMetrics ? { perModelMetrics: ptMetrics.perModelMetrics } : {}),
+        ...(ptMetrics?.conformity ? { conformityReport: ptMetrics.conformity } : {}),
+        ...(ptMetrics?.perRunMetrics ? { perRunMetrics: ptMetrics.perRunMetrics } : {}),
+        ...(ptMetrics?.averageMetrics ? { averageMetrics: ptMetrics.averageMetrics } : {}),
+      }
+    }
+
+    return job
+  }, [job, isMultiTarget, activeTarget, targets])
+
   // Update activeTab when job data loads and visible phases change
   useEffect(() => {
     if (visiblePhases.length > 0 && !visiblePhases.some(p => p.id === activeTab)) {
@@ -623,6 +703,48 @@ function JobDetailPage() {
           </AlertDialog>
         </div>
       </div>
+
+      {/* Target selector - only for multi-target jobs */}
+      {isMultiTarget && (
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Target:</span>
+          <div className="flex gap-1">
+            <button
+              onClick={() => setActiveTarget('all')}
+              className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                activeTarget === 'all'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-muted/50 text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              All
+            </button>
+            {targets.map((target, idx) => {
+              const label = `${target.target_value} ${target.count_mode === 'sentences' ? 'sent' : 'rev'}`
+              const tp = (job as any).targetProgress?.find((tp: { targetIndex: number }) => tp.targetIndex === idx)
+              return (
+                <button
+                  key={idx}
+                  onClick={() => setActiveTarget(idx)}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                    activeTarget === idx
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-muted/50 text-muted-foreground hover:bg-muted'
+                  }`}
+                >
+                  {label}
+                  {tp && (
+                    <span className="ml-1.5 opacity-70">
+                      {tp.status === 'completed' ? ' \u2713' :
+                       tp.status === 'generating' || tp.status === 'evaluating' ? ` ${tp.progress}%` : ''}
+                    </span>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Phase tabs with context-aware action buttons */}
       <div className="flex items-center justify-between">
@@ -1339,8 +1461,74 @@ function JobDetailPage() {
           {/* GENERATION Tab */}
           {activeTab === 'generation' && (
             <div className="space-y-4">
-              {/* Generation Progress */}
-              <GenerationProgress job={job} />
+              {/* Multi-target: All overview with target cards */}
+              {isMultiTarget && activeTarget === 'all' ? (
+                <div className="space-y-4">
+                  <div
+                    className="rounded-lg border overflow-hidden"
+                    style={{ borderColor: PHASES[1].strongColor }}
+                  >
+                    <div
+                      className="flex items-center justify-between p-4 border-b"
+                      style={{ backgroundColor: PHASES[1].bgRgba }}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg" style={{ backgroundColor: PHASES[1].lightColor }}>
+                          <Activity className="h-5 w-5" style={{ color: PHASES[1].strongColor }} />
+                        </div>
+                        <div>
+                          <h3 className="font-semibold text-foreground">Multi-Target Overview</h3>
+                          <p className="text-sm text-muted-foreground">{targets.length} target datasets</p>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="p-4">
+                      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        {targets.map((target, idx) => {
+                          const tp = (job as any).targetProgress?.find((tp: { targetIndex: number }) => tp.targetIndex === idx)
+                          const statusColors: Record<string, string> = {
+                            pending: 'text-muted-foreground',
+                            generating: 'text-orange-500',
+                            evaluating: 'text-green-500',
+                            completed: 'text-green-600',
+                            failed: 'text-destructive',
+                          }
+                          return (
+                            <button
+                              key={idx}
+                              onClick={() => setActiveTarget(idx)}
+                              className="rounded-lg border p-4 text-left hover:border-[#f2aa84] transition-colors"
+                            >
+                              <div className="flex items-center justify-between mb-2">
+                                <span className="font-semibold text-lg">{target.target_value}</span>
+                                <Badge
+                                  variant="outline"
+                                  className={statusColors[tp?.status || 'pending'] || 'text-muted-foreground'}
+                                >
+                                  {tp?.status || 'pending'}
+                                </Badge>
+                              </div>
+                              <span className="text-xs text-muted-foreground">
+                                {target.count_mode === 'sentences' ? 'sentences' : 'reviews'}
+                                {target.total_runs > 1 ? ` · ${target.total_runs} runs` : ''}
+                              </span>
+                              <Progress
+                                value={tp?.progress || 0}
+                                className="h-1.5 mt-2"
+                                indicatorColor={PHASES[1].strongColor}
+                                trackColor={PHASES[1].lightColor}
+                              />
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* Single-target or specific target selected: show GenerationProgress */
+                <GenerationProgress job={targetScopedJob || job} />
+              )}
 
               {/* Legacy Collapsible - hidden, will be removed */}
               {false && <Collapsible
@@ -1551,7 +1739,7 @@ function JobDetailPage() {
                     <CollapsibleContent>
                       <div className="border-t p-4 space-y-3">
                         {(() => {
-                          const report = (job as any).conformityReport
+                          const report = ((targetScopedJob || job) as any).conformityReport
                           const polarity = report ? Math.round(report.polarity * 100) : null
                           const length = report ? Math.round(report.length * 100) : null
                           const noise = report ? Math.round(report.noise * 100) : null
@@ -1619,10 +1807,34 @@ function JobDetailPage() {
           {/* EVALUATION Tab */}
           {activeTab === 'evaluation' && (
             <div className="space-y-4">
-              {/* Evaluation Progress */}
-              <EvaluationProgress job={job} />
+              {/* Multi-target: All overview - prompt to select a target */}
+              {isMultiTarget && activeTarget === 'all' ? (
+                <div className="space-y-4">
+                  <EvaluationProgress job={job} />
+                  <div className="text-center py-12">
+                    <div
+                      className="mx-auto w-16 h-16 rounded-full flex items-center justify-center mb-4"
+                      style={{ backgroundColor: PHASES[2].lightColor }}
+                    >
+                      <BarChart3 className="h-8 w-8" style={{ color: PHASES[2].strongColor }} />
+                    </div>
+                    <h3 className="text-lg font-semibold mb-2">Per-Target Evaluation</h3>
+                    <p className="text-muted-foreground">
+                      Select a target dataset above to view its MDQA evaluation metrics and cross-run results.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <>
+              {/* Single-target or specific target selected: show full evaluation */}
+              <EvaluationProgress job={targetScopedJob || job} />
 
-              {job.status !== 'completed' && job.status !== 'evaluating' && !((job as any).perModelMetrics?.length > 0) ? (
+              {(() => {
+                const scopedJob = targetScopedJob || job
+                const scopedStatus = scopedJob.status
+                const hasMetrics = !!(scopedJob as any).evaluationMetrics || (scopedJob as any).perModelMetrics?.length > 0
+                return scopedStatus !== 'completed' && scopedStatus !== 'evaluating' && !hasMetrics
+              })() ? (
                 <div className="text-center py-12">
                   <div
                     className="mx-auto w-16 h-16 rounded-full flex items-center justify-center mb-4"
@@ -1681,12 +1893,14 @@ function JobDetailPage() {
                       <CollapsibleContent>
                         <div className="border-t p-4 space-y-4">
                           {(() => {
-                            const metrics = (job as any).evaluationMetrics
-                            const perRunMetrics = (job as any).perRunMetrics as Array<{ run: number; datasetFile: string; metrics: Record<string, number> }> | undefined
-                            const averageMetrics = (job as any).averageMetrics as Record<string, { mean: number; std?: number }> | undefined
-                            const totalRuns = job.totalRuns || job.config.generation?.total_runs || 1
+                            // Use targetScopedJob for per-target metrics when a specific target is selected
+                            const metricsSource = targetScopedJob || job
+                            const metrics = (metricsSource as any).evaluationMetrics
+                            const perRunMetrics = (metricsSource as any).perRunMetrics as Array<{ run: number; datasetFile: string; metrics: Record<string, number> }> | undefined
+                            const averageMetrics = (metricsSource as any).averageMetrics as Record<string, { mean: number; std?: number }> | undefined
+                            const totalRuns = (metricsSource as any).totalRuns || (metricsSource as any).config?.generation?.total_runs || job.totalRuns || job.config.generation?.total_runs || 1
                             const hasMultipleRuns = perRunMetrics && perRunMetrics.length > 1
-                            const perModelMetrics = (job as any).perModelMetrics as Array<{
+                            const perModelMetrics = (metricsSource as any).perModelMetrics as Array<{
                               model: string
                               modelSlug: string
                               metrics: Record<string, number>
@@ -1694,7 +1908,7 @@ function JobDetailPage() {
                               perRunMetrics?: Array<{ run: number; datasetFile: string; metrics: Record<string, number> }>
                             }> | undefined
                             const isMultiModelMetrics = perModelMetrics && perModelMetrics.length > 1
-                            const modelProgressEntries = (job as any).modelProgress as Array<{ model: string; modelSlug: string; status: string }> | undefined
+                            const modelProgressEntries = (metricsSource as any).modelProgress as Array<{ model: string; modelSlug: string; status: string }> | undefined
 
                             const fmt = (v: number | undefined) => v !== undefined ? v.toFixed(4) : '—'
 
@@ -1726,17 +1940,18 @@ function JobDetailPage() {
                               }
                             }
 
+                            const METRIC_COLS = [
+                              { key: 'bleu', label: 'BLEU', higher: true },
+                              { key: 'rouge_l', label: 'ROUGE-L', higher: true },
+                              { key: 'bertscore', label: 'BERTScore', higher: true },
+                              { key: 'moverscore', label: 'MoverScore', higher: true },
+                              { key: 'distinct_1', label: 'Dist-1', higher: true },
+                              { key: 'distinct_2', label: 'Dist-2', higher: true },
+                              { key: 'self_bleu', label: 'Self-BLEU', higher: false },
+                            ]
+
                             // ── Multi-Model Comparison Table ──
                             if (isMultiModelMetrics) {
-                              const METRIC_COLS = [
-                                { key: 'bleu', label: 'BLEU', higher: true },
-                                { key: 'rouge_l', label: 'ROUGE-L', higher: true },
-                                { key: 'bertscore', label: 'BERTScore', higher: true },
-                                { key: 'moverscore', label: 'MoverScore', higher: true },
-                                { key: 'distinct_1', label: 'Dist-1', higher: true },
-                                { key: 'distinct_2', label: 'Dist-2', higher: true },
-                                { key: 'self_bleu', label: 'Self-BLEU', higher: false },
-                              ]
 
                               // Find best value per metric for highlighting
                               const bestValues: Record<string, number> = {}
@@ -1957,13 +2172,13 @@ function JobDetailPage() {
                                         <span className="text-xs text-muted-foreground">{runData.datasetFile}</span>
                                       </div>
                                       <div className="grid gap-2 grid-cols-2 sm:grid-cols-4 lg:grid-cols-7">
-                                        {['bertscore', 'bleu', 'distinct_1', 'distinct_2', 'moverscore', 'rouge_l', 'self_bleu'].map((metric) => {
-                                          const value = runData.metrics[metric]
+                                        {METRIC_COLS.map(col => {
+                                          const value = runData.metrics[col.key]
                                           if (value === undefined || value === null) return null
-                                          const quality = getQualityIndicator(metric, value)
+                                          const quality = getQualityIndicator(col.key, value)
                                           return (
-                                            <div key={metric} className="text-center p-2 rounded bg-background">
-                                              <p className="text-[10px] text-muted-foreground uppercase">{metric.replace('_', '-')}</p>
+                                            <div key={col.key} className="text-center p-2 rounded bg-background">
+                                              <p className="text-[10px] text-muted-foreground uppercase">{col.label}</p>
                                               <p className="text-sm font-semibold" style={{ color: PHASES[2].strongColor }}>{value.toFixed(4)}</p>
                                               {quality && <span className={`text-[9px] ${quality.color}`}>{quality.label}</span>}
                                             </div>
@@ -2002,6 +2217,8 @@ function JobDetailPage() {
                     </div>
                   </Collapsible>
                 </>
+              )}
+              </>
               )}
             </div>
           )}

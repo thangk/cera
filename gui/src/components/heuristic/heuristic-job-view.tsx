@@ -24,6 +24,7 @@ import { Badge } from '../ui/badge'
 import { Progress } from '../ui/progress'
 import { Separator } from '../ui/separator'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -51,6 +52,15 @@ function parseAvgSentences(val: string): number {
   return isNaN(num) || num <= 0 ? 5 : num
 }
 
+interface HeuristicTarget {
+  targetMode: string
+  targetValue: number
+  reviewsPerBatch: number
+  requestSize: number
+  totalRuns: number
+  runsMode: string
+}
+
 interface HeuristicJobViewProps {
   job: {
     _id: Id<'jobs'>
@@ -73,6 +83,10 @@ interface HeuristicJobViewProps {
       model: string
       outputFormat: string
       totalRuns?: number
+      targets?: HeuristicTarget[]
+      parallelTargets?: boolean
+      models?: string[]
+      parallelModels?: boolean
     }
     heuristicProgress?: {
       currentBatch: number
@@ -122,12 +136,357 @@ interface HeuristicJobViewProps {
     averageMetrics?: {
       [key: string]: { mean: number; std?: number }
     }
+    perTargetMetrics?: Array<{
+      targetIndex: number
+      targetLabel: string
+      targetValue: number
+      countMode: string
+      metrics?: {
+        bleu?: number
+        rouge_l?: number
+        bertscore?: number
+        moverscore?: number
+        distinct_1?: number
+        distinct_2?: number
+        self_bleu?: number
+      }
+      perRunMetrics?: Array<{
+        run: number
+        datasetFile: string
+        metrics: {
+          bleu?: number
+          rouge_l?: number
+          bertscore?: number
+          moverscore?: number
+          distinct_1?: number
+          distinct_2?: number
+          self_bleu?: number
+        }
+      }>
+      averageMetrics?: {
+        [key: string]: { mean: number; std?: number }
+      }
+    }>
   }
+}
+
+// Shared metric constants
+const METRIC_THRESHOLDS: Record<string, { poor: number; good: number; excellent: number; lowerIsBetter?: boolean }> = {
+  bleu: { poor: 0.25, good: 0.40, excellent: 0.50 },
+  rouge_l: { poor: 0.25, good: 0.40, excellent: 0.50 },
+  bertscore: { poor: 0.55, good: 0.70, excellent: 0.85 },
+  moverscore: { poor: 0.35, good: 0.50, excellent: 0.65 },
+  distinct_1: { poor: 0.30, good: 0.50, excellent: 0.70 },
+  distinct_2: { poor: 0.60, good: 0.80, excellent: 0.90 },
+  self_bleu: { poor: 0.50, good: 0.30, excellent: 0.20, lowerIsBetter: true },
+}
+
+const METRIC_ORDER: Array<{ key: string; label: string; higherIsBetter: boolean }> = [
+  { key: 'bleu', label: 'BLEU', higherIsBetter: true },
+  { key: 'rouge_l', label: 'ROUGE-L', higherIsBetter: true },
+  { key: 'bertscore', label: 'BERTScore', higherIsBetter: true },
+  { key: 'moverscore', label: 'MoverScore', higherIsBetter: true },
+  { key: 'distinct_1', label: 'Distinct-1', higherIsBetter: true },
+  { key: 'distinct_2', label: 'Distinct-2', higherIsBetter: true },
+  { key: 'self_bleu', label: 'Self-BLEU', higherIsBetter: false },
+]
+
+const METRIC_CATEGORIES = [
+  { label: 'Lexical', keys: ['bleu', 'rouge_l'], cols: 'sm:grid-cols-2' },
+  { label: 'Semantic', keys: ['bertscore', 'moverscore'], cols: 'sm:grid-cols-2' },
+  { label: 'Diversity', keys: ['distinct_1', 'distinct_2', 'self_bleu'], cols: 'sm:grid-cols-3' },
+]
+
+function getQualityIndicator(metricKey: string, value: number | undefined) {
+  if (value === undefined) return null
+  const threshold = METRIC_THRESHOLDS[metricKey]
+  if (!threshold) return null
+  if (threshold.lowerIsBetter) {
+    if (value <= threshold.excellent) return { label: 'Excellent', color: 'text-green-600 dark:text-green-400' }
+    if (value <= threshold.good) return { label: 'Good', color: 'text-blue-600 dark:text-blue-400' }
+    if (value <= threshold.poor) return { label: 'Fair', color: 'text-amber-600 dark:text-amber-400' }
+    return { label: 'Poor', color: 'text-red-600 dark:text-red-400' }
+  } else {
+    if (value >= threshold.excellent) return { label: 'Excellent', color: 'text-green-600 dark:text-green-400' }
+    if (value >= threshold.good) return { label: 'Good', color: 'text-blue-600 dark:text-blue-400' }
+    if (value >= threshold.poor) return { label: 'Fair', color: 'text-amber-600 dark:text-amber-400' }
+    return { label: 'Poor', color: 'text-red-600 dark:text-red-400' }
+  }
+}
+
+const fmt = (v: number | undefined) => v !== undefined ? v.toFixed(4) : '—'
+
+function MetricCard({ label, value, higherIsBetter, metricKey, std }: { label: string; value: number | undefined; higherIsBetter: boolean; metricKey: string; std?: number }) {
+  const threshold = METRIC_THRESHOLDS[metricKey]
+  const quality = getQualityIndicator(metricKey, value)
+  const thresholdText = threshold ? (
+    threshold.lowerIsBetter
+      ? `≤${threshold.good} good · ≤${threshold.excellent} excellent`
+      : `≥${threshold.good} good · ≥${threshold.excellent} excellent`
+  ) : ''
+
+  return (
+    <div className="rounded-lg border p-3 text-center">
+      <p className="text-xs text-muted-foreground mb-1">{label}</p>
+      <div className="flex items-center justify-center gap-2">
+        <p className="text-xl font-bold" style={{ color: MDQA_COLOR }}>
+          {fmt(value)}
+          {std !== undefined && (
+            <span className="text-xs font-normal text-muted-foreground"> ± {std.toFixed(4)}</span>
+          )}
+        </p>
+        {quality && (
+          <span className={`text-[10px] font-medium ${quality.color}`}>
+            {quality.label}
+          </span>
+        )}
+      </div>
+      <p className="text-[10px] text-muted-foreground/70 mt-1">
+        {higherIsBetter ? '↑ higher is better' : '↓ lower is better'}
+      </p>
+      {thresholdText && (
+        <p className="text-[9px] text-muted-foreground/50 mt-0.5">
+          {thresholdText}
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** Summary tab: metric cards with optional avg ± std */
+function SummaryContent({ metrics, averageMetrics, totalRuns }: {
+  metrics: Record<string, number | undefined>
+  averageMetrics?: Record<string, { mean: number; std?: number }>
+  totalRuns: number
+}) {
+  const displayMetrics = averageMetrics || metrics
+  const isAverage = !!averageMetrics
+  return (
+    <div className="space-y-4">
+      {isAverage && (
+        <p className="text-xs text-muted-foreground text-center">
+          Average across {totalRuns} runs (with ± standard deviation)
+        </p>
+      )}
+      {METRIC_CATEGORIES.map(({ label, keys, cols }) => {
+        const hasMetrics = keys.some(k => (displayMetrics as Record<string, any>)[k] !== undefined)
+        if (!hasMetrics) return null
+        return (
+          <div key={label}>
+            <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">{label}</h4>
+            <div className={`grid gap-3 ${cols}`}>
+              {keys.map(k => {
+                const mo = METRIC_ORDER.find(m => m.key === k)!
+                const value = isAverage ? (displayMetrics as any)[k]?.mean : (displayMetrics as Record<string, number | undefined>)[k]
+                const std = isAverage ? (displayMetrics as any)[k]?.std : undefined
+                return <MetricCard key={k} label={mo.label} value={value} higherIsBetter={mo.higherIsBetter} metricKey={k} std={std} />
+              })}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/** Per Run tab: each run as a card with a full metric grid */
+function PerRunContent({ runs }: { runs: Array<{ run: number; datasetFile: string; metrics: Record<string, number | undefined> }> }) {
+  if (!runs || runs.length === 0) {
+    return <p className="text-xs text-muted-foreground text-center py-4">No per-run metrics available.</p>
+  }
+  return (
+    <div className="space-y-3">
+      {runs.map((runData) => (
+        <div key={runData.run} className="rounded-lg border p-3 bg-muted/30">
+          <div className="flex justify-between items-center mb-2">
+            <span className="font-semibold text-sm">Run {runData.run}</span>
+            <span className="text-xs text-muted-foreground">{runData.datasetFile}</span>
+          </div>
+          <div className="grid gap-2 grid-cols-2 sm:grid-cols-4 lg:grid-cols-7">
+            {METRIC_ORDER.map(({ key, label }) => {
+              const value = runData.metrics[key]
+              if (value === undefined || value === null) return null
+              const quality = getQualityIndicator(key, value)
+              return (
+                <div key={key} className="text-center p-2 rounded bg-background">
+                  <p className="text-[10px] text-muted-foreground uppercase">{label}</p>
+                  <p className="text-sm font-semibold" style={{ color: MDQA_COLOR }}>{(value as number).toFixed(4)}</p>
+                  {quality && <span className={`text-[9px] ${quality.color}`}>{quality.label}</span>}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** Cross-target comparison table for "All" view */
+function CrossTargetTable({ perTargetMetrics }: { perTargetMetrics: HeuristicJobViewProps['job']['perTargetMetrics'] }) {
+  if (!perTargetMetrics || perTargetMetrics.length === 0) return null
+  // Find which metrics are present across any target
+  const presentKeys = METRIC_ORDER.filter(({ key }) =>
+    perTargetMetrics.some(t => t.metrics && (t.metrics as Record<string, number | undefined>)[key] !== undefined)
+  )
+  if (presentKeys.length === 0) return null
+
+  // Find best value per metric (for highlighting)
+  const bestValues: Record<string, number> = {}
+  for (const { key } of presentKeys) {
+    const threshold = METRIC_THRESHOLDS[key]
+    const values = perTargetMetrics
+      .map(t => t.metrics ? (t.metrics as Record<string, number | undefined>)[key] : undefined)
+      .filter((v): v is number => v !== undefined)
+    if (values.length > 0) {
+      bestValues[key] = threshold?.lowerIsBetter ? Math.min(...values) : Math.max(...values)
+    }
+  }
+
+  return (
+    <div>
+      <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Cross-Target Comparison</h4>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b">
+              <th className="text-left py-2 pr-3 font-medium text-muted-foreground">Target</th>
+              {presentKeys.map(({ key, label }) => (
+                <th key={key} className="text-center py-2 px-2 font-medium text-muted-foreground">{label}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {perTargetMetrics.map((target) => (
+              <tr key={target.targetIndex} className="border-b last:border-0">
+                <td className="py-2 pr-3 font-medium whitespace-nowrap">
+                  {target.targetLabel}
+                </td>
+                {presentKeys.map(({ key }) => {
+                  const value = target.metrics ? (target.metrics as Record<string, number | undefined>)[key] : undefined
+                  const isBest = value !== undefined && bestValues[key] === value && perTargetMetrics.length > 1
+                  return (
+                    <td key={key} className="text-center py-2 px-2">
+                      <span className={isBest ? 'font-bold' : ''} style={isBest ? { color: MDQA_COLOR } : undefined}>
+                        {fmt(value)}
+                      </span>
+                    </td>
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+/** Wraps metrics content in Summary/Per Run tabs when per-run data exists */
+function TabbedMetrics({ metrics, perRunMetrics, averageMetrics, totalRuns }: {
+  metrics: Record<string, number | undefined>
+  perRunMetrics?: Array<{ run: number; datasetFile: string; metrics: Record<string, number | undefined> }>
+  averageMetrics?: Record<string, { mean: number; std?: number }>
+  totalRuns: number
+}) {
+  const hasMultipleRuns = perRunMetrics && perRunMetrics.length > 1
+
+  if (!hasMultipleRuns) {
+    // Single run or no per-run data: just show metric cards directly
+    return <SummaryContent metrics={metrics} totalRuns={1} />
+  }
+
+  // Multiple runs: show tabbed Summary / Per Run interface (matches CERA)
+  return (
+    <Tabs defaultValue="summary" className="w-full">
+      <TabsList className="grid w-full grid-cols-2 mb-4">
+        <TabsTrigger value="summary">Summary</TabsTrigger>
+        <TabsTrigger value="per-run">Per Run ({perRunMetrics.length})</TabsTrigger>
+      </TabsList>
+      <TabsContent value="summary">
+        <SummaryContent
+          metrics={metrics}
+          averageMetrics={averageMetrics}
+          totalRuns={totalRuns}
+        />
+      </TabsContent>
+      <TabsContent value="per-run">
+        <PerRunContent runs={perRunMetrics} />
+      </TabsContent>
+    </Tabs>
+  )
+}
+
+/** Main metrics display — target-aware */
+function MetricsDisplay({ job, activeTarget, isMultiTarget }: {
+  job: HeuristicJobViewProps['job']
+  activeTarget: 'all' | number
+  isMultiTarget: boolean
+}) {
+  const perTargetMetrics = job.perTargetMetrics
+
+  // "All" view for multi-target: show cross-target comparison + aggregated cards
+  if (isMultiTarget && activeTarget === 'all') {
+    return (
+      <>
+        {perTargetMetrics && perTargetMetrics.length > 0 && (
+          <CrossTargetTable perTargetMetrics={perTargetMetrics} />
+        )}
+        {job.evaluationMetrics && (
+          <div className={perTargetMetrics && perTargetMetrics.length > 0 ? 'mt-4 pt-4 border-t' : ''}>
+            <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Aggregated (All Targets)</h4>
+            <TabbedMetrics
+              metrics={job.evaluationMetrics as Record<string, number | undefined>}
+              perRunMetrics={job.perRunMetrics as Array<{ run: number; datasetFile: string; metrics: Record<string, number | undefined> }> | undefined}
+              averageMetrics={job.averageMetrics as Record<string, { mean: number; std?: number }> | undefined}
+              totalRuns={job.perRunMetrics?.length || job.totalRuns || 1}
+            />
+          </div>
+        )}
+      </>
+    )
+  }
+
+  // Specific target view: use per-target metrics if available
+  if (typeof activeTarget === 'number' && perTargetMetrics) {
+    const targetData = perTargetMetrics.find(t => t.targetIndex === activeTarget)
+    if (targetData?.metrics) {
+      const totalRuns = targetData.perRunMetrics?.length || 1
+      return (
+        <TabbedMetrics
+          metrics={targetData.metrics as Record<string, number | undefined>}
+          perRunMetrics={targetData.perRunMetrics as Array<{ run: number; datasetFile: string; metrics: Record<string, number | undefined> }> | undefined}
+          averageMetrics={targetData.averageMetrics as Record<string, { mean: number; std?: number }> | undefined}
+          totalRuns={totalRuns}
+        />
+      )
+    }
+  }
+
+  // Fallback: legacy single-target display using job-level metrics
+  if (job.evaluationMetrics) {
+    const totalRuns = job.perRunMetrics?.length || job.totalRuns || job.heuristicConfig?.totalRuns || 1
+    return (
+      <TabbedMetrics
+        metrics={job.evaluationMetrics as Record<string, number | undefined>}
+        perRunMetrics={job.perRunMetrics as Array<{ run: number; datasetFile: string; metrics: Record<string, number | undefined> }> | undefined}
+        averageMetrics={job.averageMetrics as Record<string, { mean: number; std?: number }> | undefined}
+        totalRuns={totalRuns}
+      />
+    )
+  }
+
+  return null
 }
 
 export function HeuristicJobView({ job }: HeuristicJobViewProps) {
   const [promptExpanded, setPromptExpanded] = useState(false)
   const [metricsExpanded, setMetricsExpanded] = useState(true)
+
+  // Multi-target support
+  const targets = job.heuristicConfig?.targets || []
+  const isMultiTarget = targets.length > 1
+  const [activeTarget, setActiveTarget] = useState<'all' | number>(isMultiTarget ? 'all' : 0)
 
   const terminateJob = useMutation(api.jobs.terminate)
   const deleteJob = useMutation(api.jobs.remove)
@@ -199,12 +558,22 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
   const heuristicConfig = job.heuristicConfig
   const heuristicProgress = job.heuristicProgress
 
-  // Calculate expected values
-  const totalReviews = heuristicConfig?.targetMode === 'reviews'
-    ? heuristicConfig.targetValue
-    : Math.ceil((heuristicConfig?.targetValue || 100) / parseAvgSentences(heuristicConfig?.avgSentencesPerReview || '5'))
+  // Active target config (for display in Generation Settings)
+  const activeTargetConfig = typeof activeTarget === 'number' && targets[activeTarget]
+    ? targets[activeTarget]
+    : null
 
-  const totalBatches = heuristicProgress?.totalBatches || Math.ceil(totalReviews / (heuristicConfig?.reviewsPerBatch || 50))
+  // Calculate expected values based on active target (or legacy single-target config)
+  const displayTargetMode = activeTargetConfig?.targetMode || heuristicConfig?.targetMode || 'reviews'
+  const displayTargetValue = activeTargetConfig?.targetValue || heuristicConfig?.targetValue || 100
+  const displayBatchSize = activeTargetConfig?.reviewsPerBatch || heuristicConfig?.reviewsPerBatch || 50
+  const displayTotalRuns = activeTargetConfig?.totalRuns || heuristicConfig?.totalRuns || 1
+
+  const totalReviews = displayTargetMode === 'reviews'
+    ? displayTargetValue
+    : Math.ceil(displayTargetValue / parseAvgSentences(heuristicConfig?.avgSentencesPerReview || '5'))
+
+  const totalBatches = heuristicProgress?.totalBatches || Math.ceil(totalReviews / displayBatchSize)
 
   return (
     <div className="space-y-6">
@@ -309,6 +678,43 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
         </div>
       )}
 
+      {/* Target selector - only for multi-target jobs */}
+      {isMultiTarget && (
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Target:</span>
+          <div className="flex gap-1 flex-wrap">
+            <button
+              onClick={() => setActiveTarget('all')}
+              className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                activeTarget === 'all'
+                  ? 'text-white'
+                  : 'bg-muted/50 text-muted-foreground hover:bg-muted'
+              }`}
+              style={activeTarget === 'all' ? { backgroundColor: HEURISTIC_COLOR } : undefined}
+            >
+              All
+            </button>
+            {targets.map((target, idx) => {
+              const label = `${target.targetValue} ${target.targetMode === 'sentences' ? 'sent' : 'rev'}`
+              return (
+                <button
+                  key={idx}
+                  onClick={() => setActiveTarget(idx)}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                    activeTarget === idx
+                      ? 'text-white'
+                      : 'bg-muted/50 text-muted-foreground hover:bg-muted'
+                  }`}
+                  style={activeTarget === idx ? { backgroundColor: HEURISTIC_COLOR } : undefined}
+                >
+                  {label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Progress Section */}
       {(job.status === 'running' || job.status === 'evaluating') && (
         <div className="rounded-lg border p-4 space-y-4" style={{ borderColor: HEURISTIC_COLOR }}>
@@ -405,41 +811,67 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
             </h3>
             <div className="grid gap-3 text-sm">
               <div className="flex justify-between">
-                <span className="text-muted-foreground">LLM Model</span>
-                <span className="font-mono text-xs">{heuristicConfig?.model || 'N/A'}</span>
+                <span className="text-muted-foreground">LLM Model{heuristicConfig?.models && heuristicConfig.models.length > 1 ? 's' : ''}</span>
+                <div className="text-right">
+                  {heuristicConfig?.models && heuristicConfig.models.length > 1
+                    ? heuristicConfig.models.map((m, i) => (
+                        <div key={i} className="font-mono text-xs">{m}</div>
+                      ))
+                    : <span className="font-mono text-xs">{heuristicConfig?.model || heuristicConfig?.models?.[0] || 'N/A'}</span>
+                  }
+                </div>
               </div>
               <Separator />
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Target Mode</span>
-                <span className="capitalize">{heuristicConfig?.targetMode || 'reviews'}</span>
-              </div>
-              <Separator />
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Target Value</span>
-                <span>{heuristicConfig?.targetValue?.toLocaleString() || 'N/A'}</span>
-              </div>
-              <Separator />
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Reviews per Batch</span>
-                <span>{heuristicConfig?.reviewsPerBatch || 'N/A'}</span>
-              </div>
-              <Separator />
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Avg Sentences</span>
-                <span>{heuristicConfig?.avgSentencesPerReview || 'N/A'}</span>
-              </div>
-              <Separator />
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Total Batches</span>
-                <span>{totalBatches}</span>
-              </div>
-              {(heuristicConfig?.totalRuns && heuristicConfig.totalRuns > 1) && (
+              {isMultiTarget && activeTarget === 'all' ? (
                 <>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Targets</span>
+                    <span>{targets.length} target datasets</span>
+                  </div>
+                  <div className="space-y-1">
+                    {targets.map((t, i) => (
+                      <div key={i} className="flex justify-between text-xs text-muted-foreground pl-2">
+                        <span>Target {i + 1}</span>
+                        <span>{t.targetValue.toLocaleString()} {t.targetMode} · {t.totalRuns} run{t.totalRuns > 1 ? 's' : ''}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Target Mode</span>
+                    <span className="capitalize">{displayTargetMode}</span>
+                  </div>
                   <Separator />
                   <div className="flex justify-between">
-                    <span className="text-muted-foreground">Total Runs</span>
-                    <span className="font-medium text-amber-600 dark:text-amber-400">{heuristicConfig.totalRuns}</span>
+                    <span className="text-muted-foreground">Target Value</span>
+                    <span>{displayTargetValue.toLocaleString()}</span>
                   </div>
+                  <Separator />
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Reviews per Batch</span>
+                    <span>{displayBatchSize}</span>
+                  </div>
+                  <Separator />
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Avg Sentences</span>
+                    <span>{heuristicConfig?.avgSentencesPerReview || 'N/A'}</span>
+                  </div>
+                  <Separator />
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Total Batches</span>
+                    <span>{totalBatches}</span>
+                  </div>
+                  {displayTotalRuns > 1 && (
+                    <>
+                      <Separator />
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Total Runs</span>
+                        <span className="font-medium text-amber-600 dark:text-amber-400">{displayTotalRuns}</span>
+                      </div>
+                    </>
+                  )}
                 </>
               )}
               <Separator />
@@ -561,7 +993,7 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
           )}
 
           {/* MDQA Metrics */}
-          {job.evaluationMetrics && (
+          {(job.evaluationMetrics || (job.perTargetMetrics && job.perTargetMetrics.length > 0)) && (
             <Collapsible open={metricsExpanded} onOpenChange={setMetricsExpanded}>
               <div className="rounded-lg border overflow-hidden" style={{ borderColor: MDQA_COLOR }}>
                 <CollapsibleTrigger asChild>
@@ -575,187 +1007,11 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
                 </CollapsibleTrigger>
                 <CollapsibleContent>
                   <div className="border-t p-4 space-y-4">
-                    {(() => {
-                      const metrics = job.evaluationMetrics
-                      const fmt = (v: number | undefined) => v !== undefined ? v.toFixed(4) : '—'
-
-                      // Metric thresholds for quality indicators
-                      const METRIC_THRESHOLDS: Record<string, { poor: number; good: number; excellent: number; lowerIsBetter?: boolean }> = {
-                        bleu: { poor: 0.25, good: 0.40, excellent: 0.50 },
-                        rouge_l: { poor: 0.25, good: 0.40, excellent: 0.50 },
-                        bertscore: { poor: 0.55, good: 0.70, excellent: 0.85 },
-                        moverscore: { poor: 0.35, good: 0.50, excellent: 0.65 },
-                        distinct_1: { poor: 0.30, good: 0.50, excellent: 0.70 },
-                        distinct_2: { poor: 0.60, good: 0.80, excellent: 0.90 },
-                        self_bleu: { poor: 0.50, good: 0.30, excellent: 0.20, lowerIsBetter: true },
-                      }
-
-                      // Get quality indicator based on value and thresholds
-                      const getQualityIndicator = (metricKey: string, value: number | undefined) => {
-                        if (value === undefined) return null
-                        const threshold = METRIC_THRESHOLDS[metricKey]
-                        if (!threshold) return null
-
-                        if (threshold.lowerIsBetter) {
-                          if (value <= threshold.excellent) return { label: 'Excellent', color: 'text-green-600 dark:text-green-400' }
-                          if (value <= threshold.good) return { label: 'Good', color: 'text-blue-600 dark:text-blue-400' }
-                          if (value <= threshold.poor) return { label: 'Fair', color: 'text-amber-600 dark:text-amber-400' }
-                          return { label: 'Poor', color: 'text-red-600 dark:text-red-400' }
-                        } else {
-                          if (value >= threshold.excellent) return { label: 'Excellent', color: 'text-green-600 dark:text-green-400' }
-                          if (value >= threshold.good) return { label: 'Good', color: 'text-blue-600 dark:text-blue-400' }
-                          if (value >= threshold.poor) return { label: 'Fair', color: 'text-amber-600 dark:text-amber-400' }
-                          return { label: 'Poor', color: 'text-red-600 dark:text-red-400' }
-                        }
-                      }
-
-                      // Metric card component
-                      const MetricCard = ({ label, value, higherIsBetter, metricKey }: { label: string; value: number | undefined; higherIsBetter: boolean; metricKey: string }) => {
-                        const threshold = METRIC_THRESHOLDS[metricKey]
-                        const quality = getQualityIndicator(metricKey, value)
-                        const thresholdText = threshold ? (
-                          threshold.lowerIsBetter
-                            ? `≤${threshold.good} good · ≤${threshold.excellent} excellent`
-                            : `≥${threshold.good} good · ≥${threshold.excellent} excellent`
-                        ) : ''
-
-                        return (
-                          <div className="rounded-lg border p-3 text-center">
-                            <p className="text-xs text-muted-foreground mb-1">{label}</p>
-                            <div className="flex items-center justify-center gap-2">
-                              <p className="text-xl font-bold" style={{ color: MDQA_COLOR }}>{fmt(value)}</p>
-                              {quality && (
-                                <span className={`text-[10px] font-medium ${quality.color}`}>
-                                  {quality.label}
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-[10px] text-muted-foreground/70 mt-1">
-                              {higherIsBetter ? '↑ higher is better' : '↓ lower is better'}
-                            </p>
-                            {thresholdText && (
-                              <p className="text-[9px] text-muted-foreground/50 mt-0.5">
-                                {thresholdText}
-                              </p>
-                            )}
-                          </div>
-                        )
-                      }
-
-                      // Ordered metric keys for consistent display
-                      const METRIC_ORDER: Array<{ key: string; label: string }> = [
-                        { key: 'bleu', label: 'BLEU' },
-                        { key: 'rouge_l', label: 'ROUGE-L' },
-                        { key: 'bertscore', label: 'BERTScore' },
-                        { key: 'moverscore', label: 'MoverScore' },
-                        { key: 'distinct_1', label: 'Distinct-1' },
-                        { key: 'distinct_2', label: 'Distinct-2' },
-                        { key: 'self_bleu', label: 'Self-BLEU' },
-                      ]
-
-                      // Check if reference metrics are available
-                      const hasLexicalMetrics = metrics.bleu !== undefined || metrics.rouge_l !== undefined
-                      const hasSemanticMetrics = metrics.bertscore !== undefined || metrics.moverscore !== undefined
-                      const hasDiversityMetrics = metrics.distinct_1 !== undefined || metrics.distinct_2 !== undefined || metrics.self_bleu !== undefined
-
-                      return (
-                        <>
-                          {/* Lexical Metrics */}
-                          {hasLexicalMetrics && (
-                            <div>
-                              <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Lexical</h4>
-                              <div className="grid gap-3 sm:grid-cols-2">
-                                <MetricCard label="BLEU" value={metrics.bleu} higherIsBetter={true} metricKey="bleu" />
-                                <MetricCard label="ROUGE-L" value={metrics.rouge_l} higherIsBetter={true} metricKey="rouge_l" />
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Semantic Metrics */}
-                          {hasSemanticMetrics && (
-                            <div>
-                              <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Semantic</h4>
-                              <div className="grid gap-3 sm:grid-cols-2">
-                                <MetricCard label="BERTScore" value={metrics.bertscore} higherIsBetter={true} metricKey="bertscore" />
-                                <MetricCard label="MoverScore" value={metrics.moverscore} higherIsBetter={true} metricKey="moverscore" />
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Diversity Metrics */}
-                          {hasDiversityMetrics && (
-                            <div>
-                              <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Diversity</h4>
-                              <div className="grid gap-3 sm:grid-cols-3">
-                                <MetricCard label="Distinct-1" value={metrics.distinct_1} higherIsBetter={true} metricKey="distinct_1" />
-                                <MetricCard label="Distinct-2" value={metrics.distinct_2} higherIsBetter={true} metricKey="distinct_2" />
-                                <MetricCard label="Self-BLEU" value={metrics.self_bleu} higherIsBetter={false} metricKey="self_bleu" />
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Multi-run average metrics (if available) */}
-                          {job.averageMetrics && Object.keys(job.averageMetrics).length > 0 && (
-                            <div className="mt-4 pt-4 border-t">
-                              <h4 className="text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wider mb-3">
-                                Average Across {job.totalRuns || job.heuristicConfig?.totalRuns || 0} Runs (with ± std)
-                              </h4>
-                              <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-4">
-                                {METRIC_ORDER
-                                  .filter(({ key }) => job.averageMetrics![key])
-                                  .map(({ key, label }) => {
-                                    const value = job.averageMetrics![key]
-                                    return (
-                                      <div key={key} className="rounded-lg border bg-amber-50 dark:bg-amber-950/20 p-2 text-center">
-                                        <p className="text-[10px] text-muted-foreground uppercase">{label}</p>
-                                        <p className="text-sm font-semibold text-amber-700 dark:text-amber-300">
-                                          {value.mean?.toFixed(4) || '—'}
-                                          {value.std !== undefined && value.std !== null && (
-                                            <span className="text-[10px] font-normal text-muted-foreground">
-                                              {' '}± {value.std.toFixed(4)}
-                                            </span>
-                                          )}
-                                        </p>
-                                      </div>
-                                    )
-                                  })}
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Per-run metrics breakdown (if available) */}
-                          {job.perRunMetrics && job.perRunMetrics.length > 0 && (
-                            <div className="mt-4">
-                              <details className="text-xs">
-                                <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-                                  View per-run breakdown ({job.perRunMetrics.length} runs)
-                                </summary>
-                                <div className="mt-2 space-y-2">
-                                  {job.perRunMetrics.map((runData) => (
-                                    <div key={runData.run} className="rounded border p-2 bg-muted/30">
-                                      <div className="flex justify-between items-center mb-1">
-                                        <span className="font-medium">Run {runData.run}</span>
-                                        <span className="text-muted-foreground">{runData.datasetFile}</span>
-                                      </div>
-                                      <div className="flex flex-wrap gap-2">
-                                        {METRIC_ORDER
-                                          .filter(({ key }) => (runData.metrics as Record<string, number | undefined>)[key] !== undefined && (runData.metrics as Record<string, number | undefined>)[key] !== null)
-                                          .map(({ key, label }) => (
-                                            <span key={key} className="inline-flex items-center gap-1 text-[10px]">
-                                              <span className="text-muted-foreground">{label}:</span>
-                                              <span className="font-medium">{((runData.metrics as Record<string, number>)[key]).toFixed(4)}</span>
-                                            </span>
-                                          ))}
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                              </details>
-                            </div>
-                          )}
-                        </>
-                      )
-                    })()}
+                    <MetricsDisplay
+                      job={job}
+                      activeTarget={activeTarget}
+                      isMultiTarget={isMultiTarget}
+                    />
                   </div>
                 </CollapsibleContent>
               </div>

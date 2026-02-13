@@ -101,6 +101,11 @@ function useServiceStatus() {
     }
 
     const validateTavily = async () => {
+      // Don't ping Tavily when it's toggled off
+      if (settings?.tavilyEnabled === false) {
+        setTavilyStatus('not_configured')
+        return
+      }
       if (!settings?.tavilyApiKey) {
         setTavilyStatus('not_configured')
         return
