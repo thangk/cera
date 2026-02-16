@@ -663,8 +663,8 @@ function GenerateWizard() {
     return defaultOptions
   })
 
-  // Ceiling Test state (split dataset into two halves for ceiling metrics)
-  const [ceilingTest, setCeilingTest] = useState({ enabled: false, splitMode: 'random' as 'random' | 'sequential' })
+  // Self Test state (split dataset into two halves for self-referencing metrics)
+  const [selfTest, setSelfTest] = useState({ enabled: false, splitMode: 'random' as 'random' | 'sequential' })
 
   // RDE (Reference Dataset Extraction) state
   const [rdeModel, setRdeModel] = useState<string>('')
@@ -692,6 +692,8 @@ function GenerateWizard() {
     total_reviews: number
   }
   const [extractedRefContext, setExtractedRefContext] = useState<ExtractedRefContext | null>(null)
+  // RDE token usage records (forwarded to pipeline for tokens.json)
+  const [rdeUsage, setRdeUsage] = useState<Array<Record<string, unknown>> | null>(null)
 
   // Local storage key for ref-context cache
   const REF_CONTEXT_CACHE_KEY = 'cera-ref-context-cache'
@@ -1755,6 +1757,10 @@ function GenerateWizard() {
 
       // Set the extracted context
       setExtractedRefContext(result)
+      // Store RDE token usage for forwarding to pipeline
+      if (result.rde_usage) {
+        setRdeUsage(result.rde_usage)
+      }
       setRdeExtractionState({ status: 'success', progress: 'Extraction complete', step: 6, totalSteps: 6 })
 
       // Auto-apply extracted values to config (don't rely on child effects)
@@ -1995,6 +2001,10 @@ function GenerateWizard() {
                   transformedConfig.reviewer_profile.additional_context = existingContext + separator + extractedReviewerContext
                 }
 
+                // Store RDE usage from legacy extraction too
+                if (result.rde_usage) {
+                  setRdeUsage(result.rde_usage)
+                }
                 toast.success(`Context extracted from ${result.sample_count} reviews`)
               }
             }
@@ -2031,15 +2041,16 @@ function GenerateWizard() {
         phases: selectedPhases,
         evaluationConfig: selectedPhases.includes('evaluation') ? {
           metrics: config.evaluation.metrics,
-          reference_metrics_enabled: ceilingTest.enabled || !!referenceDatasetFile || (!selectedPhases.includes('composition') && reusedFrom && !!sourceConfig?.referenceDataset?.useForEvaluation),
-          reference_file: referenceDatasetFile ? referenceDatasetFile.name : (!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation ? sourceConfig.referenceDataset.fileName : undefined),
-          ceiling_test: ceilingTest.enabled ? { enabled: true, split_mode: ceilingTest.splitMode } : undefined,
+          reference_metrics_enabled: selfTest.enabled || (referenceOptions.useForEvaluation && !!referenceDatasetFile) || (!selectedPhases.includes('composition') && reusedFrom && !!sourceConfig?.referenceDataset?.useForEvaluation),
+          reference_file: selfTest.enabled ? undefined : (referenceDatasetFile && referenceOptions.useForEvaluation ? referenceDatasetFile.name : (!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation ? sourceConfig.referenceDataset.fileName : undefined)),
+          self_test: selfTest.enabled ? { enabled: true, split_mode: selfTest.splitMode } : undefined,
         } : undefined,
         datasetFile: datasetFile ? datasetFile.name : undefined,
         reusedFrom: reusedFrom || undefined,
         referenceDataset: referenceDatasetConfig,
         estimatedCost,
         method,
+        rdeUsage: rdeUsage || undefined,
       })
 
       // Upload dataset file if present (EVAL-only jobs)
@@ -2058,8 +2069,8 @@ function GenerateWizard() {
         }
       }
 
-      // Upload reference dataset file if present (for Lexical/Semantic metrics) — skip during ceiling test
-      if (referenceDatasetFile && selectedPhases.includes('evaluation') && !ceilingTest.enabled) {
+      // Upload reference dataset file if present (for Lexical/Semantic metrics) — skip during self test
+      if (referenceDatasetFile && selectedPhases.includes('evaluation') && !selfTest.enabled && referenceOptions.useForEvaluation) {
         try {
           const formData = new FormData()
           formData.append('file', referenceDatasetFile)
@@ -2529,56 +2540,63 @@ function GenerateWizard() {
                 </div>
               )}
 
-              {/* Ceiling Test Toggle - shown in EVALUATION-only mode */}
-              {selectedPhases.includes('evaluation') && !selectedPhases.includes('generation') && !selectedPhases.includes('composition') && (
+              {/* Self Test Toggle - shown in any mode with evaluation */}
+              {selectedPhases.includes('evaluation') && (
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
                       <Activity className="h-5 w-5 text-muted-foreground" />
                       <div>
-                        <Label className="text-sm font-medium">Ceiling Test</Label>
+                        <Label className="text-sm font-medium">Self Test</Label>
                         <p className="text-xs text-muted-foreground">
-                          Splits the uploaded dataset into two halves and compares them to establish maximum realistic metric scores
+                          {selectedPhases.includes('generation')
+                            ? 'Splits generated reviews into two halves and compares them against each other (no external reference needed)'
+                            : 'Splits the uploaded dataset into two halves and compares them against each other'}
                         </p>
                       </div>
                     </div>
                     <Switch
-                      checked={ceilingTest.enabled}
+                      checked={selfTest.enabled}
                       onCheckedChange={(checked) => {
-                        setCeilingTest(prev => ({ ...prev, enabled: checked }))
+                        setSelfTest(prev => ({ ...prev, enabled: checked }))
                         if (checked) {
-                          setReferenceDatasetFile(null)
+                          // In EVAL-only mode, clear the reference file (it's replaced by self-test)
+                          if (!selectedPhases.includes('generation') && !selectedPhases.includes('composition')) {
+                            setReferenceDatasetFile(null)
+                          }
+                          // In all modes: uncheck "Use for MDQA evaluation comparison" (mutual exclusivity)
+                          setReferenceOptions(prev => ({ ...prev, useForEvaluation: false }))
                         }
                       }}
                     />
                   </div>
 
-                  {ceilingTest.enabled && (
+                  {selfTest.enabled && (
                     <div className="space-y-2 pt-2 border-t">
                       <Label className="text-xs text-muted-foreground">Split Mode</Label>
                       <div className="flex gap-2">
                         <Button
                           type="button"
                           size="sm"
-                          variant={ceilingTest.splitMode === 'random' ? 'default' : 'outline'}
+                          variant={selfTest.splitMode === 'random' ? 'default' : 'outline'}
                           className="flex-1"
-                          onClick={() => setCeilingTest(prev => ({ ...prev, splitMode: 'random' }))}
+                          onClick={() => setSelfTest(prev => ({ ...prev, splitMode: 'random' }))}
                         >
                           Random 50% Split
                         </Button>
                         <Button
                           type="button"
                           size="sm"
-                          variant={ceilingTest.splitMode === 'sequential' ? 'default' : 'outline'}
+                          variant={selfTest.splitMode === 'sequential' ? 'default' : 'outline'}
                           className="flex-1"
-                          onClick={() => setCeilingTest(prev => ({ ...prev, splitMode: 'sequential' }))}
+                          onClick={() => setSelfTest(prev => ({ ...prev, splitMode: 'sequential' }))}
                         >
                           Normal 50% Split
                         </Button>
                       </div>
                       <p className="text-xs text-muted-foreground">
-                        {ceilingTest.splitMode === 'random'
-                          ? 'Randomly assigns each review to Set A or Set B (~50/50). Recommended for unbiased ceiling metrics.'
+                        {selfTest.splitMode === 'random'
+                          ? 'Randomly assigns each review to Set A or Set B (~50/50). Recommended for unbiased self-referencing metrics.'
                           : 'First half of reviews → Set A, second half → Set B. Useful when review order matters.'}
                       </p>
                     </div>
@@ -2586,9 +2604,9 @@ function GenerateWizard() {
                 </div>
               )}
 
-              {/* Reference Dataset - shown when COMPOSITION selected OR (EVALUATION without composition source), hidden during ceiling test */}
+              {/* Reference Dataset - shown when COMPOSITION selected OR (EVAL-only without Self Test) */}
               {(selectedPhases.includes('composition') ||
-                (selectedPhases.includes('evaluation') && !selectedPhases.includes('generation') && !ceilingTest.enabled)) && (
+                (selectedPhases.includes('evaluation') && !selectedPhases.includes('generation') && !selfTest.enabled)) && (
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
@@ -2740,9 +2758,13 @@ function GenerateWizard() {
                           <Checkbox
                             id="use-for-evaluation"
                             checked={referenceOptions.useForEvaluation}
-                            onCheckedChange={(checked) =>
+                            onCheckedChange={(checked) => {
                               setReferenceOptions(prev => ({ ...prev, useForEvaluation: !!checked }))
-                            }
+                              if (checked) {
+                                // Mutual exclusivity: disable Self Test when using reference for eval
+                                setSelfTest(prev => ({ ...prev, enabled: false }))
+                              }
+                            }}
                           />
                           <div className="space-y-1">
                             <label htmlFor="use-for-evaluation" className="text-sm font-medium cursor-pointer">
@@ -3411,7 +3433,7 @@ function GenerateWizard() {
               onReferenceFileChange={setReferenceDatasetFile}
               referenceFromInput={selectedPhases.includes('composition') && referenceOptions.useForEvaluation && !!referenceDatasetFile}
               inheritedReferenceName={!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation ? sourceConfig.referenceDataset.fileName : undefined}
-              ceilingTestEnabled={ceilingTest.enabled}
+              selfTestEnabled={selfTest.enabled}
             />
           )}
 
@@ -3657,9 +3679,8 @@ function GenerateWizard() {
                         <span className="text-muted-foreground">Reference Dataset</span>
                         {(() => {
                           const inheritedRef = !selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation
-                          const hasRef = ceilingTest.enabled || !!referenceDatasetFile || !!inheritedRef
-                          if (ceilingTest.enabled) return <span className="font-medium text-green-600 dark:text-green-400 text-xs">Ceiling Test ({ceilingTest.splitMode === 'random' ? 'Random' : 'Normal'} 50% Split)</span>
-                          if (referenceDatasetFile) return <span className="font-medium text-green-600 dark:text-green-400 text-xs">{referenceDatasetFile.name}</span>
+                          if (selfTest.enabled) return <span className="font-medium text-green-600 dark:text-green-400 text-xs">Self Test ({selfTest.splitMode === 'random' ? 'Random' : 'Normal'} 50% Split)</span>
+                          if (referenceDatasetFile && referenceOptions.useForEvaluation) return <span className="font-medium text-green-600 dark:text-green-400 text-xs">{referenceDatasetFile.name}</span>
                           if (inheritedRef) return <span className="font-medium text-green-600 dark:text-green-400 text-xs">{sourceConfig.referenceDataset.fileName} (inherited)</span>
                           return <span className="text-muted-foreground/60 italic text-xs">Not provided (Lexical/Semantic skipped)</span>
                         })()}
@@ -3667,7 +3688,7 @@ function GenerateWizard() {
                       <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Metrics</span>
                         <span className="font-medium">
-                          {(referenceDatasetFile || ceilingTest.enabled || (!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation))
+                          {(selfTest.enabled || (referenceDatasetFile && referenceOptions.useForEvaluation) || (!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation))
                             ? `${config.evaluation.metrics.length} selected`
                             : `${config.evaluation.metrics.filter((m: string) => ['distinct_1', 'distinct_2', 'self_bleu'].includes(m)).length} active (Diversity only)`
                           }
@@ -3675,7 +3696,7 @@ function GenerateWizard() {
                       </div>
                       <div className="flex flex-wrap gap-1 mt-1">
                         {config.evaluation.metrics.map((m: string) => {
-                          const isDisabled = !referenceDatasetFile && !ceilingTest.enabled && !(!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation) && !['distinct_1', 'distinct_2', 'self_bleu'].includes(m)
+                          const isDisabled = !selfTest.enabled && !(referenceDatasetFile && referenceOptions.useForEvaluation) && !(!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation) && !['distinct_1', 'distinct_2', 'self_bleu'].includes(m)
                           return (
                             <Badge
                               key={m}
@@ -4497,7 +4518,7 @@ function EvaluationPhase({
   onReferenceFileChange,
   referenceFromInput,
   inheritedReferenceName,
-  ceilingTestEnabled,
+  selfTestEnabled,
 }: {
   config: any
   updateConfig: (path: string, value: any) => void
@@ -4505,7 +4526,7 @@ function EvaluationPhase({
   onReferenceFileChange: (file: File | null) => void
   referenceFromInput?: boolean // True when reference file is set from INPUT tab
   inheritedReferenceName?: string // File name of reference dataset inherited from a reused job
-  ceilingTestEnabled?: boolean // True when ceiling test mode is active (splits dataset)
+  selfTestEnabled?: boolean // True when self test mode is active (splits dataset)
 }) {
   const METRIC_INFO: Record<string, { label: string; category: string; description: string; detail: string; requiresReference?: boolean }> = {
     bertscore: { label: 'BERTScore', category: 'Semantic', description: 'Contextual similarity using BERT embeddings', detail: 'Computes token-level cosine similarity between generated and reference texts using contextual BERT embeddings. Captures meaning beyond exact word matches. Scores range from 0 to 1, where higher means more semantically similar.', requiresReference: true },
@@ -4517,8 +4538,8 @@ function EvaluationPhase({
     self_bleu: { label: 'Self-BLEU', category: 'Diversity', description: 'Intra-corpus similarity (lower = more diverse)', detail: 'Computes BLEU score of each generated text against all other generated texts, then averages. Measures how similar generated reviews are to each other. Lower scores indicate greater diversity within the corpus.' },
   }
 
-  // Reference metrics are enabled when a reference file is provided or ceiling test is active
-  const referenceMetricsEnabled = !!referenceFile || !!inheritedReferenceName || !!ceilingTestEnabled
+  // Reference metrics are enabled when a reference file is provided or self test is active
+  const referenceMetricsEnabled = !!referenceFile || !!inheritedReferenceName || !!selfTestEnabled
 
   const toggleMetric = (metric: string) => {
     const current = config.evaluation.metrics as string[]
@@ -4564,7 +4585,7 @@ function EvaluationPhase({
                 variant={referenceMetricsEnabled ? 'default' : 'secondary'}
                 className="text-[10px] px-1.5"
               >
-                {ceilingTestEnabled ? 'Ceiling Test' : referenceFromInput ? 'From Input' : inheritedReferenceName ? 'Inherited' : referenceMetricsEnabled ? 'Provided' : 'Optional'}
+                {selfTestEnabled ? 'Self Test' : referenceFromInput ? 'From Input' : inheritedReferenceName ? 'Inherited' : referenceMetricsEnabled ? 'Provided' : 'Optional'}
               </Badge>
               <TooltipProvider delayDuration={200}>
                 <Tooltip>
@@ -4581,8 +4602,8 @@ function EvaluationPhase({
               </TooltipProvider>
             </div>
             <p className="text-sm text-muted-foreground mt-1">
-              {ceilingTestEnabled
-                ? 'Dataset will be split into two halves for ceiling metric computation'
+              {selfTestEnabled
+                ? 'Dataset will be split into two halves for self-referencing metric computation'
                 : referenceFromInput
                 ? 'Configured in Input tab'
                 : inheritedReferenceName
@@ -4592,15 +4613,15 @@ function EvaluationPhase({
           </div>
 
           {/* Reference Dataset Status Indicator */}
-          {ceilingTestEnabled ? (
+          {selfTestEnabled ? (
             <div className="rounded-lg border border-green-500/30 bg-green-500/5 p-4 space-y-2">
               <div className="flex items-center gap-2">
                 <Activity className="h-4 w-4 text-green-600 dark:text-green-400" />
-                <span className="text-sm font-medium">Ceiling Test Mode</span>
+                <span className="text-sm font-medium">Self Test Mode</span>
                 <Badge variant="outline" className="text-xs border-green-500/30 text-green-600 dark:text-green-400">Active</Badge>
               </div>
               <p className="text-xs text-muted-foreground">
-                The uploaded dataset will be split into two halves. Set A is evaluated against Set B as the reference, establishing the maximum realistic metric scores.
+                The dataset will be split into two halves. Set A is evaluated against Set B as the reference, producing self-referencing metric scores.
               </p>
             </div>
           ) : referenceFile ? (
