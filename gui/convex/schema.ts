@@ -114,9 +114,13 @@ export default defineSchema({
       metrics: v.array(v.string()), // ["bertscore", "bleu", "rouge_l", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
       reference_metrics_enabled: v.optional(v.boolean()), // Whether Lexical/Semantic metrics use reference
       reference_file: v.optional(v.string()), // Reference file name for MDQA comparison
-      ceiling_test: v.optional(v.object({
+      self_test: v.optional(v.object({
         enabled: v.boolean(),
         split_mode: v.string(), // "random" | "sequential"
+      })),
+      ceiling_test: v.optional(v.object({ // deprecated: renamed to self_test
+        enabled: v.boolean(),
+        split_mode: v.string(),
       })),
     })),
     // Reference dataset configuration (for context extraction and/or MDQA comparison)
@@ -126,6 +130,8 @@ export default defineSchema({
       extractedSubjectContext: v.optional(v.boolean()),  // Was subject context extracted?
       extractedReviewerContext: v.optional(v.boolean()), // Was reviewer context extracted?
     })),
+    // Pre-job RDE token usage records (serialized LLMUsage dicts from context extraction)
+    rdeUsage: v.optional(v.any()),
     // Path to uploaded dataset (for EVALUATION-only jobs)
     datasetFile: v.optional(v.string()),
     status: v.union(

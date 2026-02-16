@@ -98,22 +98,41 @@ export const listForResearch = query({
       (job) => job.status === "completed"
     );
 
-    return evaluated.map((job) => ({
-      _id: job._id,
-      name: job.name,
-      method: job.method || "cera",
-      generationCount:
-        job.config?.generation?.count ??
-        job.heuristicConfig?.targetValue ??
-        0,
-      totalRuns: job.totalRuns ?? 1,
-      averageMetrics: job.averageMetrics,
-      evaluationMetrics: job.evaluationMetrics,
-      perRunMetrics: job.perRunMetrics,
-      perModelMetrics: job.perModelMetrics,
-      jobDir: job.jobDir,
-      createdAt: job.createdAt,
-    }));
+    return evaluated.map((job) => {
+      // Extract available target sizes from config
+      const ceraTargets = job.config?.generation?.targets as Array<{ target_value: number; count_mode: string }> | undefined;
+      const heuristicTargets = job.heuristicConfig?.targets as Array<{ targetValue: number; targetMode: string }> | undefined;
+      const targets = ceraTargets?.map(t => ({ value: t.target_value, countMode: t.count_mode }))
+        ?? heuristicTargets?.map(t => ({ value: t.targetValue, countMode: t.targetMode }))
+        ?? null;
+
+      // Extract generation model slug(s) from config
+      const ceraModel = job.config?.generation?.model as string | undefined;
+      const ceraModels = job.config?.generation?.models as string[] | undefined;
+      const heuristicModel = job.heuristicConfig?.model as string | undefined;
+      const modelSlugs = (ceraModels ?? (ceraModel ? [ceraModel] : (heuristicModel ? [heuristicModel] : [])))
+        .map((m: string) => m.split("/").pop() || m);
+
+      return {
+        _id: job._id,
+        name: job.name,
+        method: job.method || "cera",
+        generationCount:
+          job.config?.generation?.count ??
+          job.heuristicConfig?.targetValue ??
+          0,
+        totalRuns: job.totalRuns ?? 1,
+        averageMetrics: job.averageMetrics,
+        evaluationMetrics: job.evaluationMetrics,
+        perRunMetrics: job.perRunMetrics,
+        perModelMetrics: job.perModelMetrics,
+        perTargetMetrics: job.perTargetMetrics ?? null,
+        targets,
+        jobDir: job.jobDir,
+        createdAt: job.createdAt,
+        modelSlugs,
+      };
+    });
   },
 });
 
@@ -229,7 +248,7 @@ export const create = mutation({
       metrics: v.array(v.string()),
       reference_metrics_enabled: v.optional(v.boolean()),
       reference_file: v.optional(v.string()),
-      ceiling_test: v.optional(v.object({
+      self_test: v.optional(v.object({
         enabled: v.boolean(),
         split_mode: v.string(),
       })),
@@ -245,6 +264,8 @@ export const create = mutation({
       extractedSubjectContext: v.optional(v.boolean()),
       extractedReviewerContext: v.optional(v.boolean()),
     })),
+    // Pre-job RDE token usage records (from context extraction, forwarded to pipeline)
+    rdeUsage: v.optional(v.any()),
     // Cost estimates from job creation (for comparison with actual)
     estimatedCost: v.optional(v.object({
       composition: v.object({
@@ -324,6 +345,8 @@ export const create = mutation({
       // Heuristic method fields (optional, only set for heuristic jobs)
       method: args.method || "cera",
       heuristicConfig: args.heuristicConfig,
+      // Pre-job RDE token usage (from context extraction)
+      rdeUsage: args.rdeUsage,
     });
     return jobId;
   },

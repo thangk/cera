@@ -131,6 +131,8 @@ export const runPipeline = action({
           // Heuristic method fields
           method: job.method || "cera",
           heuristicConfig: job.heuristicConfig || null,
+          // Pre-job RDE token usage (from context extraction)
+          rdeUsage: job.rdeUsage || null,
         }),
       });
 
