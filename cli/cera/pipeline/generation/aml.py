@@ -75,7 +75,7 @@ class AuthenticityModelingLayer:
         """Get or create the OpenRouter client."""
         if self._client is None:
             from cera.llm.openrouter import OpenRouterClient
-            self._client = OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker)
+            self._client = OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="aml")
         return self._client
 
     def _determine_polarity(self, polarity_dist: dict) -> str:

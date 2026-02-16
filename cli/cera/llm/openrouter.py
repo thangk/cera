@@ -102,11 +102,16 @@ class OpenRouterClient:
         "deepseek-r1": "deepseek/deepseek-r1",
     }
 
-    def __init__(self, api_key: str, site_url: str = "", site_name: str = "CERA", usage_tracker=None):
+    def __init__(self, api_key: str, site_url: str = "", site_name: str = "CERA", usage_tracker=None,
+                 component: str = "", target: str = "", run: str = ""):
         self.api_key = api_key
         self.site_url = site_url
         self.site_name = site_name
         self.usage_tracker = usage_tracker
+        # Labels baked into every record from this client (for parallel-safe tracking)
+        self._component = component
+        self._target = target
+        self._run = run
         self.client = httpx.AsyncClient()
 
     def _get_model_id(self, model: str) -> str:
@@ -201,6 +206,10 @@ class OpenRouterClient:
                     completion_tokens=usage.get("completion_tokens", 0),
                     total_tokens=usage.get("total_tokens", 0),
                     model=model_id,
+                    component=self._component,
+                    target=self._target,
+                    run=self._run,
+                    generation_id=data.get("id", ""),
                 ))
 
         logger.debug("llm_call", model=model_id, tokens=data.get("usage", {}).get("total_tokens"))
@@ -276,6 +285,10 @@ class OpenRouterClient:
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),
                 model=actual_model,
+                component=self._component,
+                target=self._target,
+                run=self._run,
+                generation_id=gen_id or "",
             ))
 
         return ChatResponse(

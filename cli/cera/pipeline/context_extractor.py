@@ -108,12 +108,12 @@ class ContextExtractor:
             reviews_json=reviews_json,
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="rde.subject") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,  # Lower temperature for more consistent extraction
-                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
+                max_tokens=16384,  # Generous headroom for reasoning models' thinking tokens
             )
 
         # Clean up response (remove any markdown formatting if present)
@@ -156,12 +156,12 @@ class ContextExtractor:
             reviews_json=reviews_json,
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="rde.reviewer") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
+                max_tokens=16384,  # Generous headroom for reasoning models' thinking tokens
             )
 
         # Clean up response
@@ -203,12 +203,12 @@ class ContextExtractor:
             reviews_json=reviews_json,
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="rde.query") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
+                max_tokens=16384,  # Generous headroom for reasoning models' thinking tokens
             )
 
         # Clean up response - just the query, no quotes or extra text
@@ -250,12 +250,12 @@ class ContextExtractor:
             reviews_json=reviews_json,
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="rde.domain") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
+                max_tokens=16384,  # Generous headroom for reasoning models' thinking tokens
             )
 
         # Parse JSON response using robust extractor
@@ -301,12 +301,12 @@ class ContextExtractor:
             reviews_json=reviews_json,
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="rde.region") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=0.3,
-                max_tokens=2048,  # Reasoning models need headroom for thinking tokens
+                max_tokens=16384,  # Generous headroom for reasoning models' thinking tokens
             )
 
         # Parse JSON response using robust extractor

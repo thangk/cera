@@ -155,6 +155,19 @@ class PipelineExecutor:
 
         self.mdqa = MultiDimensionalQualityAssessment(use_gpu=False)
 
+    def _save_tokens(self):
+        """Incrementally save tokens.json to the output directory."""
+        if self.usage_tracker.total_tokens == 0:
+            return
+        try:
+            output_dir = Path(self.config.output.directory)
+            reports_dir = output_dir / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            job_id = getattr(self.config, 'job_id', '') or output_dir.name
+            self.usage_tracker.save_tokens_json(reports_dir / "tokens.json", job_id, "cera")
+        except Exception as e:
+            logger.warning("tokens_json_save_failed", error=str(e))
+
     def _update_progress(self, progress: int, phase: str):
         """Update progress via callback if available."""
         if self.progress_callback:
@@ -478,6 +491,7 @@ class PipelineExecutor:
         try:
             # Phase 1: Composition (runs once regardless of total_runs/targets)
             subject_ctx, reviewer_contexts, attrs_ctx = await self._run_composition_phase()
+            self._save_tokens()  # Incremental save after composition
 
             # Multi-target loop: iterate over each target size
             target_list = effective_targets if is_multi_target else [None]
@@ -513,6 +527,11 @@ class PipelineExecutor:
                     if run > 1:
                         self.console.print("[dim]  RGM[/dim] Regenerating reviewer profiles...")
                         reviewer_contexts = self.rgm.generate_profiles(self.config.generation.count)
+
+                    # Set target/run context for token tracking
+                    target_label = str(target.target_value) if target else ""
+                    run_label = f"run{run}" if total_runs > 1 else ""
+                    self.usage_tracker.set_context(target=target_label, run=run_label)
 
                     # Generate reviews
                     reviews = await self._run_generation_phase(subject_ctx, reviewer_contexts, attrs_ctx)
@@ -554,6 +573,9 @@ class PipelineExecutor:
                         self.console.print(f"\n[dim]  Total cost ({total_runs} run{'s' if total_runs > 1 else ''}): ${cost_summary['total_cost_usd']:.4f}[/dim]")
                 except Exception as e:
                     logger.warning("pricing_fetch_failed", error=str(e))
+
+            # Final tokens.json save (now includes pricing data)
+            self._save_tokens()
 
             self._update_progress(100, "complete")
 

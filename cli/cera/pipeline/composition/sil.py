@@ -304,7 +304,7 @@ class SubjectIntelligenceLayer:
         # Step 1: Understand the subject type
         prompt = load_and_format("sil", "understand", subject=subject)
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.research") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=model,
@@ -343,7 +343,7 @@ class SubjectIntelligenceLayer:
             queries_str = ", ".join(understanding.search_queries)
             search_prompt = load_and_format("sil", "search", subject=subject, queries=queries_str)
 
-            async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+            async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.search") as client:
                 search_response = await client.chat(
                     messages=[{"role": "user", "content": search_prompt}],
                     model=search_model,
@@ -394,7 +394,7 @@ class SubjectIntelligenceLayer:
             research_context_block=research_context_block,
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.queries") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=model,
@@ -588,7 +588,7 @@ class SubjectIntelligenceLayer:
         # and can cause JSON parse failures (e.g., Opus with :online suffix).
         use_model = model
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.answers") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=use_model,
@@ -654,7 +654,7 @@ class SubjectIntelligenceLayer:
             topics_json=json.dumps(topics, indent=2, ensure_ascii=False),
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.judge") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=judge_model,
@@ -926,7 +926,7 @@ class SubjectIntelligenceLayer:
         # Use first available model for classification
         classify_model = self.mav_config.models[0] if self.mav_config.models else "anthropic/claude-sonnet-4"
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.classify") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=classify_model,
@@ -1008,7 +1008,7 @@ class SubjectIntelligenceLayer:
             output_schema=output_schema,
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.cluster") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=model,
@@ -1086,7 +1086,7 @@ class SubjectIntelligenceLayer:
             clustering_json=json.dumps(clustering, indent=2),
         )
 
-        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker) as client:
+        async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.cluster_judge") as client:
             response = await client.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=judge_model,

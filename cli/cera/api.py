@@ -205,12 +205,9 @@ def create_job_directory(jobs_dir: str, job_id: str, job_name: str) -> dict[str,
     Structure:
     {jobs_dir}/{job_id}-{sanitized_name}/
     ├── contexts/      # Composition context files (shared across targets)
-    ├── amls/          # AML prompt files (single-target legacy)
     ├── mavs/          # MAV raw data (shared)
-    ├── metrics/       # Evaluation metrics (single-target legacy)
     ├── reports/       # Analysis reports (shared)
-    ├── dataset/       # Final dataset (single-target legacy)
-    ├── datasets/      # Multi-target datasets (per-target subdirs via create_target_directory)
+    ├── datasets/      # Per-target subdirs via create_target_directory()
     └── config.json
 
     Returns:
@@ -1128,7 +1125,7 @@ class ConvexClient:
         generated: int, failed: int, target: int, progress: int,
         status: str, eval_progress: int = 0,
     ):
-        """Update per-model progress. Routes to PocketBase when available."""
+        """Update per-model progress. Sends to both PocketBase (real-time) and Convex (persistent)."""
         if self.pb:
             entry = {
                 "model": model, "modelSlug": model_slug,
@@ -1146,7 +1143,7 @@ class ConvexClient:
             if not found:
                 models.append(entry)
             await self.pb.update(job_id, model_progress=models)
-            return
+            # Also persist to Convex (don't return early)
         try:
             response = await self.client.post(
                 f"{self.url}/api/mutation",
@@ -1827,6 +1824,7 @@ async def execute_composition_simple(
     jobs_directory: str,
     convex_url: Optional[str] = None,
     convex_token: Optional[str] = None,
+    usage_tracker=None,
 ) -> dict:
     """
     Execute composition phase with optional Convex progress updates.
@@ -1896,6 +1894,7 @@ async def execute_composition_simple(
         mav_config=sil_mav_config,
         tavily_api_key=tavily_api_key,
         log_callback=sil_log_callback if convex else None,
+        usage_tracker=usage_tracker,
     )
 
     # Gather intelligence (this runs MAV if enabled)
@@ -3286,6 +3285,7 @@ async def _generate_personas(
     api_key: str,
     age_enabled: bool = True,
     sex_enabled: bool = True,
+    usage_tracker=None,
 ) -> list[dict]:
     """Generate persona objects via LLM.
 
@@ -3297,7 +3297,7 @@ async def _generate_personas(
     from cera.prompts import load_prompt, format_prompt
     from cera.pipeline.composition.rgm import ReviewerGenerationModule
 
-    _llm = OpenRouterClient(api_key=api_key)
+    _llm = OpenRouterClient(api_key=api_key, usage_tracker=usage_tracker, component="aml.persona")
 
     # Pre-sample demographics via RGM
     age_range_tuple = tuple(reviewer_profile.age_range) if reviewer_profile.age_range and age_enabled else None
@@ -3406,6 +3406,7 @@ async def _generate_writing_patterns(
     job_paths: dict,
     gen_model: str,
     api_key: str,
+    usage_tracker=None,
 ) -> dict:
     """Generate domain-specific writing patterns via LLM.
 
@@ -3416,7 +3417,7 @@ async def _generate_writing_patterns(
     from cera.llm.openrouter import OpenRouterClient
     from cera.prompts import load_prompt, format_prompt
 
-    _llm = OpenRouterClient(api_key=api_key)
+    _llm = OpenRouterClient(api_key=api_key, usage_tracker=usage_tracker, component="aml.patterns")
     _domain = subject_context.get("domain", subject_context.get("category", "general"))
     _region = subject_context.get("region", "unknown")
 
@@ -3472,6 +3473,7 @@ async def _generate_structure_variants(
     estimated_reviews: int,
     gen_model: str,
     api_key: str,
+    usage_tracker=None,
 ) -> list[dict]:
     """Generate review structure variants via LLM.
 
@@ -3481,7 +3483,7 @@ async def _generate_structure_variants(
     from cera.llm.openrouter import OpenRouterClient
     from cera.prompts import load_prompt, format_prompt
 
-    _llm = OpenRouterClient(api_key=api_key)
+    _llm = OpenRouterClient(api_key=api_key, usage_tracker=usage_tracker, component="aml.structures")
     _domain = subject_context.get("domain", subject_context.get("category", "general"))
     _region = subject_context.get("region", "unknown")
     reviewer_ctx = reviewers_context.get("additional_context", "general consumer")
@@ -3690,6 +3692,7 @@ async def execute_generation(
     total_runs: int = 1,  # Multi-run: total number of runs
     dataset_dir_override: Optional[str] = None,  # Multi-target: override output directory
     amls_dir_override: Optional[str] = None,  # Multi-target: override AML prompts directory
+    usage_tracker=None,  # Token usage tracker
 ) -> dict:
     """
     Execute the GENERATION phase of the CERA pipeline.
@@ -3835,6 +3838,7 @@ async def execute_generation(
                             api_key=api_key,
                             age_enabled=age_enabled,
                             sex_enabled=sex_enabled,
+                            usage_tracker=usage_tracker,
                         )
                         personas_pool = existing_pool + extra
                     except Exception as e:
@@ -3857,16 +3861,27 @@ async def execute_generation(
                     api_key=api_key,
                     age_enabled=age_enabled,
                     sex_enabled=sex_enabled,
+                    usage_tracker=usage_tracker,
                 )
                 print(f"[Generation] Generated {len(personas_pool)} personas")
 
-                # Save to target-specific personas dir if dataset_dir_override provided
-                _personas_save_dir = Path(dataset_dir_override).parent / "reviewer-personas" if dataset_dir_override else Path(job_paths["root"]) / "reviewer-personas"
+                # Save to target-level personas dir (datasets/{target}/reviewer-personas/)
+                # dataset_dir_override is model dir: datasets/{target}/run{N}/model-slug/
+                # .parent.parent = datasets/{target}/ (target level)
+                if dataset_dir_override:
+                    _target_dir = Path(dataset_dir_override).parent.parent
+                else:
+                    _target_dir = Path(job_paths["root"])
+                _personas_save_dir = _target_dir / "reviewer-personas"
                 _save_personas_to_dir(personas_pool, _personas_save_dir, subject_context.get("region", "unknown"))
 
-                # Also save JSON for potential reuse
-                _personas_json_save = Path(dataset_dir_override).parent / "personas.json" if dataset_dir_override else contexts_path / "personas.json"
+                # Save JSON at target level and contexts level (for cross-target reuse)
+                _personas_json_save = _target_dir / "personas.json"
                 with open(_personas_json_save, "w") as f:
+                    json.dump(personas_pool, f, indent=2)
+                # Also save to contexts for reuse by subsequent targets
+                _contexts_json_save = contexts_path / "personas.json"
+                with open(_contexts_json_save, "w") as f:
                     json.dump(personas_pool, f, indent=2)
 
             except Exception as e:
@@ -3896,6 +3911,7 @@ async def execute_generation(
                     job_paths=job_paths,
                     gen_model=config.generation.model,
                     api_key=api_key,
+                    usage_tracker=usage_tracker,
                 )
                 # Save for reuse
                 _patterns_save = contexts_path / "writing-patterns.json"
@@ -3905,32 +3921,51 @@ async def execute_generation(
             except Exception as e:
                 print(f"[Generation] Warning: Pattern generation failed: {e}")
 
-        # Generate structure variants (or load from existing)
+        # Generate structure variants (per-target: variant count scales with target size)
+        import math as _sv_math
         structure_variants: list[dict] = []
-        structures_path = contexts_path / "structure-variants.json"
-        if structures_path.exists():
-            try:
-                with open(structures_path) as f:
-                    structure_variants = json.load(f)
-                print(f"[Generation] Loaded {len(structure_variants)} structure variants from existing")
-            except Exception as e:
-                print(f"[Generation] Warning: Could not load structure variants: {e}")
+        _needed_variants = max(6, min(30, _sv_math.ceil(total_reviews * 0.15)))
+
+        # Check target-level first, then contexts-level fallback
+        if dataset_dir_override:
+            _target_structs_path = Path(dataset_dir_override).parent.parent / "structure-variants.json"
+        else:
+            _target_structs_path = None
+        _contexts_structs_path = contexts_path / "structure-variants.json"
+
+        for _sp in [_target_structs_path, _contexts_structs_path]:
+            if _sp and _sp.exists():
+                try:
+                    with open(_sp) as f:
+                        _loaded = json.load(f)
+                    if len(_loaded) >= _needed_variants:
+                        structure_variants = _loaded[:_needed_variants]
+                        print(f"[Generation] Loaded {len(structure_variants)} structure variants from {_sp.name} (needed {_needed_variants})")
+                        break
+                    else:
+                        print(f"[Generation] Found {len(_loaded)} variants in {_sp.name}, need {_needed_variants} — regenerating")
+                except Exception as e:
+                    print(f"[Generation] Warning: Could not load structure variants from {_sp.name}: {e}")
 
         if not structure_variants:
             try:
-                _est_reviews = total_reviews
                 structure_variants = await _generate_structure_variants(
                     subject_context=subject_context,
                     reviewers_context=reviewers_context,
-                    estimated_reviews=_est_reviews,
+                    estimated_reviews=total_reviews,
                     gen_model=config.generation.model,
                     api_key=api_key,
+                    usage_tracker=usage_tracker,
                 )
-                # Save for reuse
-                _structs_save = contexts_path / "structure-variants.json"
-                with open(_structs_save, "w") as f:
+                # Save at target level
+                if _target_structs_path:
+                    _target_structs_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_target_structs_path, "w") as f:
+                        json.dump(structure_variants, f, indent=2)
+                # Also save to contexts for fallback
+                with open(_contexts_structs_path, "w") as f:
                     json.dump(structure_variants, f, indent=2)
-                print(f"[Generation] Generated {len(structure_variants)} structure variants")
+                print(f"[Generation] Generated {len(structure_variants)} structure variants for {total_reviews} reviews")
             except Exception as e:
                 print(f"[Generation] Warning: Structure generation failed: {e}")
 
@@ -3961,7 +3996,11 @@ async def execute_generation(
         )
 
         # OpenRouter client for LLM calls
-        llm = OpenRouterClient(api_key=api_key)
+        _target_label = str(config.generation.count)
+        llm = OpenRouterClient(
+            api_key=api_key, usage_tracker=usage_tracker, component="aml",
+            target=_target_label, run=f"run{current_run}" if total_runs > 1 else "",
+        )
 
         # Generation settings (count_mode, length_range, avg_sentences_per_review,
         # target_sentences, estimated_reviews, total_reviews already computed above)
@@ -4351,6 +4390,13 @@ Output ONLY the JSON object, no other text."""
                     review_features = entity.get("characteristics", [])
                     review_pros = entity.get("positives", [])
                     review_cons = entity.get("negatives", [])
+                    # Fallback: if entity has empty characteristics, use flat pools from subject_context
+                    if not review_features:
+                        review_features = list(all_features) if all_features else []
+                    if not review_pros:
+                        review_pros = list(all_pros) if all_pros else []
+                    if not review_cons:
+                        review_cons = list(all_cons) if all_cons else []
                     # Use only this entity's applicable aspects for the sentence plan
                     entity_aspects = entity.get("applicable_aspects", aspect_cats)
                     if not entity_aspects:
@@ -4440,7 +4486,7 @@ Output ONLY the JSON object, no other text."""
                 system_prompt = format_prompt(system_template, **prompt_vars)
                 user_prompt = format_prompt(user_template, **prompt_vars)
 
-                aml_number = str(review_index + 1).zfill(digits)
+                aml_number = str(review_index).zfill(digits)
                 aml_file = amls_path / f"aml-{aml_number}.md"
                 aml_content = f"# AML Prompt {aml_number}\n\n## System Prompt\n{system_prompt}\n\n## User Prompt\n{user_prompt}\n"
                 aml_file.write_text(aml_content, encoding="utf-8")
@@ -5358,6 +5404,8 @@ class PipelineRequest(BaseModel):
     # Heuristic method fields (RQ1 baseline)
     method: str = "cera"  # "cera" or "heuristic"
     heuristicConfig: Optional[HeuristicConfig] = None
+    # Token usage: pre-job RDE records from context extraction
+    rdeUsage: Optional[list[dict]] = None
 
 
 def _recover_truncated_json_array(content: str) -> list | None:
@@ -5419,6 +5467,7 @@ async def execute_heuristic_pipeline(
     convex_url: Optional[str],
     convex_token: Optional[str],
     evaluation_config: Optional[dict],
+    rde_usage: Optional[list[dict]] = None,
 ):
     """
     Execute heuristic (baseline) pipeline for RQ1 comparison.
@@ -5443,9 +5492,26 @@ async def execute_heuristic_pipeline(
         # Create job directory
         job_paths = create_job_directory(jobs_directory, job_id, job_name)
 
+        # Initialize token usage tracker
+        from cera.llm.usage import UsageTracker
+        usage_tracker = UsageTracker()
+        tokens_json_path = Path(job_paths["reports"]) / "tokens.json"
+
+        # Import pre-job RDE usage records if available
+        if rde_usage:
+            usage_tracker.import_records(rde_usage)
+            print(f"[Tokens] Imported {len(rde_usage)} RDE usage records")
+
+        def _save_tokens_incremental():
+            """Incrementally save tokens.json (safe to call anytime)."""
+            try:
+                if usage_tracker.total_tokens > 0:
+                    usage_tracker.save_tokens_json(tokens_json_path, job_id, "heuristic")
+            except Exception as _e:
+                print(f"[Tokens] Warning: Failed to save tokens.json: {_e}")
+
         # Multi-run support
         total_runs = heuristic_config.totalRuns if heuristic_config.totalRuns else 1
-        all_run_metrics = []  # Collect metrics from each run for averaging
 
         if convex:
             if total_runs > 1:
@@ -5476,17 +5542,6 @@ async def execute_heuristic_pipeline(
             except ValueError:
                 avg_sentences_num = 5.0
 
-        # Calculate total reviews and batches
-        if heuristic_config.targetMode == "reviews":
-            total_reviews = heuristic_config.targetValue
-        else:  # sentences mode
-            total_reviews = math.ceil(heuristic_config.targetValue / avg_sentences_num)
-
-        total_batches = math.ceil(total_reviews / heuristic_config.reviewsPerBatch)
-
-        if convex:
-            await convex.add_log(job_id, "INFO", "Heuristic", f"Target: {total_reviews} reviews in {total_batches} batches")
-
         # Inject knowledge from source CERA job if provided
         knowledge_suffix = ""
         if heuristic_config.knowledgeSourceJobId:
@@ -5509,9 +5564,8 @@ async def execute_heuristic_pipeline(
                     await convex.add_log(job_id, "WARN", "Heuristic", f"Knowledge source job directory not found for {source_job_id}")
 
         # ========================================
-        # Multi-Target + Multi-Model Pipeline
-        # (Runs generation + evaluation per target × model, then returns early)
-        # Single-target single-model jobs skip this block.
+        # Generation + Evaluation Pipeline
+        # (Unified path for all target/model combinations)
         # ========================================
         effective_targets = heuristic_config.get_effective_targets()
         effective_models = heuristic_config.get_effective_models()
@@ -5519,938 +5573,524 @@ async def execute_heuristic_pipeline(
         is_multi_model = len(effective_models) > 1
         use_format_prompt = heuristic_config.useFormatPrompt if heuristic_config.useFormatPrompt is not None else True
 
-        if is_multi_target or is_multi_model:
-            eval_lock = asyncio.Lock()  # GPU eval lock (shared)
+        eval_lock = asyncio.Lock()  # GPU eval lock (shared)
 
-            # Shared progress tracking for multi-target pipeline
-            _mt_progress = {
-                "completed_batches": 0,
-                "total_batches": 0,
-                "reviews_collected": 0,
-                "current_target": "",
-            }
-            _mt_progress_lock = asyncio.Lock()
+        # Shared progress tracking for multi-target pipeline
+        _mt_progress = {
+            "completed_batches": 0,
+            "total_batches": 0,
+            "reviews_collected": 0,
+            "current_target": "",
+        }
+        _mt_progress_lock = asyncio.Lock()
 
-            # Calculate total batches across all targets/runs for progress bar
-            for _t in effective_targets:
-                if _t.targetMode == "reviews":
-                    _t_reviews = _t.targetValue
+        # Calculate total batches across all targets/runs for progress bar
+        for _t in effective_targets:
+            if _t.targetMode == "reviews":
+                _t_reviews = _t.targetValue
+            else:
+                _t_reviews = math.ceil(_t.targetValue / avg_sentences_num)
+            _t_batches = math.ceil(_t_reviews / _t.reviewsPerBatch)
+            _mt_progress["total_batches"] += _t_batches * _t.totalRuns * len(effective_models)
+
+        async def _update_mt_progress(batches_done: int = 0, reviews_done: int = 0, target_label: str = ""):
+            """Update shared progress and report to Convex."""
+            async with _mt_progress_lock:
+                _mt_progress["completed_batches"] += batches_done
+                _mt_progress["reviews_collected"] += reviews_done
+                if target_label:
+                    _mt_progress["current_target"] = target_label
+                if convex:
+                    await convex.run_mutation("jobs:updateHeuristicProgress", {
+                        "jobId": job_id,
+                        "currentBatch": _mt_progress["completed_batches"],
+                        "totalBatches": _mt_progress["total_batches"],
+                        "reviewsCollected": _mt_progress["reviews_collected"],
+                    })
+
+        def _prepare_prompt(reviews_per_batch: int) -> str:
+            """Prepare full prompt with target-specific substitutions."""
+            p = heuristic_config.prompt
+            p = p.replace("{review_count}", str(reviews_per_batch))
+            p = p.replace("{avg_sentences}", avg_sentences_str)
+            p = p.replace("{sentence_count}", str(int(reviews_per_batch * avg_sentences_num)))
+            if use_format_prompt:
+                if heuristic_config.formatPrompt:
+                    p += "\n\n" + heuristic_config.formatPrompt
                 else:
-                    _t_reviews = math.ceil(_t.targetValue / avg_sentences_num)
-                _t_batches = math.ceil(_t_reviews / _t.reviewsPerBatch)
-                _mt_progress["total_batches"] += _t_batches * _t.totalRuns * len(effective_models)
+                    p += _DEFAULT_HEURISTIC_FORMAT_PROMPT()
+            if knowledge_suffix:
+                p += knowledge_suffix
+            return p
 
-            async def _update_mt_progress(batches_done: int = 0, reviews_done: int = 0, target_label: str = ""):
-                """Update shared progress and report to Convex."""
-                async with _mt_progress_lock:
-                    _mt_progress["completed_batches"] += batches_done
-                    _mt_progress["reviews_collected"] += reviews_done
-                    if target_label:
-                        _mt_progress["current_target"] = target_label
-                    if convex:
-                        await convex.run_mutation("jobs:updateHeuristicProgress", {
-                            "jobId": job_id,
-                            "currentBatch": _mt_progress["completed_batches"],
-                            "totalBatches": _mt_progress["total_batches"],
-                            "reviewsCollected": _mt_progress["reviews_collected"],
+        async def _run_target_model(target: HeuristicTargetDataset, model_id: str, target_paths: dict):
+            """Generate + save for one target × one model (all runs)."""
+            model_slug = model_id.split("/")[-1]
+
+            if target.targetMode == "reviews":
+                t_reviews = target.targetValue
+            else:
+                t_reviews = math.ceil(target.targetValue / avg_sentences_num)
+            t_batches = math.ceil(t_reviews / target.reviewsPerBatch)
+            t_prompt = _prepare_prompt(target.reviewsPerBatch)
+
+            async def _gen_run(run_num: int) -> list:
+                """Generate all batches for one run."""
+                reviews = []
+                sem = asyncio.Semaphore(target.requestSize)
+
+                # Per-run progress tracking (shows individual progress bars per run)
+                if convex and t_runs > 1:
+                    await convex.run_mutation("jobs:updateRunProgress", {
+                        "jobId": job_id, "run": run_num, "status": "generating",
+                        "currentBatch": 0, "totalBatches": t_batches, "reviewsCollected": 0,
+                    })
+
+                async def _gen_batch(batch_num: int) -> list:
+                    async with sem:
+                        if convex:
+                            await convex.add_log(job_id, "INFO", "Heuristic",
+                                f"[{target.targetValue}][{model_slug}] Run {run_num} batch {batch_num}/{t_batches}")
+                        retries = 0
+                        content = None
+                        while retries < 3:
+                            try:
+                                from cera.llm.openrouter import OpenRouterClient
+                                llm = OpenRouterClient(
+                                    api_key=api_key, usage_tracker=usage_tracker,
+                                    component="heuristic",
+                                    target=str(target.targetValue),
+                                    run=f"run{run_num}" if t_runs > 1 else "",
+                                )
+                                content = await llm.chat(
+                                    model=model_id,
+                                    messages=[{"role": "user", "content": t_prompt}],
+                                    temperature=0.8,
+                                    max_tokens=16384,
+                                )
+                                batch_reviews = _extract_json_from_llm(content, expected_type="array")
+                                if not batch_reviews:
+                                    raise ValueError("No JSON array")
+                                await _update_mt_progress(batches_done=1, reviews_done=len(batch_reviews))
+                                return batch_reviews
+                            except Exception as e:
+                                retries += 1
+                                content_preview = repr(content[:500]) if content else "(empty)"
+                                print(f"[Heuristic] [{target.targetValue}][{model_slug}] Batch {batch_num} attempt {retries}/3 failed: {e}")
+                                print(f"[Heuristic] LLM response preview ({len(content) if content else 0} chars): {content_preview}")
+                                if retries >= 3:
+                                    if convex:
+                                        await convex.add_log(job_id, "ERROR", "Heuristic",
+                                            f"[{target.targetValue}][{model_slug}] Batch {batch_num} failed after 3 attempts")
+                                    return []
+                        return []
+
+                for wave_start in range(1, t_batches + 1, target.requestSize):
+                    wave_end = min(wave_start + target.requestSize, t_batches + 1)
+                    wave_results = await asyncio.gather(*[_gen_batch(b) for b in range(wave_start, wave_end)])
+                    for batch_reviews in wave_results:
+                        for review in batch_reviews:
+                            rid = f"{job_id}-r{run_num}-{len(reviews):05d}"
+                            if "sentences" in review:
+                                reviews.append({"id": rid, "sentences": review["sentences"], "method": "heuristic"})
+                            else:
+                                text = review.get("text", "")
+                                polarity = review.get("polarity", "neutral")
+                                reviews.append({"id": rid, "sentences": [{"text": text, "opinions": [
+                                    {"target": "NULL", "category": "GENERAL", "polarity": polarity, "from": 0, "to": 0}
+                                ]}], "method": "heuristic"})
+
+                    # Update per-run progress after each wave
+                    if convex and t_runs > 1:
+                        completed_batches = min(wave_end - 1, t_batches)
+                        await convex.run_mutation("jobs:updateRunProgress", {
+                            "jobId": job_id, "run": run_num, "status": "generating",
+                            "currentBatch": completed_batches, "totalBatches": t_batches,
+                            "reviewsCollected": len(reviews),
                         })
 
-            def _prepare_prompt(reviews_per_batch: int) -> str:
-                """Prepare full prompt with target-specific substitutions."""
-                p = heuristic_config.prompt
-                p = p.replace("{review_count}", str(reviews_per_batch))
-                p = p.replace("{avg_sentences}", avg_sentences_str)
-                p = p.replace("{sentence_count}", str(int(reviews_per_batch * avg_sentences_num)))
-                if use_format_prompt:
-                    if heuristic_config.formatPrompt:
-                        p += "\n\n" + heuristic_config.formatPrompt
-                    else:
-                        p += _DEFAULT_HEURISTIC_FORMAT_PROMPT()
-                if knowledge_suffix:
-                    p += knowledge_suffix
-                return p
-
-            async def _run_target_model(target: HeuristicTargetDataset, model_id: str, target_paths: dict):
-                """Generate + save for one target × one model (all runs)."""
-                model_slug = model_id.split("/")[-1]
-
-                if target.targetMode == "reviews":
-                    t_reviews = target.targetValue
-                else:
-                    t_reviews = math.ceil(target.targetValue / avg_sentences_num)
-                t_batches = math.ceil(t_reviews / target.reviewsPerBatch)
-                t_prompt = _prepare_prompt(target.reviewsPerBatch)
-
-                async def _gen_run(run_num: int) -> list:
-                    """Generate all batches for one run."""
-                    reviews = []
-                    sem = asyncio.Semaphore(target.requestSize)
-
-                    async def _gen_batch(batch_num: int) -> list:
-                        async with sem:
-                            if convex:
-                                await convex.add_log(job_id, "INFO", "Heuristic",
-                                    f"[{target.targetValue}][{model_slug}] Run {run_num} batch {batch_num}/{t_batches}")
-                            retries = 0
-                            while retries < 3:
-                                try:
-                                    from cera.llm.openrouter import OpenRouterClient
-                                    llm = OpenRouterClient(api_key=api_key)
-                                    content = await llm.chat(
-                                        model=model_id,
-                                        messages=[{"role": "user", "content": t_prompt}],
-                                        temperature=0.8,
-                                        max_tokens=16384,
-                                    )
-                                    batch_reviews = _extract_json_from_llm(content, expected_type="array")
-                                    if not batch_reviews:
-                                        raise ValueError("No JSON array")
-                                    await _update_mt_progress(batches_done=1, reviews_done=len(batch_reviews))
-                                    return batch_reviews
-                                except Exception as e:
-                                    retries += 1
-                                    content_preview = repr(content[:500]) if content else "(empty)"
-                                    print(f"[Heuristic] [{target.targetValue}][{model_slug}] Batch {batch_num} attempt {retries}/3 failed: {e}")
-                                    print(f"[Heuristic] LLM response preview ({len(content) if content else 0} chars): {content_preview}")
-                                    if retries >= 3:
-                                        if convex:
-                                            await convex.add_log(job_id, "ERROR", "Heuristic",
-                                                f"[{target.targetValue}][{model_slug}] Batch {batch_num} failed after 3 attempts")
-                                        return []
-                            return []
-
-                    for wave_start in range(1, t_batches + 1, target.requestSize):
-                        wave_end = min(wave_start + target.requestSize, t_batches + 1)
-                        wave_results = await asyncio.gather(*[_gen_batch(b) for b in range(wave_start, wave_end)])
-                        for batch_reviews in wave_results:
-                            for review in batch_reviews:
-                                rid = f"{job_id}-r{run_num}-{len(reviews):05d}"
-                                if "sentences" in review:
-                                    reviews.append({"id": rid, "sentences": review["sentences"], "method": "heuristic"})
+                # Normalize targets
+                for review in reviews:
+                    for sentence in review.get("sentences", []):
+                        text = sentence.get("text", "")
+                        for opinion in sentence.get("opinions", []):
+                            t = opinion.get("target")
+                            if t and t != "NULL":
+                                t = t.strip().split()[-1].lower()
+                                idx = text.lower().find(t)
+                                if idx >= 0:
+                                    opinion["target"] = t
+                                    opinion["from"] = idx
+                                    opinion["to"] = idx + len(t)
                                 else:
-                                    text = review.get("text", "")
-                                    polarity = review.get("polarity", "neutral")
-                                    reviews.append({"id": rid, "sentences": [{"text": text, "opinions": [
-                                        {"target": "NULL", "category": "GENERAL", "polarity": polarity, "from": 0, "to": 0}
-                                    ]}], "method": "heuristic"})
+                                    opinion["target"] = "NULL"
+                                    opinion["from"] = 0
+                                    opinion["to"] = 0
+                # Mark run as completed
+                if convex and t_runs > 1:
+                    await convex.run_mutation("jobs:updateRunProgress", {
+                        "jobId": job_id, "run": run_num, "status": "completed",
+                        "currentBatch": t_batches, "totalBatches": t_batches,
+                        "reviewsCollected": len(reviews),
+                    })
 
-                    # Normalize targets
-                    for review in reviews:
-                        for sentence in review.get("sentences", []):
-                            text = sentence.get("text", "")
-                            for opinion in sentence.get("opinions", []):
-                                t = opinion.get("target")
-                                if t and t != "NULL":
-                                    t = t.strip().split()[-1].lower()
-                                    idx = text.lower().find(t)
-                                    if idx >= 0:
-                                        opinion["target"] = t
-                                        opinion["from"] = idx
-                                        opinion["to"] = idx + len(t)
-                                    else:
-                                        opinion["target"] = "NULL"
-                                        opinion["from"] = 0
-                                        opinion["to"] = 0
-                    return reviews
+                return reviews
 
-                # Execute runs (parallel or sequential)
-                t_runs = target.totalRuns
-                t_parallel = target.runsMode == "parallel"
-                if t_parallel and t_runs > 1:
-                    run_results = await asyncio.gather(*[_gen_run(r) for r in range(1, t_runs + 1)])
-                else:
-                    run_results = [await _gen_run(r) for r in range(1, t_runs + 1)]
+            # Execute runs (parallel or sequential)
+            t_runs = target.totalRuns
+            t_parallel = target.runsMode == "parallel"
+            if t_parallel and t_runs > 1:
+                run_results = await asyncio.gather(*[_gen_run(r) for r in range(1, t_runs + 1)])
+            else:
+                run_results = [await _gen_run(r) for r in range(1, t_runs + 1)]
 
-                # Save datasets per run into run{N}/{model_slug}/ directories
-                for run_num, reviews in enumerate(run_results, 1):
-                    if not reviews:
-                        continue
+            # Save datasets per run into run{N}/{model_slug}/ directories
+            for run_num, reviews in enumerate(run_results, 1):
+                if not reviews:
+                    continue
 
-                    # Get the correct output directory for this run + model
-                    run_model_dir = Path(target_paths["runs"][run_num]["models"][model_id])
+                # Get the correct output directory for this run + model
+                run_model_dir = Path(target_paths["runs"][run_num]["models"][model_id])
 
-                    # Save explicit + implicit
-                    for mode_suffix, implicit in [("explicit", False), ("implicit", True)]:
-                        import copy as _copy
-                        save_reviews = _copy.deepcopy(reviews) if implicit else reviews
-                        if implicit:
+                # Save explicit + implicit
+                for mode_suffix, implicit in [("explicit", False), ("implicit", True)]:
+                    import copy as _copy
+                    save_reviews = _copy.deepcopy(reviews) if implicit else reviews
+                    if implicit:
+                        for r in save_reviews:
+                            for s in r.get("sentences", []):
+                                for o in s.get("opinions", []):
+                                    o["target"] = "NULL"
+                                    o["from"] = 0
+                                    o["to"] = 0
+
+                    # Filename: {prefix}-{mode}.{ext} (run/model encoded in directory path)
+                    file_stem = f"{_h_file_base}-{mode_suffix}"
+
+                    # JSONL (always)
+                    jsonl_path = run_model_dir / f"{file_stem}.jsonl"
+                    with open(jsonl_path, "w") as f:
+                        for r in save_reviews:
+                            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+                    # SemEval XML
+                    if heuristic_config.outputFormat == "semeval_xml":
+                        xml_path = run_model_dir / f"{file_stem}.xml"
+                        xml_content = ['<?xml version="1.0" encoding="UTF-8"?>', '<Reviews>']
+                        for r in save_reviews:
+                            xml_content.append(f'  <Review rid="{r["id"]}">')
+                            xml_content.append('    <sentences>')
+                            for s_idx, s in enumerate(r.get("sentences", [])):
+                                sid = f"{r['id']}:{s_idx}"
+                                xml_content.append(f'      <sentence id="{sid}">')
+                                xml_content.append(f'        <text>{escape_xml(s.get("text", ""))}</text>')
+                                xml_content.append('        <Opinions>')
+                                for o in s.get("opinions", []):
+                                    xml_content.append(
+                                        f'          <Opinion target="{escape_xml(o.get("target", "NULL"))}" '
+                                        f'category="{o.get("category", "")}" '
+                                        f'polarity="{o.get("polarity", "neutral")}" '
+                                        f'from="{o.get("from", 0)}" to="{o.get("to", 0)}"/>')
+                                xml_content.append('        </Opinions>')
+                                xml_content.append('      </sentence>')
+                            xml_content.append('    </sentences>')
+                            xml_content.append('  </Review>')
+                        xml_content.append('</Reviews>')
+                        with open(xml_path, "w", encoding="utf-8") as f:
+                            f.write("\n".join(xml_content))
+
+                    # CSV
+                    elif heuristic_config.outputFormat == "csv":
+                        import csv as csv_module
+                        csv_path = run_model_dir / f"{file_stem}.csv"
+                        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                            writer = csv_module.DictWriter(f, fieldnames=[
+                                "review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"
+                            ])
+                            writer.writeheader()
                             for r in save_reviews:
-                                for s in r.get("sentences", []):
-                                    for o in s.get("opinions", []):
-                                        o["target"] = "NULL"
-                                        o["from"] = 0
-                                        o["to"] = 0
-
-                        # Filename: {prefix}-{mode}.{ext} (run/model encoded in directory path)
-                        file_stem = f"{_h_file_base}-{mode_suffix}"
-
-                        # JSONL (always)
-                        jsonl_path = run_model_dir / f"{file_stem}.jsonl"
-                        with open(jsonl_path, "w") as f:
-                            for r in save_reviews:
-                                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-                        # SemEval XML
-                        if heuristic_config.outputFormat == "semeval_xml":
-                            xml_path = run_model_dir / f"{file_stem}.xml"
-                            xml_content = ['<?xml version="1.0" encoding="UTF-8"?>', '<Reviews>']
-                            for r in save_reviews:
-                                xml_content.append(f'  <Review rid="{r["id"]}">')
-                                xml_content.append('    <sentences>')
                                 for s_idx, s in enumerate(r.get("sentences", [])):
-                                    sid = f"{r['id']}:{s_idx}"
-                                    xml_content.append(f'      <sentence id="{sid}">')
-                                    xml_content.append(f'        <text>{escape_xml(s.get("text", ""))}</text>')
-                                    xml_content.append('        <Opinions>')
                                     for o in s.get("opinions", []):
-                                        xml_content.append(
-                                            f'          <Opinion target="{escape_xml(o.get("target", "NULL"))}" '
-                                            f'category="{o.get("category", "")}" '
-                                            f'polarity="{o.get("polarity", "neutral")}" '
-                                            f'from="{o.get("from", 0)}" to="{o.get("to", 0)}"/>')
-                                    xml_content.append('        </Opinions>')
-                                    xml_content.append('      </sentence>')
-                                xml_content.append('    </sentences>')
-                                xml_content.append('  </Review>')
-                            xml_content.append('</Reviews>')
-                            with open(xml_path, "w", encoding="utf-8") as f:
-                                f.write("\n".join(xml_content))
-
-                        # CSV
-                        elif heuristic_config.outputFormat == "csv":
-                            import csv as csv_module
-                            csv_path = run_model_dir / f"{file_stem}.csv"
-                            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                                writer = csv_module.DictWriter(f, fieldnames=[
-                                    "review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"
-                                ])
-                                writer.writeheader()
-                                for r in save_reviews:
-                                    for s_idx, s in enumerate(r.get("sentences", [])):
-                                        for o in s.get("opinions", []):
-                                            writer.writerow({
-                                                "review_id": r["id"],
-                                                "sentence_id": f"{r['id']}_{s_idx}",
-                                                "text": s.get("text", ""),
-                                                "target": o.get("target", "NULL"),
-                                                "category": o.get("category", ""),
-                                                "polarity": o.get("polarity", "neutral"),
-                                                "from": o.get("from", 0),
-                                                "to": o.get("to", 0),
-                                            })
-
-                    if convex:
-                        await convex.add_log(job_id, "INFO", "Heuristic",
-                            f"[{target.targetValue}][{model_slug}] Run {run_num} saved ({len(reviews)} reviews)")
-
-                return run_results
-
-            # Resolve file naming prefix (falls back to job directory name)
-            _h_prefix = heuristic_config.targetPrefix or ""
-            if not _h_prefix.strip():
-                _job_dir_name = Path(job_paths["root"]).name
-                _parts = _job_dir_name.split("-", 1)
-                _h_prefix = _parts[1] if len(_parts) > 1 else _job_dir_name
-            _h_file_base = _h_prefix.strip()
-
-            # Orchestrate: targets × models
-            if convex:
-                target_labels = [f"{t.targetValue} {t.targetMode}" for t in effective_targets]
-                model_labels = [m.split("/")[-1] for m in effective_models]
-                await convex.add_log(job_id, "INFO", "Heuristic",
-                    f"Multi-pipeline: {len(effective_targets)} targets ({', '.join(target_labels)}) × "
-                    f"{len(effective_models)} models ({', '.join(model_labels)})")
-
-            # Collect metrics across all targets for final aggregation
-            _all_target_metrics = []  # list of metrics dicts from all evaluations
-
-            async def _run_heuristic_target(target_idx, target):
-                nonlocal _h_file_base
-                # Create target directory
-                target_paths = create_target_directory(
-                    job_paths["datasets"], target.targetValue, target.targetMode,
-                    target.totalRuns, effective_models,
-                )
-                target_job_paths = dict(job_paths)
-                target_job_paths["dataset"] = target_paths["target"]
-                target_job_paths["metrics"] = target_paths["metrics"]
+                                        writer.writerow({
+                                            "review_id": r["id"],
+                                            "sentence_id": f"{r['id']}_{s_idx}",
+                                            "text": s.get("text", ""),
+                                            "target": o.get("target", "NULL"),
+                                            "category": o.get("category", ""),
+                                            "polarity": o.get("polarity", "neutral"),
+                                            "from": o.get("from", 0),
+                                            "to": o.get("to", 0),
+                                        })
 
                 if convex:
                     await convex.add_log(job_id, "INFO", "Heuristic",
-                        f"[Target {target_idx+1}/{len(effective_targets)}] {target.targetValue} {target.targetMode}")
+                        f"[{target.targetValue}][{model_slug}] Run {run_num} saved ({len(reviews)} reviews)")
 
-                # Run models for this target (parallel or sequential)
-                parallel_models = heuristic_config.parallelModels
+            return run_results
 
-                async def _model_task(model_id):
-                    await _run_target_model(target, model_id, target_paths)
+        # Resolve file naming prefix (falls back to job directory name)
+        _h_prefix = heuristic_config.targetPrefix or ""
+        if not _h_prefix.strip():
+            _job_dir_name = Path(job_paths["root"]).name
+            _parts = _job_dir_name.split("-", 1)
+            _h_prefix = _parts[1] if len(_parts) > 1 else _job_dir_name
+        _h_file_base = _h_prefix.strip()
 
-                if parallel_models and is_multi_model:
-                    await asyncio.gather(*[_model_task(m) for m in effective_models])
-                else:
-                    for m in effective_models:
-                        await _model_task(m)
+        # Orchestrate: targets × models
+        if convex:
+            target_labels = [f"{t.targetValue} {t.targetMode}" for t in effective_targets]
+            model_labels = [m.split("/")[-1] for m in effective_models]
+            await convex.add_log(job_id, "INFO", "Heuristic",
+                f"Pipeline: {len(effective_targets)} target(s) ({', '.join(target_labels)}) × "
+                f"{len(effective_models)} model(s) ({', '.join(model_labels)})")
 
-                # Evaluation for this target
-                if evaluation_config and evaluation_config.get("metrics"):
-                    if convex:
-                        # Signal evaluation phase (idempotent — may be called per target)
-                        try:
-                            await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
-                        except Exception:
-                            pass  # Already in evaluating state from another target
-                        await convex.add_log(job_id, "INFO", "MDQA",
-                            f"[Target {target.targetValue}] Starting evaluation...")
+        # Collect metrics across all targets for final aggregation
+        _all_target_metrics = []  # list of metrics dicts from all evaluations
 
-                    # Find dataset files in run{N}/{model_slug}/ subdirectories
-                    target_dir = Path(target_paths["target"])
-                    target_eval_metrics = []  # list of (metrics_dict, dataset_file_path)
-                    for ext in [".jsonl"]:
-                        for dataset_file_path in sorted(target_dir.glob(f"run*/**/*-explicit{ext}")):
-                            async with eval_lock:
-                                metrics_result = await execute_evaluation(
-                                    job_id=job_id,
-                                    job_paths=target_job_paths,
-                                    evaluation_config=evaluation_config,
-                                    dataset_file=str(dataset_file_path),
-                                    convex=convex,
-                                    save_files=True,
-                                )
-                                if metrics_result:
-                                    target_eval_metrics.append((metrics_result, str(dataset_file_path)))
+        async def _run_heuristic_target(target_idx, target):
+            nonlocal _h_file_base
+            # Create target directory
+            target_paths = create_target_directory(
+                job_paths["datasets"], target.targetValue, target.targetMode,
+                target.totalRuns, effective_models,
+            )
+            target_job_paths = dict(job_paths)
+            target_job_paths["dataset"] = target_paths["target"]
+            target_job_paths["metrics"] = target_paths["metrics"]
 
-                    # Build per-run metrics list for Convex
-                    import re as _re
-                    per_run_metrics = []
-                    for metrics_dict, file_path in target_eval_metrics:
-                        # Extract run number from path like .../run1/model-slug/file.jsonl
-                        run_match = _re.search(r'/run(\d+)/', file_path)
-                        run_num = int(run_match.group(1)) if run_match else 1
-                        metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
-                        per_run_metrics.append({
-                            "run": run_num,
-                            "datasetFile": Path(file_path).name,
-                            "metrics": {k: float(round(float(v), 6)) for k, v in metrics_dict.items()
-                                        if k in metric_keys and v is not None},
-                        })
-
-                    # Aggregate metrics for this target (average across runs/models)
-                    all_metrics_dicts = [m for m, _ in target_eval_metrics]
-                    if all_metrics_dicts:
-                        metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
-                        if len(all_metrics_dicts) > 1:
-                            import numpy as np
-                            avg_metrics = {}
-                            avg_with_std = {}  # For Convex averageMetrics field
-                            for key in metric_keys:
-                                values = [m.get(key) for m in all_metrics_dicts if m.get(key) is not None]
-                                if values:
-                                    try:
-                                        values_array = np.array([float(v) for v in values])
-                                        mean_val = float(round(np.mean(values_array), 6))
-                                        std_val = float(round(np.std(values_array), 6))
-                                        avg_metrics[key] = mean_val
-                                        avg_metrics[f"{key}_std"] = std_val
-                                        avg_with_std[key] = {"mean": mean_val, "std": std_val}
-                                    except (TypeError, ValueError):
-                                        avg_metrics[key] = values[0]
-                                        avg_with_std[key] = {"mean": float(round(float(values[0]), 6))}
-                            _all_target_metrics.append(avg_metrics)
-                        else:
-                            _all_target_metrics.append(all_metrics_dicts[0])
-                            avg_with_std = {k: {"mean": float(round(float(v), 6))}
-                                            for k, v in all_metrics_dicts[0].items()
-                                            if k in metric_keys and v is not None}
-
-                        # Save target-level aggregated metrics
-                        agg_path = Path(target_job_paths["metrics"]) / "mdqa_metrics_average.json"
-                        with open(agg_path, "w") as f:
-                            json.dump(_all_target_metrics[-1], f, indent=2)
-
-                        # Send per-target metrics to Convex
-                        if convex:
-                            try:
-                                flat_metrics = {k: float(round(float(v), 6))
-                                                for k, v in _all_target_metrics[-1].items()
-                                                if k in metric_keys and v is not None}
-                                await convex.run_mutation("jobs:saveTargetMetrics", {
-                                    "jobId": job_id,
-                                    "targetIndex": target_idx,
-                                    "targetLabel": f"{target.targetValue} {target.targetMode}",
-                                    "targetValue": target.targetValue,
-                                    "countMode": target.targetMode,
-                                    "metrics": flat_metrics,
-                                    "perRunMetrics": per_run_metrics if len(per_run_metrics) > 1 else None,
-                                    "averageMetrics": avg_with_std if len(all_metrics_dicts) > 1 else None,
-                                })
-                            except Exception as e:
-                                print(f"[Heuristic] Warning: Could not store per-target metrics: {e}")
-
-                    if convex:
-                        await convex.add_log(job_id, "INFO", "MDQA",
-                            f"[Target {target.targetValue}] Evaluation complete ({len(target_eval_metrics)} dataset(s))")
-
-            # Execute targets (parallel or sequential based on parallelTargets flag)
-            if heuristic_config.parallelTargets and len(effective_targets) > 1:
-                await asyncio.gather(*[
-                    _run_heuristic_target(idx, t) for idx, t in enumerate(effective_targets)
-                ])
-            else:
-                for idx, t in enumerate(effective_targets):
-                    await _run_heuristic_target(idx, t)
-
-            # Report total reviews generated (before metrics — sets generatedCount)
             if convex:
-                total_reviews = _mt_progress["reviews_collected"]
-                if total_reviews > 0:
-                    try:
-                        await convex.run_mutation("jobs:completeHeuristicGeneration", {
-                            "jobId": job_id,
-                            "reviewsCollected": total_reviews,
-                        })
-                    except Exception as e:
-                        print(f"[Heuristic] Warning: Could not report review count: {e}")
-
-            # Send aggregated metrics to Convex
-            if convex and _all_target_metrics:
-                # If multiple targets, average across targets; if single target, use it directly
-                if len(_all_target_metrics) > 1:
-                    import numpy as np
-                    combined = {}
-                    metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
-                    for key in metric_keys:
-                        values = [m.get(key) for m in _all_target_metrics if m.get(key) is not None]
-                        if values:
-                            try:
-                                values_array = np.array([float(v) for v in values])
-                                combined[key] = float(round(np.mean(values_array), 6))
-                                combined[f"{key}_std"] = float(round(np.std(values_array), 6))
-                            except (TypeError, ValueError):
-                                combined[key] = values[0]
-                    final_metrics = combined
-                else:
-                    # Single target — send its metrics directly
-                    final_metrics = {}
-                    metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
-                    for k, v in _all_target_metrics[0].items():
-                        if v is not None and (k in metric_keys or k.endswith("_std")):
-                            try:
-                                final_metrics[k] = float(round(float(v), 6))
-                            except (TypeError, ValueError):
-                                pass
-
-                if final_metrics:
-                    try:
-                        await convex.run_mutation("jobs:setEvaluationMetrics", {
-                            "jobId": job_id,
-                            "evaluationMetrics": final_metrics,
-                        })
-                    except Exception as e:
-                        print(f"[Heuristic] Warning: Could not store eval metrics: {e}")
-
-            # Complete job
-            if convex:
-                await convex.run_mutation("jobs:complete", {"jobId": job_id})
                 await convex.add_log(job_id, "INFO", "Heuristic",
-                    f"Multi-pipeline complete! ({len(effective_targets)} targets × {len(effective_models)} models, "
-                    f"{_mt_progress['reviews_collected']} reviews)")
-            return  # Skip single-target code below
+                    f"[Target {target_idx+1}/{len(effective_targets)}] {target.targetValue} {target.targetMode}")
 
-        # ========================================
-        # Single-Target Single-Model Pipeline (existing behavior unchanged)
-        # ========================================
+            # Run models for this target (parallel or sequential)
+            parallel_models = heuristic_config.parallelModels
 
-        # Inject variables into prompt template
-        prompt = heuristic_config.prompt
-        prompt = prompt.replace("{review_count}", str(heuristic_config.reviewsPerBatch))
-        # Pass avg_sentences verbatim (e.g. "4-7") so the LLM sees it as-is
-        prompt = prompt.replace("{avg_sentences}", avg_sentences_str)
-        # Calculate sentence count for this batch using numeric midpoint
-        batch_sentence_count = int(heuristic_config.reviewsPerBatch * avg_sentences_num)
-        prompt = prompt.replace("{sentence_count}", str(batch_sentence_count))
+            async def _model_task(model_id):
+                await _run_target_model(target, model_id, target_paths)
 
-        # Append JSON format instructions for ABSA format (if enabled)
-
-        if use_format_prompt:
-            # Use custom format prompt if provided, otherwise use default
-            if heuristic_config.formatPrompt:
-                prompt += "\n\n" + heuristic_config.formatPrompt
+            if parallel_models and is_multi_model:
+                await asyncio.gather(*[_model_task(m) for m in effective_models])
             else:
-                # Default ABSA format instructions
-                prompt += """
+                for m in effective_models:
+                    await _model_task(m)
 
-Return your response as a JSON array with ABSA (Aspect-Based Sentiment Analysis) format.
-Each review should have sentences, and each sentence should have aspect-level opinions.
-
-Structure:
-[
-  {
-    "sentences": [
-      {
-        "text": "The food was delicious and fresh.",
-        "opinions": [
-          {"target": "food", "category": "FOOD#QUALITY", "polarity": "positive", "from": 4, "to": 8}
-        ]
-      },
-      {
-        "text": "However, the service was quite slow.",
-        "opinions": [
-          {"target": "service", "category": "SERVICE#GENERAL", "polarity": "negative", "from": 13, "to": 20}
-        ]
-      }
-    ]
-  },
-  ...
-]
-
-Rules:
-- "text": The sentence text (non-empty string)
-- "target": MUST be a SINGLE WORD (noun) in lowercase that appears exactly in the text
-- "category": Use categories mentioned in the prompt above
-- "polarity": One of "positive", "negative", "neutral"
-- "from": Character offset where target starts in the text (0-indexed)
-- "to": Character offset where target ends (exclusive, NOT including any character after the word)
-
-Important:
-- The target MUST be a single lowercase word, NOT a phrase (e.g., "food" not "the food", "service" not "great service")
-- The "from" and "to" must be accurate character positions for the target substring
-- A sentence can have multiple opinions about different aspects
-- A sentence can have zero opinions if it's neutral/general
-Return ONLY the JSON array, no other text, no markdown code blocks."""
-
-        # Append domain knowledge from source job (after user prompt + format instructions)
-        if knowledge_suffix:
-            prompt += knowledge_suffix
-
-        # ========================================
-        # Single run coroutine (generation + save + evaluation)
-        # ========================================
-        # GPU evaluation lock — BERTScore/MoverScore need exclusive GPU access
-        eval_lock = asyncio.Lock() if total_runs > 1 else None
-
-        async def execute_single_run(current_run: int) -> Optional[dict]:
-            """Execute one heuristic generation run. Returns metrics dict or None."""
-            if convex and total_runs > 1:
-                await convex.add_log(job_id, "INFO", "Heuristic", f"Starting run {current_run}/{total_runs}...")
-                # Initialize per-run progress
-                if parallel_runs:
-                    await convex.run_mutation("jobs:updateRunProgress", {
-                        "jobId": job_id, "run": current_run, "status": "generating",
-                        "currentBatch": 0, "totalBatches": total_batches, "reviewsCollected": 0,
-                    })
-
-            all_reviews = []
-            request_size = heuristic_config.requestSize
-
-            # Single batch generation coroutine
-            async def generate_batch(batch_num: int, sem: asyncio.Semaphore) -> list:
-                async with sem:
-                    if convex:
-                        run_prefix = f"[Run {current_run}] " if total_runs > 1 else ""
-                        await convex.add_log(job_id, "INFO", "Heuristic", f"{run_prefix}Generating batch {batch_num}/{total_batches}...")
-
-                    retries = 0
-                    max_retries = 3
-                    batch_reviews = []
-
-                    while retries < max_retries:
-                        try:
-                            from cera.llm.openrouter import OpenRouterClient
-
-                            llm = OpenRouterClient(api_key=api_key)
-                            content = await llm.chat(
-                                model=heuristic_config.model,
-                                messages=[{"role": "user", "content": prompt}],
-                                temperature=0.8,
-                                max_tokens=16384,
-                            )
-
-                            print(f"[Heuristic] Run {current_run} Batch {batch_num} raw content length: {len(content)}")
-
-                            # Use robust JSON extraction (handles markdown fences, truncation, trailing commas)
-                            batch_reviews = _extract_json_from_llm(content, expected_type="array")
-
-                            if not batch_reviews:
-                                raise ValueError("Could not extract JSON array from response")
-
-                            print(f"[Heuristic] Run {current_run} Batch {batch_num} parsed {len(batch_reviews)} reviews")
-                            break  # Success
-
-                        except (json.JSONDecodeError, ValueError, KeyError) as e:
-                            retries += 1
-                            print(f"[Heuristic] Run {current_run} Batch {batch_num} parse error: {str(e)[:200]}")
-                            if convex:
-                                await convex.add_log(job_id, "WARN", "Heuristic", f"Run {current_run} Batch {batch_num} parse error (retry {retries}/{max_retries}): {str(e)[:100]}")
-                            if retries >= max_retries:
-                                if convex:
-                                    await convex.add_log(job_id, "ERROR", "Heuristic", f"Run {current_run} Batch {batch_num} failed after {max_retries} retries")
-                                batch_reviews = []
-
-                    return [(batch_num, review) for review in batch_reviews]
-
-            # Parallel batch generation with request_size concurrency
-            semaphore = asyncio.Semaphore(request_size)
-            if convex:
-                run_prefix = f"[Run {current_run}] " if total_runs > 1 else ""
-                await convex.add_log(job_id, "INFO", "Heuristic", f"{run_prefix}Parallel generation: {request_size} concurrent requests")
-
-            # Process batches in waves of request_size for progress tracking
-            for wave_start in range(1, total_batches + 1, request_size):
-                wave_end = min(wave_start + request_size, total_batches + 1)
-                tasks = [generate_batch(b, semaphore) for b in range(wave_start, wave_end)]
-                wave_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for result in wave_results:
-                    if isinstance(result, Exception):
-                        print(f"[Heuristic] Run {current_run} Batch exception: {result}")
-                        if convex:
-                            await convex.add_log(job_id, "ERROR", "Heuristic", f"Run {current_run} Batch exception: {str(result)[:100]}")
-                        continue
-                    for batch_num, review in result:
-                        review_id = f"{job_id}-r{current_run}-{len(all_reviews):05d}"
-                        if "sentences" in review:
-                            all_reviews.append({
-                                "id": review_id,
-                                "sentences": review.get("sentences", []),
-                                "method": "heuristic",
-                                "batch": batch_num,
-                            })
-                        else:
-                            text = review.get("text", "")
-                            polarity = review.get("polarity", "neutral")
-                            all_reviews.append({
-                                "id": review_id,
-                                "sentences": [{
-                                    "text": text,
-                                    "opinions": [{
-                                        "target": "NULL",
-                                        "category": "RESTAURANT#GENERAL",
-                                        "polarity": polarity,
-                                        "from": 0,
-                                        "to": 0,
-                                    }]
-                                }],
-                                "method": "heuristic",
-                                "batch": batch_num,
-                            })
-
-                if convex:
-                    completed_batches = min(wave_end - 1, total_batches)
-                    if parallel_runs and total_runs > 1:
-                        # Per-run progress bar
-                        await convex.run_mutation("jobs:updateRunProgress", {
-                            "jobId": job_id, "run": current_run, "status": "generating",
-                            "currentBatch": completed_batches, "totalBatches": total_batches,
-                            "reviewsCollected": len(all_reviews),
-                        })
-                    else:
-                        # Single progress bar (sequential)
-                        await convex.run_mutation("jobs:updateHeuristicProgress", {
-                            "jobId": job_id,
-                            "currentBatch": completed_batches,
-                            "totalBatches": total_batches,
-                            "reviewsCollected": len(all_reviews),
-                        })
-
-            # Normalize targets: single-word, lowercase, fix offsets
-            for review in all_reviews:
-                for sentence in review.get("sentences", []):
-                    text = sentence.get("text", "")
-                    for opinion in sentence.get("opinions", []):
-                        target = opinion.get("target")
-                        if target and target != "NULL":
-                            target = target.strip()
-                            words = target.split()
-                            if len(words) > 1:
-                                target = words[-1]
-                            target = target.lower()
-                            idx = text.lower().find(target)
-                            if idx >= 0:
-                                opinion["target"] = target
-                                opinion["from"] = idx
-                                opinion["to"] = idx + len(target)
-                            else:
-                                opinion["target"] = "NULL"
-                                opinion["from"] = 0
-                                opinion["to"] = 0
-                        else:
-                            opinion["target"] = "NULL"
-                            opinion["from"] = 0
-                            opinion["to"] = 0
-
-            if convex:
-                if total_runs > 1:
-                    await convex.add_log(job_id, "INFO", "Heuristic", f"Run {current_run}/{total_runs} complete. Reviews: {len(all_reviews)}")
-                else:
-                    await convex.add_log(job_id, "INFO", "Heuristic", f"Generation complete. Total reviews: {len(all_reviews)}")
-                await convex.run_mutation("jobs:completeHeuristicGeneration", {
-                    "jobId": job_id,
-                    "reviewsCollected": len(all_reviews),
-                })
-
-            # Save dataset in both explicit and implicit formats
-            dataset_dir = Path(job_paths["dataset"])
-            run_suffix = f"-run{current_run}" if total_runs > 1 else ""
-
-            # Resolve file naming prefix (falls back to job directory name)
-            _sh_prefix = heuristic_config.targetPrefix or ""
-            if not _sh_prefix.strip():
-                _sh_dir_name = Path(job_paths["root"]).name
-                _sh_parts = _sh_dir_name.split("-", 1)
-                _sh_prefix = _sh_parts[1] if len(_sh_parts) > 1 else _sh_dir_name
-            _sh_file_base = _sh_prefix.strip()
-
-            def save_absa_dataset(reviews, mode_suffix: str, implicit: bool = False):
-                """Save dataset in ABSA format, optionally converting to implicit (NULL targets)."""
-                output_format = heuristic_config.outputFormat
-
-                if implicit:
-                    import copy
-                    reviews = copy.deepcopy(reviews)
-                    for review in reviews:
-                        for sentence in review.get("sentences", []):
-                            for opinion in sentence.get("opinions", []):
-                                opinion["target"] = "NULL"
-                                opinion["from"] = 0
-                                opinion["to"] = 0
-
-                full_suffix = f"{mode_suffix}{run_suffix}"
-
-                jsonl_path = dataset_dir / f"{_sh_file_base}-{full_suffix}.jsonl"
-                with open(jsonl_path, "w") as f:
-                    for review in reviews:
-                        f.write(json.dumps(review, ensure_ascii=False) + "\n")
-
-                if output_format == "csv":
-                    import csv as csv_module
-                    csv_path = dataset_dir / f"{_sh_file_base}-{full_suffix}.csv"
-                    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                        writer = csv_module.DictWriter(f, fieldnames=[
-                            "review_id", "sentence_id", "text", "target", "category", "polarity", "from", "to"
-                        ])
-                        writer.writeheader()
-                        for review in reviews:
-                            for s_idx, sentence in enumerate(review.get("sentences", [])):
-                                for opinion in sentence.get("opinions", []):
-                                    writer.writerow({
-                                        "review_id": review["id"],
-                                        "sentence_id": f"{review['id']}_{s_idx}",
-                                        "text": sentence.get("text", ""),
-                                        "target": opinion.get("target", "NULL"),
-                                        "category": opinion.get("category", ""),
-                                        "polarity": opinion.get("polarity", "neutral"),
-                                        "from": opinion.get("from", 0),
-                                        "to": opinion.get("to", 0),
-                                    })
-
-                elif output_format == "semeval_xml":
-                    xml_path = dataset_dir / f"{_sh_file_base}-{full_suffix}.xml"
-                    xml_content = ['<?xml version="1.0" encoding="UTF-8"?>', '<Reviews>']
-                    for review in reviews:
-                        xml_content.append(f'  <Review rid="{review["id"]}">')
-                        xml_content.append('    <sentences>')
-                        for s_idx, sentence in enumerate(review.get("sentences", [])):
-                            sent_id = f"{review['id']}:{s_idx}"
-                            xml_content.append(f'      <sentence id="{sent_id}">')
-                            xml_content.append(f'        <text>{escape_xml(sentence.get("text", ""))}</text>')
-                            xml_content.append('        <Opinions>')
-                            for opinion in sentence.get("opinions", []):
-                                target = escape_xml(opinion.get("target", "NULL"))
-                                category = opinion.get("category", "")
-                                polarity = opinion.get("polarity", "neutral")
-                                from_pos = opinion.get("from", 0)
-                                to_pos = opinion.get("to", 0)
-                                xml_content.append(
-                                    f'          <Opinion target="{target}" category="{category}" '
-                                    f'polarity="{polarity}" from="{from_pos}" to="{to_pos}"/>'
-                                )
-                            xml_content.append('        </Opinions>')
-                            xml_content.append('      </sentence>')
-                        xml_content.append('    </sentences>')
-                        xml_content.append('  </Review>')
-                    xml_content.append('</Reviews>')
-                    with open(xml_path, "w", encoding="utf-8") as f:
-                        f.write("\n".join(xml_content))
-
-            save_absa_dataset(all_reviews, "explicit", implicit=False)
-            save_absa_dataset(all_reviews, "implicit", implicit=True)
-
-            if convex:
-                await convex.add_log(job_id, "INFO", "Heuristic", f"Run {current_run} dataset saved")
-
-            # ========================================
-            # Run MDQA Evaluation for this run (if configured)
-            # ========================================
-            metrics_result = None
-            if not all_reviews:
-                # No reviews generated — skip evaluation, mark as failed
-                if convex:
-                    await convex.add_log(job_id, "WARN", "Heuristic", f"Run {current_run} produced 0 reviews — skipping evaluation")
-                    if parallel_runs and total_runs > 1:
-                        await convex.run_mutation("jobs:updateRunProgress", {
-                            "jobId": job_id, "run": current_run, "status": "failed",
-                            "currentBatch": total_batches, "totalBatches": total_batches,
-                            "reviewsCollected": 0,
-                        })
-                return None
-
+            # Evaluation for this target
             if evaluation_config and evaluation_config.get("metrics"):
                 if convex:
-                    if not parallel_runs and current_run == 1:
+                    # Signal evaluation phase (idempotent — may be called per target)
+                    try:
                         await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
-                    if total_runs > 1:
-                        await convex.add_log(job_id, "INFO", "MDQA", f"Evaluating run {current_run}/{total_runs}...")
-                    # Update per-run status to evaluating
-                    if parallel_runs and total_runs > 1:
-                        await convex.run_mutation("jobs:updateRunProgress", {
-                            "jobId": job_id, "run": current_run, "status": "evaluating",
-                            "currentBatch": total_batches, "totalBatches": total_batches,
-                            "reviewsCollected": len(all_reviews), "evalProgress": 0,
-                        })
+                    except Exception:
+                        pass  # Already in evaluating state from another target
+                    await convex.add_log(job_id, "INFO", "MDQA",
+                        f"[Target {target.targetValue}] Starting evaluation...")
 
-                # Serialize GPU evaluations across parallel runs (BERTScore/MoverScore need exclusive GPU)
-                if eval_lock:
-                    await eval_lock.acquire()
-                try:
-                    metrics_result = await execute_evaluation(
-                        job_id=job_id,
-                        job_paths=job_paths,
-                        evaluation_config=evaluation_config,
-                        convex=convex if not parallel_runs else None,
-                        reviews_data=all_reviews,
-                        run_number=current_run if total_runs > 1 else None,
-                        save_files=(total_runs == 1),
-                    )
-                finally:
-                    if eval_lock and eval_lock.locked():
-                        eval_lock.release()
+                # Find dataset files in run{N}/{model_slug}/ subdirectories
+                target_dir = Path(target_paths["target"])
+                target_eval_metrics = []  # list of (metrics_dict, dataset_file_path)
+                for ext in [".jsonl"]:
+                    for dataset_file_path in sorted(target_dir.glob(f"run*/**/*-explicit{ext}")):
+                        async with eval_lock:
+                            metrics_result = await execute_evaluation(
+                                job_id=job_id,
+                                job_paths=target_job_paths,
+                                evaluation_config=evaluation_config,
+                                dataset_file=str(dataset_file_path),
+                                convex=convex,
+                                save_files=True,
+                            )
+                            if metrics_result:
+                                target_eval_metrics.append((metrics_result, str(dataset_file_path)))
 
-                if metrics_result and total_runs > 1:
-                    metrics_path = Path(job_paths["metrics"]) / f"mdqa_metrics-run{current_run}.json"
-                    with open(metrics_path, "w") as f:
-                        json.dump(metrics_result, f, indent=2)
+                # Build per-run metrics list and extract model info from paths
+                import re as _re
+                metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                per_run_metrics = []
+                # Also collect per-model data: model_slug -> {metrics_list, per_run}
+                _h_per_model = {}
+                for metrics_dict, file_path in target_eval_metrics:
+                    # Extract run number from path like .../run1/model-slug/file.jsonl
+                    run_match = _re.search(r'/run(\d+)/', file_path)
+                    run_num = int(run_match.group(1)) if run_match else 1
+                    # Extract model slug from path like .../run1/model-slug/file.jsonl
+                    model_match = _re.search(r'/run\d+/([^/]+)/', file_path)
+                    model_slug = model_match.group(1) if model_match else "unknown"
+                    clean_metrics = {k: float(round(float(v), 6)) for k, v in metrics_dict.items()
+                                    if k in metric_keys and v is not None}
+                    per_run_metrics.append({
+                        "run": run_num,
+                        "datasetFile": Path(file_path).name,
+                        "metrics": clean_metrics,
+                    })
+                    # Collect per-model data
+                    if model_slug not in _h_per_model:
+                        _h_per_model[model_slug] = {"metrics_list": [], "per_run": []}
+                    _h_per_model[model_slug]["metrics_list"].append(clean_metrics)
+                    _h_per_model[model_slug]["per_run"].append({
+                        "run": run_num,
+                        "metrics": clean_metrics,
+                    })
 
+                # Build per-model entries
+                h_per_model_entries = []
+                for m_slug, m_data in _h_per_model.items():
+                    m_avg = {}
+                    for key in metric_keys:
+                        values = [m.get(key) for m in m_data["metrics_list"] if m.get(key) is not None]
+                        if values:
+                            m_avg[key] = float(round(sum(values) / len(values), 6))
+                    h_per_model_entries.append({
+                        "model": m_slug,
+                        "modelSlug": m_slug,
+                        "metrics": m_avg if m_avg else None,
+                        "runs": sorted(m_data["per_run"], key=lambda x: x["run"]),
+                    })
+                _h_is_multi_model = len(h_per_model_entries) > 1
+
+                # Aggregate metrics for this target (average across runs/models)
+                all_metrics_dicts = [m for m, _ in target_eval_metrics]
+                if all_metrics_dicts:
+                    if len(all_metrics_dicts) > 1:
+                        import numpy as np
+                        avg_metrics = {}
+                        avg_with_std = {}  # For Convex averageMetrics field
+                        for key in metric_keys:
+                            values = [m.get(key) for m in all_metrics_dicts if m.get(key) is not None]
+                            if values:
+                                try:
+                                    values_array = np.array([float(v) for v in values])
+                                    mean_val = float(round(np.mean(values_array), 6))
+                                    std_val = float(round(np.std(values_array), 6))
+                                    avg_metrics[key] = mean_val
+                                    avg_metrics[f"{key}_std"] = std_val
+                                    avg_with_std[key] = {"mean": mean_val, "std": std_val}
+                                except (TypeError, ValueError):
+                                    avg_metrics[key] = values[0]
+                                    avg_with_std[key] = {"mean": float(round(float(values[0]), 6))}
+                        _all_target_metrics.append(avg_metrics)
+                    else:
+                        _all_target_metrics.append(all_metrics_dicts[0])
+                        avg_with_std = {k: {"mean": float(round(float(v), 6))}
+                                        for k, v in all_metrics_dicts[0].items()
+                                        if k in metric_keys and v is not None}
+
+                    # Save target-level aggregated metrics (with per-model breakdown)
+                    agg_data = dict(_all_target_metrics[-1])
+                    if _h_is_multi_model:
+                        agg_data["totalModels"] = len(h_per_model_entries)
+                        agg_data["perModel"] = h_per_model_entries
+                    agg_path = Path(target_job_paths["metrics"]) / "mdqa_metrics_average.json"
+                    with open(agg_path, "w") as f:
+                        json.dump(agg_data, f, indent=2)
+
+                    # Send per-target metrics to Convex
                     if convex:
                         try:
-                            per_run_metrics = {
-                                k: float(round(float(v), 6))
-                                for k, v in metrics_result.items()
-                                if v is not None and k in ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
-                            }
-                            await convex.run_mutation("jobs:savePerRunMetrics", {
+                            flat_metrics = {k: float(round(float(v), 6))
+                                            for k, v in _all_target_metrics[-1].items()
+                                            if k in metric_keys and v is not None}
+                            save_args = {
                                 "jobId": job_id,
-                                "run": current_run,
-                                "datasetFile": f"reviews-explicit{run_suffix}.jsonl",
-                                "metrics": per_run_metrics,
-                            })
+                                "targetIndex": target_idx,
+                                "targetLabel": f"{target.targetValue} {target.targetMode}",
+                                "targetValue": target.targetValue,
+                                "countMode": target.targetMode,
+                                "metrics": flat_metrics,
+                                "perRunMetrics": per_run_metrics if len(per_run_metrics) > 1 else None,
+                                "averageMetrics": avg_with_std if len(all_metrics_dicts) > 1 else None,
+                            }
+                            # Add per-model metrics for Convex (strip runs detail)
+                            if _h_is_multi_model:
+                                save_args["perModelMetrics"] = [
+                                    {"model": pm["model"], "modelSlug": pm["modelSlug"], "metrics": pm["metrics"]}
+                                    for pm in h_per_model_entries
+                                ]
+                            await convex.run_mutation("jobs:saveTargetMetrics", save_args)
                         except Exception as e:
-                            print(f"[Heuristic] Warning: Could not save run {current_run} metrics: {e}")
+                            print(f"[Heuristic] Warning: Could not store per-target metrics: {e}")
 
-                # Mark per-run as completed
-                if convex and parallel_runs and total_runs > 1:
-                    await convex.run_mutation("jobs:updateRunProgress", {
-                        "jobId": job_id, "run": current_run, "status": "completed",
-                        "currentBatch": total_batches, "totalBatches": total_batches,
-                        "reviewsCollected": len(all_reviews), "evalProgress": 100,
-                    })
-            elif convex and parallel_runs and total_runs > 1:
-                # No evaluation — mark as completed after generation
-                await convex.run_mutation("jobs:updateRunProgress", {
-                    "jobId": job_id, "run": current_run, "status": "completed",
-                    "currentBatch": total_batches, "totalBatches": total_batches,
-                    "reviewsCollected": len(all_reviews),
-                })
+                if convex:
+                    await convex.add_log(job_id, "INFO", "MDQA",
+                        f"[Target {target.targetValue}] Evaluation complete ({len(target_eval_metrics)} dataset(s))")
 
-            return metrics_result
-
-        # ========================================
-        # Execute runs (parallel or sequential)
-        # ========================================
-        parallel_runs = heuristic_config.parallelRuns if hasattr(heuristic_config, 'parallelRuns') else True
-
-        if parallel_runs and total_runs > 1:
-            if convex:
-                await convex.add_log(job_id, "INFO", "Heuristic", f"Running {total_runs} runs in parallel...")
-                await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
-            run_results = await asyncio.gather(
-                *[execute_single_run(r) for r in range(1, total_runs + 1)],
-                return_exceptions=True,
-            )
-            for r in run_results:
-                if isinstance(r, Exception):
-                    print(f"[Heuristic] Run exception: {r}")
-                    if convex:
-                        await convex.add_log(job_id, "ERROR", "Heuristic", f"Run exception: {str(r)[:100]}")
-                elif r is not None:
-                    all_run_metrics.append(r)
+        # Execute targets (parallel or sequential based on parallelTargets flag)
+        if heuristic_config.parallelTargets and len(effective_targets) > 1:
+            await asyncio.gather(*[
+                _run_heuristic_target(idx, t) for idx, t in enumerate(effective_targets)
+            ])
         else:
-            # Sequential runs
-            for current_run in range(1, total_runs + 1):
-                if convex and total_runs > 1:
-                    await convex.update_current_run(job_id, current_run, total_runs)
-                    await convex.run_mutation("jobs:updateHeuristicProgress", {
+            for idx, t in enumerate(effective_targets):
+                await _run_heuristic_target(idx, t)
+
+        # Report total reviews generated (before metrics — sets generatedCount)
+        if convex:
+            total_reviews = _mt_progress["reviews_collected"]
+            if total_reviews > 0:
+                try:
+                    await convex.run_mutation("jobs:completeHeuristicGeneration", {
                         "jobId": job_id,
-                        "currentBatch": 0,
-                        "totalBatches": total_batches,
-                        "reviewsCollected": 0,
+                        "reviewsCollected": total_reviews,
                     })
-                result = await execute_single_run(current_run)
-                if result is not None:
-                    all_run_metrics.append(result)
+                except Exception as e:
+                    print(f"[Heuristic] Warning: Could not report review count: {e}")
 
-        # End of multi-run execution
+        # Send aggregated metrics to Convex
+        if convex and _all_target_metrics:
+            # If multiple targets, average across targets; if single target, use it directly
+            if len(_all_target_metrics) > 1:
+                import numpy as np
+                combined = {}
+                metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                for key in metric_keys:
+                    values = [m.get(key) for m in _all_target_metrics if m.get(key) is not None]
+                    if values:
+                        try:
+                            values_array = np.array([float(v) for v in values])
+                            combined[key] = float(round(np.mean(values_array), 6))
+                            combined[f"{key}_std"] = float(round(np.std(values_array), 6))
+                        except (TypeError, ValueError):
+                            combined[key] = values[0]
+                final_metrics = combined
+            else:
+                # Single target — send its metrics directly
+                final_metrics = {}
+                metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                for k, v in _all_target_metrics[0].items():
+                    if v is not None and (k in metric_keys or k.endswith("_std")):
+                        try:
+                            final_metrics[k] = float(round(float(v), 6))
+                        except (TypeError, ValueError):
+                            pass
 
-        # ========================================
-        # Compute average metrics (for multi-run)
-        # ========================================
-        if total_runs > 1 and len(all_run_metrics) > 1 and evaluation_config and evaluation_config.get("metrics"):
-            import numpy as np
+            if final_metrics:
+                try:
+                    await convex.run_mutation("jobs:setEvaluationMetrics", {
+                        "jobId": job_id,
+                        "evaluationMetrics": final_metrics,
+                    })
+                except Exception as e:
+                    print(f"[Heuristic] Warning: Could not store eval metrics: {e}")
 
-            avg_metrics = {}
-            for key in all_run_metrics[0].keys():
-                values = [m.get(key) for m in all_run_metrics if m.get(key) is not None]
-                if values:
-                    try:
-                        values_array = np.array([float(v) for v in values])
-                        avg_metrics[key] = float(round(np.mean(values_array), 6))
-                        avg_metrics[f"{key}_std"] = float(round(np.std(values_array), 6))
-                    except (TypeError, ValueError):
-                        avg_metrics[key] = values[0]
+        # Save tokens before completion
+        _save_tokens_incremental()
 
-            if convex:
-                await convex.run_mutation("jobs:setEvaluationMetrics", {
-                    "jobId": job_id,
-                    "evaluationMetrics": avg_metrics,
-                })
-                await convex.add_log(job_id, "INFO", "MDQA", f"Evaluation complete - averaged {len(all_run_metrics)} runs.")
-
-            # Save average metrics to file
-            avg_metrics_path = Path(job_paths["metrics"]) / "mdqa_metrics_average.json"
-            with open(avg_metrics_path, "w") as f:
-                json.dump(avg_metrics, f, indent=2)
-
-        elif len(all_run_metrics) == 1:
-            # Single run - store metrics directly
-            if convex:
-                await convex.run_mutation("jobs:setEvaluationMetrics", {
-                    "jobId": job_id,
-                    "evaluationMetrics": all_run_metrics[0],
-                })
-                await convex.add_log(job_id, "INFO", "MDQA", f"Evaluation complete: {len(all_run_metrics[0])} metrics computed")
-
-        # Mark job as completed
+        # Complete job
         if convex:
             await convex.run_mutation("jobs:complete", {"jobId": job_id})
-            if total_runs > 1:
-                await convex.add_log(job_id, "INFO", "Heuristic", f"Pipeline complete! ({total_runs} runs)")
-            else:
-                await convex.add_log(job_id, "INFO", "Heuristic", "Pipeline complete!")
+            await convex.add_log(job_id, "INFO", "Heuristic",
+                f"Pipeline complete! ({len(effective_targets)} targets × {len(effective_models)} models, "
+                f"{_mt_progress['reviews_collected']} reviews)")
 
     except Exception as e:
         import traceback
         error_msg = f"Heuristic pipeline failed: {str(e)}"
         print(f"[Heuristic] Error: {error_msg}")
         print(traceback.format_exc())
+        # Save whatever tokens we have on failure
+        try:
+            _save_tokens_incremental()
+        except Exception:
+            pass
         if convex:
             await convex.run_mutation("jobs:setFailed", {
                 "jobId": job_id,
@@ -6484,6 +6124,7 @@ async def execute_pipeline(
     reference_dataset: Optional[dict] = None,
     method: str = "cera",
     heuristic_config: Optional[HeuristicConfig] = None,
+    rde_usage: Optional[list[dict]] = None,
 ):
     """Execute selected pipeline phases sequentially."""
     from pathlib import Path
@@ -6505,12 +6146,32 @@ async def execute_pipeline(
             convex_url=convex_url,
             convex_token=convex_token,
             evaluation_config=evaluation_config,
+            rde_usage=rde_usage,
         )
         return  # Heuristic pipeline is complete
 
     try:
         # Get or create job directory
         job_paths = create_job_directory(jobs_directory, job_id, job_name)
+
+        # Initialize token usage tracker
+        from cera.llm.usage import UsageTracker
+        usage_tracker = UsageTracker()
+        tokens_json_path = Path(job_paths["reports"]) / "tokens.json"
+
+        # Import pre-job RDE usage records if available
+        if rde_usage:
+            usage_tracker.import_records(rde_usage)
+            print(f"[Tokens] Imported {len(rde_usage)} RDE usage records")
+
+        def _save_tokens_incremental():
+            """Incrementally save tokens.json (safe to call anytime)."""
+            try:
+                if usage_tracker.total_tokens > 0:
+                    _method = method if method != "heuristic" else "cera"
+                    usage_tracker.save_tokens_json(tokens_json_path, job_id, _method)
+            except Exception as _e:
+                print(f"[Tokens] Warning: Failed to save tokens.json: {_e}")
 
         # ========================================
         # Handle Composition Reuse (copy context files from source job)
@@ -6608,6 +6269,7 @@ async def execute_pipeline(
                 jobs_directory=jobs_directory,
                 convex_url=convex_url,
                 convex_token=convex_token,
+                usage_tracker=usage_tracker,
             )
 
             if convex:
@@ -6643,6 +6305,9 @@ async def execute_pipeline(
                         json.dump(config_data, f, indent=2, default=str)
             except Exception as e:
                 print(f"[Pipeline] Warning: Could not update config.json with composition metadata: {e}", flush=True)
+
+            # Save tokens after composition phase
+            _save_tokens_incremental()
 
         # ========================================
         # Target-based Pipeline (all jobs use datasets/{size}/ structure)
@@ -6781,6 +6446,7 @@ async def execute_pipeline(
                             total_runs=total_target_runs,
                             dataset_dir_override=dataset_dir,
                             amls_dir_override=amls_dir,
+                            usage_tracker=usage_tracker,
                         )
 
                         if convex:
@@ -6814,6 +6480,9 @@ async def execute_pipeline(
                         # Fully sequential
                         for m, r in gen_tasks:
                             await _gen_model_run(m, r)
+
+                # Save tokens after this target's generation
+                _save_tokens_incremental()
 
                 # Update target progress: generation done
                 if convex:
@@ -6929,6 +6598,34 @@ async def execute_pipeline(
                                 avg_metrics[key] = float(round(_np.mean(values_array), 6))
                                 std_metrics[key] = float(round(_np.std(values_array), 6)) if len(values) > 1 else 0.0
 
+                        # --- Compute per-model breakdown (for disk AND Convex) ---
+                        _per_model = {}  # model_id -> {metrics_list, model_slug, per_run}
+                        for em in target_eval_metrics:
+                            mid = em["model"]
+                            if mid not in _per_model:
+                                _per_model[mid] = {"metrics_list": [], "model_slug": mid.split("/")[-1], "per_run": []}
+                            _per_model[mid]["metrics_list"].append(em.get("metrics", {}))
+                            _per_model[mid]["per_run"].append({
+                                "run": em["run"],
+                                "metrics": {k: em["metrics"].get(k) for k in _metric_keys if em["metrics"].get(k) is not None},
+                            })
+
+                        per_model_entries = []
+                        for mid, data in _per_model.items():
+                            model_avg = {}
+                            for key in _metric_keys:
+                                values = [m.get(key) for m in data["metrics_list"] if m.get(key) is not None]
+                                if values:
+                                    model_avg[key] = float(round(sum(values) / len(values), 6))
+                            per_model_entries.append({
+                                "model": mid,
+                                "modelSlug": data["model_slug"],
+                                "metrics": model_avg if model_avg else None,
+                                "runs": sorted(data["per_run"], key=lambda x: x["run"]),
+                            })
+
+                        _is_multi_model = len(per_model_entries) > 1
+
                         # --- Save consolidated files to target metrics dir ---
                         metrics_dir = _Path(target_paths["metrics"])
                         metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -6938,23 +6635,57 @@ async def execute_pipeline(
                             csv_path = metrics_dir / f"{category}-metrics.csv"
                             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                                 writer = _csv_module.writer(f)
-                                writer.writerow(["run", "metric", "score", "description"])
-                                for run_idx, run_metrics in enumerate(all_run_metrics, 1):
+                                if _is_multi_model:
+                                    writer.writerow(["run", "model", "metric", "score", "description"])
+                                    # Per-model per-run rows
+                                    for em in target_eval_metrics:
+                                        run_num = em["run"]
+                                        m_slug = em["model"].split("/")[-1]
+                                        for metric in metric_names:
+                                            val = em["metrics"].get(metric)
+                                            if val is not None:
+                                                writer.writerow([run_num, m_slug, metric, f"{val:.6f}", _metric_descriptions.get(metric, "")])
+                                    # Cross-model averages per run
+                                    for run_idx, run_metrics in enumerate(all_run_metrics, 1):
+                                        for metric in metric_names:
+                                            val = run_metrics.get(metric)
+                                            if val is not None:
+                                                writer.writerow([run_idx, "ALL", metric, f"{val:.6f}", f"Average across {len(per_model_entries)} models"])
+                                    # Overall averages
                                     for metric in metric_names:
-                                        val = run_metrics.get(metric)
+                                        val = avg_metrics.get(metric)
                                         if val is not None:
-                                            writer.writerow([run_idx, metric, f"{val:.6f}", _metric_descriptions.get(metric, "")])
-                                for metric in metric_names:
-                                    val = avg_metrics.get(metric)
-                                    if val is not None:
-                                        writer.writerow(["avg", metric, f"{val:.6f}", f"Average across {len(all_run_metrics)} runs"])
-                                for metric in metric_names:
-                                    val = std_metrics.get(metric)
-                                    if val is not None:
-                                        writer.writerow(["std", metric, f"{val:.6f}", "Standard deviation"])
+                                            writer.writerow(["avg", "ALL", metric, f"{val:.6f}", f"Average across {len(all_run_metrics)} runs"])
+                                    # Per-model averages across runs
+                                    for pm in per_model_entries:
+                                        if pm["metrics"]:
+                                            for metric in metric_names:
+                                                val = pm["metrics"].get(metric)
+                                                if val is not None:
+                                                    writer.writerow(["avg", pm["modelSlug"], metric, f"{val:.6f}", f"Average across runs for {pm['modelSlug']}"])
+                                    # Overall std
+                                    for metric in metric_names:
+                                        val = std_metrics.get(metric)
+                                        if val is not None:
+                                            writer.writerow(["std", "ALL", metric, f"{val:.6f}", "Standard deviation"])
+                                else:
+                                    writer.writerow(["run", "metric", "score", "description"])
+                                    for run_idx, run_metrics in enumerate(all_run_metrics, 1):
+                                        for metric in metric_names:
+                                            val = run_metrics.get(metric)
+                                            if val is not None:
+                                                writer.writerow([run_idx, metric, f"{val:.6f}", _metric_descriptions.get(metric, "")])
+                                    for metric in metric_names:
+                                        val = avg_metrics.get(metric)
+                                        if val is not None:
+                                            writer.writerow(["avg", metric, f"{val:.6f}", f"Average across {len(all_run_metrics)} runs"])
+                                    for metric in metric_names:
+                                        val = std_metrics.get(metric)
+                                        if val is not None:
+                                            writer.writerow(["std", metric, f"{val:.6f}", "Standard deviation"])
                             print(f"[Evaluation] Saved {category} metrics: {csv_path}")
 
-                        # Save consolidated JSON with all runs (same format as single-target)
+                        # Save consolidated JSON with all runs
                         all_runs_json = {
                             "runs": [],
                             "average": {},
@@ -6974,6 +6705,11 @@ async def execute_pipeline(
                         all_runs_json["average"]["_flat"] = avg_metrics
                         all_runs_json["std"]["_flat"] = std_metrics
 
+                        # Add per-model breakdown for multi-model jobs
+                        if _is_multi_model:
+                            all_runs_json["totalModels"] = len(per_model_entries)
+                            all_runs_json["perModel"] = per_model_entries
+
                         json_path = metrics_dir / "mdqa-results.json"
                         with open(json_path, "w") as f:
                             json.dump(all_runs_json, f, indent=2)
@@ -6983,27 +6719,6 @@ async def execute_pipeline(
                         print(f"[Evaluation] Saving target {target_idx} metrics to Convex (convex={convex is not None})...", flush=True)
                         if convex:
                             try:
-                                # Per-model entries (for multi-model comparison)
-                                _per_model = {}
-                                for em in target_eval_metrics:
-                                    mid = em["model"]
-                                    if mid not in _per_model:
-                                        _per_model[mid] = {"metrics_list": [], "model_slug": mid.split("/")[-1]}
-                                    _per_model[mid]["metrics_list"].append(em.get("metrics", {}))
-
-                                per_model_entries = []
-                                for mid, data in _per_model.items():
-                                    model_avg = {}
-                                    for key in _metric_keys:
-                                        values = [m.get(key) for m in data["metrics_list"] if m.get(key) is not None]
-                                        if values:
-                                            model_avg[key] = float(round(sum(values) / len(values), 6))
-                                    per_model_entries.append({
-                                        "model": mid,
-                                        "modelSlug": data["model_slug"],
-                                        "metrics": model_avg if model_avg else None,
-                                    })
-
                                 # Build averageMetrics for Convex (mean + std per metric)
                                 convex_avg_metrics = {}
                                 for key in _metric_keys:
@@ -7016,6 +6731,12 @@ async def execute_pipeline(
                                 # Overall flat metrics (average across all)
                                 overall_metrics = {k: avg_metrics[k] for k in _metric_keys if k in avg_metrics}
 
+                                # Strip per-run detail from per_model_entries for Convex
+                                convex_per_model = [
+                                    {"model": pm["model"], "modelSlug": pm["modelSlug"], "metrics": pm["metrics"]}
+                                    for pm in per_model_entries
+                                ]
+
                                 print(f"[Evaluation] Calling saveTargetMetrics for target {target_idx}: {list(overall_metrics.keys())}", flush=True)
                                 # Build args — omit None values (Convex v.optional rejects null)
                                 save_args: dict = {
@@ -7027,8 +6748,8 @@ async def execute_pipeline(
                                 }
                                 if overall_metrics:
                                     save_args["metrics"] = overall_metrics
-                                if len(per_model_entries) > 1:
-                                    save_args["perModelMetrics"] = per_model_entries
+                                if len(convex_per_model) > 1:
+                                    save_args["perModelMetrics"] = convex_per_model
                                 if len(convex_per_run) > 1:
                                     save_args["perRunMetrics"] = convex_per_run
                                 if convex_avg_metrics:
@@ -7327,8 +7048,11 @@ async def execute_pipeline(
                         job_id, m, slug, 0, 0, target, 0, "pending", 0
                     )
 
+            _eval_phase_started = False  # Flag to call startEvaluation only once
+
             async def _run_model_pipeline(model_id: str):
                 """Run generation + evaluation for a single model."""
+                nonlocal _eval_phase_started
                 model_slug = model_id.split("/")[-1]
                 target = config.generation.count
                 print(f"\n[Multi-Model] Starting model: {model_slug}", flush=True)
@@ -7372,6 +7096,7 @@ async def execute_pipeline(
                         progress_callback=_progress_cb,
                         current_run=current_run,
                         total_runs=total_runs,
+                        usage_tracker=usage_tracker,
                     )
 
                     model_gen_results.append(gen_result)
@@ -7408,6 +7133,14 @@ async def execute_pipeline(
                     )
                     await convex.add_log(job_id, "INFO", "AML",
                         f"[{model_slug}] Generation complete, starting evaluation")
+                    # Transition job to evaluation phase (first model triggers this)
+                    if not _eval_phase_started:
+                        _eval_phase_started = True
+                        try:
+                            await convex.run_mutation("jobs:startEvaluation", {"id": job_id})
+                        except Exception:
+                            pass  # May already be in evaluating state
+                        await convex.update_progress(job_id, 80, "MDQA")
 
                 # --- EVALUATION ---
                 if "evaluation" not in phases:
@@ -7617,6 +7350,7 @@ async def execute_pipeline(
                     should_complete_job=False,  # Pipeline handles completion after evaluation
                     current_run=current_run,
                     total_runs=total_runs,
+                    usage_tracker=usage_tracker,
                 )
 
                 # Calculate conformity from in-memory reviews (before files are renamed)
@@ -8083,9 +7817,17 @@ async def execute_pipeline(
             await convex.complete_job(job_id)
             await convex.add_log(job_id, "INFO", "Pipeline", "Pipeline completed successfully.")
 
+        # Final tokens save
+        _save_tokens_incremental()
+
     except Exception as e:
         error_msg = str(e)
         print(f"[Pipeline] Error: {error_msg}")
+        # Save whatever tokens we have on failure
+        try:
+            _save_tokens_incremental()
+        except Exception:
+            pass
         if convex:
             await convex.add_log(job_id, "ERROR", "Pipeline", f"Pipeline failed: {error_msg}")
             await convex.fail_job(job_id, error_msg)
@@ -8319,18 +8061,18 @@ async def execute_evaluation(
 
     print(f"[Evaluation] Loaded {len(review_texts)} reviews ({len(sentence_texts)} sentences) for evaluation")
 
-    # Check for Ceiling Test mode (split dataset into two halves)
-    reference_texts = []       # Review-level reference (for diversity ceiling tests)
+    # Check for Self Test mode (split dataset into two halves)
+    reference_texts = []       # Review-level reference (for diversity self tests)
     reference_sentence_texts = []  # Sentence-level reference (for lexical/semantic metrics)
     reference_metrics_enabled = evaluation_config.get("reference_metrics_enabled", False) if evaluation_config else False
-    ceiling_test = evaluation_config.get("ceiling_test") if evaluation_config else None
+    self_test = evaluation_config.get("self_test") or evaluation_config.get("ceiling_test") if evaluation_config else None
 
     # Lexical/Semantic metrics that require a reference dataset
     reference_required_metrics = {"bleu", "rouge_l", "bertscore", "moverscore"}
 
-    if ceiling_test and ceiling_test.get("enabled"):
-        # Ceiling Test: split the dataset into two halves
-        split_mode = ceiling_test.get("split_mode", "random")
+    if self_test and self_test.get("enabled"):
+        # Self Test: split the dataset into two halves
+        split_mode = self_test.get("split_mode", "random")
         if split_mode == "random":
             import random
             indices = list(range(len(review_texts)))
@@ -8343,11 +8085,11 @@ async def execute_evaluation(
             set_a = review_texts[:mid]
             set_b = review_texts[mid:]
 
-        print(f"[Evaluation] Ceiling Test ({split_mode} split): Set A = {len(set_a)} reviews, Set B = {len(set_b)} reviews")
+        print(f"[Evaluation] Self Test ({split_mode} split): Set A = {len(set_a)} reviews, Set B = {len(set_b)} reviews")
         if convex:
-            await convex.add_log(job_id, "INFO", "MDQA", f"Ceiling Test ({split_mode} split): Set A = {len(set_a)} reviews, Set B = {len(set_b)} reviews")
+            await convex.add_log(job_id, "INFO", "MDQA", f"Self Test ({split_mode} split): Set A = {len(set_a)} reviews, Set B = {len(set_b)} reviews")
 
-        # For ceiling test, use review-level for both (same split)
+        # For self test, use review-level for both (same split)
         review_texts = set_a
         reference_texts = set_b
         # Sentence-level split: approximate by splitting sentence_texts at midpoint
@@ -9059,6 +8801,7 @@ async def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTas
         request.referenceDataset,
         request.method,
         request.heuristicConfig,
+        request.rdeUsage,
     )
     return {"status": "started", "jobId": request.jobId, "phases": request.phases, "method": request.method}
 
@@ -9132,7 +8875,7 @@ async def list_jobs(jobs_directory: str = "./jobs"):
         return {"jobs": []}
 
     jobs = []
-    for job_dir in sorted(jobs_dir.iterdir(), reverse=True):
+    for job_dir in sorted(jobs_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
         if not job_dir.is_dir() or job_dir.name.startswith('.'):
             continue
 
@@ -9214,6 +8957,8 @@ async def list_jobs(jobs_directory: str = "./jobs"):
         if not has_conformity:
             has_conformity = (job_dir / "reports" / "conformity-report.json").exists()
 
+        has_tokens = (job_dir / "reports" / "tokens.json").exists()
+
         jobs.append({
             "dirName": job_dir.name,
             "path": str(job_dir),
@@ -9223,12 +8968,75 @@ async def list_jobs(jobs_directory: str = "./jobs"):
             "hasMavs": has_mavs,
             "hasMetrics": has_metrics,
             "hasConformity": has_conformity,
+            "hasTokens": has_tokens,
             "datasetFiles": dataset_files,
             "mavModels": mav_models,
             "targets": targets,
         })
 
     return {"jobs": jobs}
+
+
+class ReadTokensRequest(BaseModel):
+    jobDir: str
+
+
+@app.post("/api/read-tokens")
+async def read_tokens(request: ReadTokensRequest):
+    """Read tokens.json from a job's reports directory."""
+    from pathlib import Path
+    import json
+
+    tokens_path = Path(request.jobDir) / "reports" / "tokens.json"
+    if not tokens_path.exists():
+        return {"found": False, "tokens": None}
+
+    try:
+        with open(tokens_path, "r", encoding="utf-8") as f:
+            tokens_data = json.load(f)
+        return {"found": True, "tokens": tokens_data}
+    except Exception as e:
+        return {"found": False, "tokens": None, "error": str(e)}
+
+
+class FetchActualCostsRequest(BaseModel):
+    generationIds: list[str]
+
+
+@app.post("/api/fetch-actual-costs")
+async def fetch_actual_costs(request: FetchActualCostsRequest):
+    """Fetch actual costs from OpenRouter generation details endpoint."""
+    import asyncio
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return {"costs": {}, "error": "No API key configured"}
+
+    valid_ids = [gid for gid in request.generationIds if gid]
+    if not valid_ids:
+        return {"costs": {}}
+
+    costs: dict[str, float] = {}
+    semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
+
+    async with httpx.AsyncClient() as client:
+        async def fetch_one(gen_id: str):
+            async with semaphore:
+                try:
+                    resp = await client.get(
+                        f"https://openrouter.ai/api/v1/generation?id={gen_id}",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        timeout=10.0,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json().get("data", {})
+                        costs[gen_id] = data.get("usage", 0)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[fetch_one(gid) for gid in valid_ids])
+
+    return {"costs": costs}
 
 
 class ReadDatasetRequest(BaseModel):
@@ -9466,6 +9274,8 @@ async def read_metrics(request: ReadMetricsRequest):
             for metric, score in raw_avg.items():
                 if metric.endswith("_std") or metric.startswith("_"):
                     continue
+                if metric in ("perModel", "totalModels"):
+                    continue
                 cat = category_map.get(metric, "other")
                 if cat not in average_metrics:
                     average_metrics[cat] = []
@@ -9488,6 +9298,11 @@ async def read_metrics(request: ReadMetricsRequest):
             for category in ["lexical", "semantic", "diversity"]:
                 if category in average_metrics:
                     result[category] = average_metrics[category]
+
+            # Extract per-model data (multi-model heuristic jobs)
+            if "perModel" in raw_avg and isinstance(raw_avg["perModel"], list):
+                result["perModel"] = raw_avg["perModel"]
+                result["totalModels"] = raw_avg.get("totalModels", len(raw_avg["perModel"]))
         else:
             # Single average file, no per-run data
             category_map = {
@@ -9498,10 +9313,17 @@ async def read_metrics(request: ReadMetricsRequest):
             for metric, score in raw_avg.items():
                 if metric.endswith("_std") or metric.startswith("_"):
                     continue
+                if metric in ("perModel", "totalModels"):
+                    continue
                 cat = category_map.get(metric, "other")
                 if cat not in result:
                     result[cat] = []
                 result[cat].append({"metric": metric, "score": score, "description": metric_descriptions.get(metric, "")})
+
+            # Extract per-model data (multi-model heuristic jobs, single-run)
+            if "perModel" in raw_avg and isinstance(raw_avg["perModel"], list):
+                result["perModel"] = raw_avg["perModel"]
+                result["totalModels"] = raw_avg.get("totalModels", len(raw_avg["perModel"]))
 
     if json_path.exists():
         raw = json.loads(json_path.read_text(encoding="utf-8"))
@@ -9550,6 +9372,11 @@ async def read_metrics(request: ReadMetricsRequest):
                 if category in average_metrics:
                     result[category] = average_metrics[category]
 
+            # Extract per-model data (multi-model jobs)
+            if "perModel" in raw and isinstance(raw["perModel"], list):
+                result["perModel"] = raw["perModel"]
+                result["totalModels"] = raw.get("totalModels", len(raw["perModel"]))
+
         # Check if it's the grouped format (single-run with lexical/semantic/diversity keys)
         elif "lexical" in raw or "semantic" in raw or "diversity" in raw:
             for category in ["lexical", "semantic", "diversity"]:
@@ -9577,6 +9404,7 @@ async def read_metrics(request: ReadMetricsRequest):
 
     # Fallback: read from CSVs if JSON not found or empty
     if not result:
+        csv_per_model = {}  # model_slug -> {metric_key -> [values]}  (for multi-model CSVs)
         for category in ["lexical", "semantic", "diversity"]:
             csv_path = metrics_dir / f"{category}-metrics.csv"
             if csv_path.exists():
@@ -9585,22 +9413,36 @@ async def read_metrics(request: ReadMetricsRequest):
                 std_row = []
                 with open(csv_path, encoding="utf-8") as f:
                     reader = csv.DictReader(f)
+                    has_model_col = False
                     for row in reader:
                         run_val = row.get("run", "")
+                        model_val = row.get("model", "")
+                        if model_val:
+                            has_model_col = True
                         metric_entry = {
                             "metric": row.get("metric", ""),
                             "score": float(row.get("score", 0)),
                             "description": row.get("description", ""),
                         }
-                        if run_val == "avg":
+                        if run_val == "avg" and model_val and model_val != "ALL":
+                            # Per-model average row
+                            if model_val not in csv_per_model:
+                                csv_per_model[model_val] = {}
+                            csv_per_model[model_val][row.get("metric", "")] = float(row.get("score", 0))
+                        elif run_val == "avg":
                             avg_metrics.append(metric_entry)
                         elif run_val == "std":
                             std_row.append(metric_entry)
                         elif run_val.isdigit():
-                            run_key = f"run{run_val}"
-                            if run_key not in metrics_by_run:
-                                metrics_by_run[run_key] = []
-                            metrics_by_run[run_key].append(metric_entry)
+                            # For multi-model CSVs with model col, only use ALL rows for per-run
+                            if has_model_col and model_val and model_val != "ALL":
+                                # Track per-model per-run data
+                                pass
+                            else:
+                                run_key = f"run{run_val}"
+                                if run_key not in metrics_by_run:
+                                    metrics_by_run[run_key] = []
+                                metrics_by_run[run_key].append(metric_entry)
                         else:
                             # Single-run format (no run column)
                             if category not in result:
@@ -9623,6 +9465,14 @@ async def read_metrics(request: ReadMetricsRequest):
             result["perRun"] = per_run_metrics
             result["average"] = average_metrics
             result["std"] = std_metrics
+
+        # Build perModel from CSV per-model average rows
+        if csv_per_model:
+            result["perModel"] = [
+                {"model": slug, "modelSlug": slug, "metrics": metrics}
+                for slug, metrics in csv_per_model.items()
+            ]
+            result["totalModels"] = len(csv_per_model)
 
     return {"metrics": result}
 
@@ -9695,6 +9545,7 @@ class ExtractContextResponse(BaseModel):
     reviewer_context: Optional[str] = None
     sample_count: int = 0
     error: Optional[str] = None
+    rde_usage: Optional[list[dict]] = None  # Serialized LLMUsage records for token tracking
 
 
 @app.post("/api/extract-context", response_model=ExtractContextResponse)
@@ -9722,9 +9573,13 @@ async def extract_context(request: ExtractContextRequest):
         print(f"[CTX] Starting context extraction from {len(request.reviews)} reviews")
         print(f"[CTX] Using model: {request.model}")
 
+        from cera.llm.usage import UsageTracker
+        rde_tracker = UsageTracker()
+
         extractor = ContextExtractor(
             api_key=request.apiKey,
             model=request.model,
+            usage_tracker=rde_tracker,
         )
 
         subject_context = None
@@ -9767,6 +9622,7 @@ async def extract_context(request: ExtractContextRequest):
             subject_context=subject_context,
             reviewer_context=reviewer_context,
             sample_count=actual_sample_count,
+            rde_usage=rde_tracker.records_list() if rde_tracker.total_tokens > 0 else None,
         )
 
     except Exception as e:
@@ -9855,6 +9711,7 @@ class ExtractRefContextResponse(BaseModel):
     sample_count: int = 0
     total_reviews: int = 0
     error: Optional[str] = None
+    rde_usage: Optional[list[dict]] = None  # Serialized LLMUsage records for token tracking
 
 
 def _load_sex_patterns() -> dict:
@@ -10207,9 +10064,13 @@ async def extract_ref_context(request: ExtractRefContextRequest):
 
         # 6. LLM-based extraction for subject context, reviewer context, domain, region, and query
         print("[RDE] Step 6/6: LLM extraction...")
+        from cera.llm.usage import UsageTracker
+        rde_tracker = UsageTracker()
+
         extractor = ContextExtractor(
             api_key=request.apiKey,
             model=request.model,
+            usage_tracker=rde_tracker,
         )
 
         # Convert reviews to text strings for the extractor
@@ -10278,6 +10139,7 @@ async def extract_ref_context(request: ExtractRefContextRequest):
             aspect_categories=aspect_categories,
             sample_count=actual_sample,
             total_reviews=total_reviews,
+            rde_usage=rde_tracker.records_list() if rde_tracker.total_tokens > 0 else None,
         )
 
     except Exception as e:
