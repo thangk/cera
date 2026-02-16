@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate, useSearch } from '@tanstack/react-router'
 import { useQuery } from 'convex/react'
 import { api } from '../../convex/_generated/api'
-import React, { useState, useCallback, useEffect } from 'react'
+import React, { useState, useCallback, useEffect, useMemo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -17,14 +17,15 @@ import {
   Eye, Upload, FileText, BarChart3, Users, Loader2,
   ArrowUpDown, Filter, ChevronDown, ChevronRight, ChevronLeft,
   CheckCircle, XCircle, AlertCircle, Info, ClipboardCheck, Search, X,
-  Plus, Trash2, RotateCcw, Save, Edit2,
+  Plus, Trash2, RotateCcw, Save, Edit2, Coins,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { PYTHON_API_URL } from '../lib/api-urls'
+import { useOpenRouterModels } from '../hooks/use-openrouter-models'
 
 // Valid tool values for URL state
-const toolValues = ['dataset', 'mav', 'conformity', 'metrics', 'domain-patterns'] as const
+const toolValues = ['dataset', 'mav', 'conformity', 'metrics', 'tokens', 'domain-patterns'] as const
 type ToolValue = typeof toolValues[number]
 
 const searchSchema = z.object({
@@ -55,10 +56,23 @@ interface Review {
   id: string
   sentences: Sentence[]
   metadata?: {
-    assigned_polarity?: string
+    assigned_polarity?: string | Record<string, number>
     age?: number
     sex?: string
   }
+}
+
+/** Extract polarity string from metadata.assigned_polarity which may be a string or distribution object */
+function resolvePolarity(review: Review): string {
+  const raw = review.metadata?.assigned_polarity
+  if (!raw) return inferPolarity(review)
+  if (typeof raw === 'string') return raw.toLowerCase()
+  // It's a distribution object like {positive: 65, neutral: 15, negative: 20}
+  // Return the dominant polarity
+  const entries = Object.entries(raw)
+  if (entries.length === 0) return inferPolarity(review)
+  entries.sort(([, a], [, b]) => b - a)
+  return entries[0][0].toLowerCase()
 }
 
 interface TargetInfo {
@@ -77,6 +91,7 @@ interface JobInfo {
   hasMavs: boolean
   hasMetrics: boolean
   hasConformity: boolean
+  hasTokens: boolean
   datasetFiles: string[]
   mavModels: string[]
   targets: TargetInfo[]
@@ -157,11 +172,11 @@ function ViewerTools() {
     <div className="flex flex-col gap-6 p-6">
       <div>
         <h1 className="text-2xl font-bold">Viewer Tools</h1>
-        <p className="text-muted-foreground">View and analyze datasets, MAV reports, conformity reports, and evaluation metrics</p>
+        <p className="text-muted-foreground">View and analyze datasets, MAV reports, conformity reports, evaluation metrics, and token usage</p>
       </div>
 
       <Tabs value={currentTool} onValueChange={handleToolChange} className="w-full">
-        <TabsList className="grid w-full grid-cols-5">
+        <TabsList className="grid w-full grid-cols-6">
           <TabsTrigger value="dataset" className="flex items-center gap-2">
             <FileText className="h-4 w-4" />
             Dataset Viewer
@@ -177,6 +192,10 @@ function ViewerTools() {
           <TabsTrigger value="metrics" className="flex items-center gap-2">
             <BarChart3 className="h-4 w-4" />
             Metrics Viewer
+          </TabsTrigger>
+          <TabsTrigger value="tokens" className="flex items-center gap-2">
+            <Coins className="h-4 w-4" />
+            Tokens
           </TabsTrigger>
           <TabsTrigger value="domain-patterns" className="flex items-center gap-2">
             <Filter className="h-4 w-4" />
@@ -195,6 +214,9 @@ function ViewerTools() {
         </TabsContent>
         <TabsContent value="metrics" className="mt-6">
           <MetricsViewer />
+        </TabsContent>
+        <TabsContent value="tokens" className="mt-6">
+          <TokensViewer />
         </TabsContent>
         <TabsContent value="domain-patterns" className="mt-6">
           <DomainPatternsManager />
@@ -424,8 +446,7 @@ function DatasetViewer() {
 
   // Get polarity counts (normalized to lowercase)
   const polarityCounts = reviews.reduce((acc, r) => {
-    const rawPol = r.metadata?.assigned_polarity || inferPolarity(r)
-    const pol = rawPol.toLowerCase()
+    const pol = resolvePolarity(r)
     acc[pol] = (acc[pol] || 0) + 1
     return acc
   }, {} as Record<string, number>)
@@ -509,7 +530,7 @@ function DatasetViewer() {
   const filteredReviews = reviews
     .filter(r => {
       if (polarityFilter !== 'all') {
-        const pol = r.metadata?.assigned_polarity || inferPolarity(r)
+        const pol = resolvePolarity(r)
         if (pol !== polarityFilter) return false
       }
       if (categoryFilter !== 'all') {
@@ -528,8 +549,8 @@ function DatasetViewer() {
     })
     .sort((a, b) => {
       if (sortBy === 'polarity') {
-        const polA = a.metadata?.assigned_polarity || inferPolarity(a)
-        const polB = b.metadata?.assigned_polarity || inferPolarity(b)
+        const polA = resolvePolarity(a)
+        const polB = resolvePolarity(b)
         return polA.localeCompare(polB)
       }
       return parseInt(a.id) - parseInt(b.id)
@@ -893,7 +914,7 @@ function DatasetViewer() {
 }
 
 function ReviewCard({ review, searchQuery }: { review: Review; searchQuery?: string }) {
-  const polarity = review.metadata?.assigned_polarity || inferPolarity(review)
+  const polarity = resolvePolarity(review)
   const allCategories = Array.from(new Set(
     review.sentences.flatMap(s => s.opinions.map(o => o.category))
   ))
@@ -1954,9 +1975,17 @@ function MetricsViewer() {
   const [perRunMetrics, setPerRunMetrics] = useState<PerRunMetrics>({})
   const [summaryMetrics, setSummaryMetrics] = useState<SummaryMetrics>({})
   const [isMultiRun, setIsMultiRun] = useState(false)
-  const [multiRunView, setMultiRunView] = useState<'summary' | 'per-run'>('summary')
+  const [multiRunView, setMultiRunView] = useState<'summary' | 'per-run' | 'per-model'>('summary')
   const [selectedRun, setSelectedRun] = useState<string>('')
   const [selectedTarget, setSelectedTarget] = useState<number | null>(null)
+  // Per-model metrics from mdqa-results.json
+  const [perModelData, setPerModelData] = useState<Array<{
+    model: string
+    modelSlug: string
+    metrics: Record<string, number>
+    runs?: Array<{ run: number; metrics: Record<string, number> }>
+  }>>([])
+  const [isMultiModel, setIsMultiModel] = useState(false)
 
   // Restore state from localStorage on mount
   useEffect(() => {
@@ -1991,6 +2020,8 @@ function MetricsViewer() {
     setSummaryMetrics({})
     setIsMultiRun(false)
     setSelectedRun('')
+    setPerModelData([])
+    setIsMultiModel(false)
     localStorage.removeItem(METRICS_VIEWER_STORAGE_KEY)
   }
 
@@ -2090,6 +2121,16 @@ function MetricsViewer() {
           }
         }
         setMetrics(avgMetrics)
+
+        // Check for per-model data
+        if (metricsData.perModel && Array.isArray(metricsData.perModel) && metricsData.perModel.length > 1) {
+          setPerModelData(metricsData.perModel)
+          setIsMultiModel(true)
+        } else {
+          setPerModelData([])
+          setIsMultiModel(false)
+        }
+
         toast.success(`Loaded metrics from ${metricsData.totalRuns || runs.length} runs`)
       } else {
         // Single-run data
@@ -2099,6 +2140,8 @@ function MetricsViewer() {
         setSummaryMetrics({})
         setIsMultiRun(false)
         setSelectedRun('')
+        setPerModelData([])
+        setIsMultiModel(false)
         toast.success('Loaded metrics data')
       }
     } catch {
@@ -2132,6 +2175,16 @@ function MetricsViewer() {
       toast.error(`Failed to parse ${category} metrics file`)
     }
   }
+
+  const METRIC_COLS = [
+    { key: 'bleu', label: 'BLEU', higher: true },
+    { key: 'rouge_l', label: 'ROUGE-L', higher: true },
+    { key: 'bertscore', label: 'BERTScore', higher: true },
+    { key: 'moverscore', label: 'MoverScore', higher: true },
+    { key: 'distinct_1', label: 'Dist-1', higher: true },
+    { key: 'distinct_2', label: 'Dist-2', higher: true },
+    { key: 'self_bleu', label: 'Self-BLEU', higher: false },
+  ]
 
   const CATEGORY_INFO: Record<string, { label: string; color: string; icon: typeof BarChart3 }> = {
     lexical: { label: 'Lexical Metrics', color: 'text-blue-500', icon: FileText },
@@ -2338,7 +2391,8 @@ function MetricsViewer() {
                       Multi-Run Dataset
                     </Badge>
                     <span className="text-sm text-muted-foreground">
-                      {Object.keys(perRunMetrics[Object.keys(perRunMetrics)[0]] || {}).length} runs evaluated
+                      {Object.keys(perRunMetrics[Object.keys(perRunMetrics)[0]] || {}).length} runs
+                      {isMultiModel && ` \u00d7 ${perModelData.length} models`} evaluated
                     </span>
                   </div>
                   <div className="flex gap-2">
@@ -2358,6 +2412,16 @@ function MetricsViewer() {
                       <Eye className="mr-2 h-4 w-4" />
                       Per Run
                     </Button>
+                    {isMultiModel && (
+                      <Button
+                        variant={multiRunView === 'per-model' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setMultiRunView('per-model')}
+                      >
+                        <Users className="mr-2 h-4 w-4" />
+                        Per Model
+                      </Button>
+                    )}
                   </div>
                 </div>
               </CardContent>
@@ -2533,6 +2597,127 @@ function MetricsViewer() {
             </>
           )}
 
+          {/* Multi-model Per-Model View */}
+          {isMultiRun && multiRunView === 'per-model' && perModelData.length > 0 && (() => {
+            // Find best value per metric for highlighting
+            const bestValues: Record<string, number> = {}
+            for (const col of METRIC_COLS) {
+              const values = perModelData
+                .map(pm => pm.metrics?.[col.key])
+                .filter((v): v is number => v !== undefined)
+              if (values.length > 0) {
+                bestValues[col.key] = col.higher
+                  ? Math.max(...values)
+                  : Math.min(...values)
+              }
+            }
+            const numRuns = Object.keys(perRunMetrics[Object.keys(perRunMetrics)[0]] || {}).length
+
+            return (
+              <div className="space-y-4">
+                <Card>
+                  <CardHeader className="pb-3">
+                    <CardTitle className="text-base">Model Comparison</CardTitle>
+                    <CardDescription>
+                      Average metrics across {numRuns} runs per model
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b">
+                            <th className="text-left py-2 px-2 text-xs font-semibold text-muted-foreground">Model</th>
+                            {METRIC_COLS.map(col => (
+                              <th key={col.key} className="text-center py-2 px-2 text-xs font-semibold text-muted-foreground">
+                                {col.label}
+                                <span className="block text-[9px] font-normal opacity-60">
+                                  {col.higher ? '\u2191' : '\u2193'}
+                                </span>
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {perModelData.map(pm => (
+                            <tr key={pm.model} className="border-b last:border-0">
+                              <td className="py-2.5 px-2">
+                                <span className="font-medium truncate max-w-[200px] block" title={pm.model}>
+                                  {pm.modelSlug}
+                                </span>
+                              </td>
+                              {METRIC_COLS.map(col => {
+                                const value = pm.metrics?.[col.key]
+                                const quality = getQualityIndicator(col.key, value ?? 0)
+                                const isBest = value !== undefined && bestValues[col.key] === value && perModelData.length > 1
+                                return (
+                                  <td key={col.key} className={`text-center py-2.5 px-2 ${isBest ? 'font-bold' : ''}`}>
+                                    {value !== undefined ? (
+                                      <div className="flex flex-col items-center">
+                                        <span className="font-mono text-xs">{value.toFixed(4)}</span>
+                                        {quality && (
+                                          <span className={`text-[9px] ${quality.color}`}>{quality.label}</span>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <span className="text-muted-foreground">&mdash;</span>
+                                    )}
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Per-model per-run breakdown */}
+                {perModelData.some(pm => pm.runs && pm.runs.length > 1) && (
+                  <Card>
+                    <CardHeader className="pb-3">
+                      <CardTitle className="text-base">Per-Run Breakdown</CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-3">
+                      {perModelData.map(pm => {
+                        if (!pm.runs || pm.runs.length <= 1) return null
+                        return (
+                          <div key={pm.model} className="space-y-2">
+                            <h4 className="text-sm font-medium">{pm.modelSlug}</h4>
+                            <div className="space-y-1.5 pl-2">
+                              {pm.runs.map(runData => (
+                                <div key={runData.run} className="rounded border p-2 bg-muted/20">
+                                  <div className="flex justify-between items-center mb-1.5">
+                                    <span className="text-xs font-medium">Run {runData.run}</span>
+                                  </div>
+                                  <div className="grid gap-1.5 grid-cols-2 sm:grid-cols-4 lg:grid-cols-7">
+                                    {METRIC_COLS.map(col => {
+                                      const value = runData.metrics?.[col.key]
+                                      if (value === undefined) return null
+                                      const quality = getQualityIndicator(col.key, value)
+                                      return (
+                                        <div key={col.key} className="text-center p-1.5 rounded bg-background">
+                                          <p className="text-[9px] text-muted-foreground uppercase">{col.label}</p>
+                                          <p className="text-xs font-semibold font-mono">{value.toFixed(4)}</p>
+                                          {quality && <span className={`text-[8px] ${quality.color}`}>{quality.label}</span>}
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </CardContent>
+                  </Card>
+                )}
+              </div>
+            )
+          })()}
+
           {/* Single-run view */}
           {!isMultiRun && (
             <div className="grid gap-4 md:grid-cols-3">
@@ -2601,6 +2786,875 @@ function MetricsViewer() {
           <AlertCircle className="mr-2 h-5 w-5" />
           <span>No metrics data found for this job</span>
         </div>
+      )}
+    </div>
+  )
+}
+
+
+// ========================================
+// Tokens Viewer Tab
+// ========================================
+
+interface TokensReport {
+  version: number
+  job_id: string
+  method: string
+  generated_at: string
+  totals: {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+    total_calls: number
+    estimated_cost_usd: number
+  }
+  by_phase: Record<string, {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+    total_calls: number
+    estimated_cost_usd: number
+    components: Record<string, {
+      prompt_tokens: number
+      completion_tokens: number
+      total_tokens: number
+      total_calls: number
+      estimated_cost_usd: number
+    }>
+  }>
+  by_model: Record<string, {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+    total_calls: number
+    estimated_cost_usd: number
+    pricing?: { prompt_per_token: number; completion_per_token: number }
+  }>
+  by_target: Record<string, {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+    total_calls: number
+    estimated_cost_usd: number
+    runs?: Record<string, {
+      prompt_tokens: number
+      completion_tokens: number
+      total_tokens: number
+      total_calls: number
+      estimated_cost_usd: number
+    }>
+  }>
+  records: Array<{
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+    model: string
+    component: string
+    target: string
+    run: string
+    timestamp: string
+    generation_id?: string
+  }>
+}
+
+// Pipeline execution order for SIL components
+const SIL_COMPONENT_ORDER = [
+  'sil.research',
+  'sil.search',
+  'sil.queries',
+  'sil.answers',
+  'sil.judge',
+  'sil.classify',
+  'sil.cluster',
+  'sil.cluster_judge',
+]
+
+// Component label display names
+const COMPONENT_LABELS: Record<string, string> = {
+  'sil.research': 'Research',
+  'sil.search': 'Web Search',
+  'sil.queries': 'Query Generation',
+  'sil.answers': 'Query Answering',
+  'sil.judge': 'Consensus Judging',
+  'sil.classify': 'Fact Classification',
+  'sil.cluster': 'Entity Clustering',
+  'sil.cluster_judge': 'Cluster Judging',
+  'aml': 'Review Generation',
+  'aml.persona': 'Persona Generation',
+  'aml.patterns': 'Writing Patterns',
+  'aml.structures': 'Structure Variants',
+  'rde.subject': 'Subject Context',
+  'rde.reviewer': 'Reviewer Context',
+  'rde.query': 'Subject Query',
+  'rde.domain': 'Domain Extraction',
+  'rde.region': 'Region Extraction',
+  'heuristic': 'Heuristic Generation',
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return n.toLocaleString()
+}
+
+function formatCost(usd: number): string {
+  if (usd === 0) return '$0.00'
+  if (usd < 0.01) return `$${usd.toFixed(4)}`
+  return `$${usd.toFixed(2)}`
+}
+
+function TokensViewer() {
+  const settings = useQuery(api.settings.get)
+  const [jobs, setJobs] = useState<JobInfo[]>([])
+  const [selectedJob, setSelectedJob] = useState<string>('')
+  const [loading, setLoading] = useState(false)
+  const [jobsLoading, setJobsLoading] = useState(false)
+  const [tokens, setTokens] = useState<TokensReport | null>(null)
+  const [expandedComponents, setExpandedComponents] = useState<Set<string>>(new Set())
+  const [costMode, setCostMode] = useState<'estimated' | 'actual'>('estimated')
+  const [actualCosts, setActualCosts] = useState<Record<string, number>>({})
+  const [actualCostsLoading, setActualCostsLoading] = useState(false)
+
+  // Fetch OpenRouter models for pricing data (same endpoint the LLM selector uses)
+  const { models: orModels } = useOpenRouterModels()
+
+  // Build pricing lookup: { modelId: { prompt: perTokenCost, completion: perTokenCost } }
+  const pricingMap = useMemo(() => {
+    const map: Record<string, { prompt: number; completion: number }> = {}
+    for (const m of orModels) {
+      const promptPrice = parseFloat(m.pricing.prompt) || 0
+      const completionPrice = parseFloat(m.pricing.completion) || 0
+      if (promptPrice > 0 || completionPrice > 0) {
+        map[m.id] = { prompt: promptPrice, completion: completionPrice }
+      }
+    }
+    return map
+  }, [orModels])
+
+  // Compute estimated cost for a single record using pricing map
+  const getEstimatedCost = useCallback((promptTokens: number, completionTokens: number, model: string) => {
+    // Try exact match, then strip :online suffix
+    const pricing = pricingMap[model] || pricingMap[model.replace(':online', '')]
+    if (!pricing) return 0
+    return promptTokens * pricing.prompt + completionTokens * pricing.completion
+  }, [pricingMap])
+
+  // Get cost for a record (actual if available, otherwise estimated)
+  const getRecordCost = useCallback((r: { prompt_tokens: number; completion_tokens: number; model: string; generation_id?: string }) => {
+    if (costMode === 'actual' && r.generation_id && actualCosts[r.generation_id] !== undefined) {
+      return actualCosts[r.generation_id]
+    }
+    return getEstimatedCost(r.prompt_tokens, r.completion_tokens, r.model)
+  }, [costMode, actualCosts, getEstimatedCost])
+
+  // Fetch actual costs from OpenRouter generation details
+  const fetchActualCosts = useCallback(async () => {
+    if (!tokens) return
+    const genIds = tokens.records.map(r => r.generation_id).filter((id): id is string => !!id)
+    if (genIds.length === 0) {
+      toast.error('No generation IDs found. Re-run job to capture them.')
+      setCostMode('estimated')
+      return
+    }
+    setActualCostsLoading(true)
+    try {
+      const res = await fetch(`${PYTHON_API_URL}/api/fetch-actual-costs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ generationIds: genIds }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      if (data.error) {
+        toast.error(`Failed to fetch actual costs: ${data.error}`)
+        setCostMode('estimated')
+        return
+      }
+      setActualCosts(data.costs || {})
+      const found = Object.keys(data.costs || {}).length
+      toast.success(`Fetched actual costs for ${found}/${genIds.length} generations`)
+    } catch {
+      toast.error('Failed to fetch actual costs from OpenRouter')
+      setCostMode('estimated')
+    } finally {
+      setActualCostsLoading(false)
+    }
+  }, [tokens])
+
+  // Enrich tokens report with computed costs (estimated from pricing or actual from OpenRouter)
+  const enrichedTokens = useMemo(() => {
+    if (!tokens) return tokens
+    // In estimated mode, need pricing data; in actual mode, need actual costs
+    if (costMode === 'estimated' && Object.keys(pricingMap).length === 0) return tokens
+    // Compute total cost from raw records
+    let totalCost = 0
+    for (const r of tokens.records) {
+      totalCost += getRecordCost(r)
+    }
+    // Compute by_phase costs
+    const enrichedByPhase: typeof tokens.by_phase = {}
+    for (const [phase, phaseData] of Object.entries(tokens.by_phase)) {
+      const enrichedComponents: typeof phaseData.components = {}
+      let phaseCost = 0
+      for (const [comp, compData] of Object.entries(phaseData.components)) {
+        let compCost = 0
+        for (const r of tokens.records) {
+          if (r.component === comp) {
+            compCost += getRecordCost(r)
+          }
+        }
+        enrichedComponents[comp] = { ...compData, estimated_cost_usd: compCost }
+        phaseCost += compCost
+      }
+      enrichedByPhase[phase] = { ...phaseData, estimated_cost_usd: phaseCost, components: enrichedComponents }
+    }
+    // Compute by_model costs
+    const enrichedByModel: typeof tokens.by_model = {}
+    for (const [model, modelData] of Object.entries(tokens.by_model)) {
+      const pricing = pricingMap[model] || pricingMap[model.replace(':online', '')]
+      let cost = 0
+      for (const r of tokens.records) {
+        if (r.model === model) {
+          cost += getRecordCost(r)
+        }
+      }
+      enrichedByModel[model] = {
+        ...modelData,
+        estimated_cost_usd: cost,
+        pricing: pricing ? { prompt_per_token: pricing.prompt, completion_per_token: pricing.completion } : undefined,
+      }
+    }
+    // Compute by_target costs
+    const enrichedByTarget: typeof tokens.by_target = {}
+    for (const [target, targetData] of Object.entries(tokens.by_target)) {
+      let targetCost = 0
+      for (const r of tokens.records) {
+        if (r.target === target) {
+          targetCost += getRecordCost(r)
+        }
+      }
+      const enrichedRuns: typeof targetData.runs = {}
+      if (targetData.runs) {
+        for (const [run, runData] of Object.entries(targetData.runs)) {
+          let runCost = 0
+          for (const r of tokens.records) {
+            if (r.target === target && r.run === run) {
+              runCost += getRecordCost(r)
+            }
+          }
+          enrichedRuns[run] = { ...runData, estimated_cost_usd: runCost }
+        }
+      }
+      enrichedByTarget[target] = { ...targetData, estimated_cost_usd: targetCost, runs: Object.keys(enrichedRuns).length > 0 ? enrichedRuns : targetData.runs }
+    }
+    return {
+      ...tokens,
+      totals: { ...tokens.totals, estimated_cost_usd: totalCost },
+      by_phase: enrichedByPhase,
+      by_model: enrichedByModel,
+      by_target: enrichedByTarget,
+    }
+  }, [tokens, pricingMap, getRecordCost, costMode])
+
+  const fetchJobs = useCallback(async () => {
+    setJobsLoading(true)
+    try {
+      const jobsDir = settings?.jobsDirectory || './jobs'
+      const res = await fetch(`${PYTHON_API_URL}/api/jobs-list?jobs_directory=${encodeURIComponent(jobsDir)}`)
+      const data = await res.json()
+      const jobsList = data.jobs || []
+      setJobs(jobsList)
+      const jobsWithTokens = jobsList.filter((j: JobInfo) => j.hasTokens)
+      if (jobsWithTokens.length > 0 && !selectedJob) {
+        const firstJob = jobsWithTokens[0]
+        setSelectedJob(firstJob.path)
+        loadTokens(firstJob.path)
+      }
+    } catch {
+      toast.error('Failed to load jobs list')
+    } finally {
+      setJobsLoading(false)
+    }
+  }, [settings?.jobsDirectory, selectedJob])
+
+  useEffect(() => {
+    if (settings?.jobsDirectory && jobs.length === 0) {
+      fetchJobs()
+    }
+  }, [settings?.jobsDirectory])
+
+  const loadTokens = async (jobDir: string) => {
+    setLoading(true)
+    try {
+      const res = await fetch(`${PYTHON_API_URL}/api/read-tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobDir }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      if (data.found && data.tokens) {
+        setTokens(data.tokens)
+      } else {
+        setTokens(null)
+        toast.error('No token data found for this job')
+      }
+    } catch (err) {
+      toast.error('Failed to load token data')
+      setTokens(null)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggleComponent = (key: string) => {
+    setExpandedComponents(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  // Get per-component model breakdown from raw records (with live pricing or actual costs)
+  const getComponentModelBreakdown = (component: string) => {
+    if (!tokens) return {}
+    const breakdown: Record<string, { prompt_tokens: number; completion_tokens: number; total_tokens: number; total_calls: number; estimated_cost_usd: number }> = {}
+    for (const r of tokens.records) {
+      if (r.component !== component) continue
+      const model = r.model || 'unknown'
+      if (!breakdown[model]) breakdown[model] = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, total_calls: 0, estimated_cost_usd: 0 }
+      breakdown[model].prompt_tokens += r.prompt_tokens
+      breakdown[model].completion_tokens += r.completion_tokens
+      breakdown[model].total_tokens += r.total_tokens
+      breakdown[model].total_calls += 1
+      breakdown[model].estimated_cost_usd += getRecordCost(r)
+    }
+    return breakdown
+  }
+
+  const jobsWithTokens = jobs.filter(j => j.hasTokens)
+
+  // Use enriched tokens (with computed costs) for display
+  const displayTokens = enrichedTokens
+
+  // Determine which phase sections to show
+  const compositionPhase = displayTokens?.by_phase?.composition
+  const generationPhase = displayTokens?.by_phase?.generation
+
+  // Split composition components into SIL+MAV vs RDE
+  const silComponents: [string, typeof compositionPhase extends undefined ? never : NonNullable<typeof compositionPhase>['components'][string]][] = []
+  const rdeComponents: [string, typeof compositionPhase extends undefined ? never : NonNullable<typeof compositionPhase>['components'][string]][] = []
+  if (compositionPhase?.components) {
+    for (const [key, val] of Object.entries(compositionPhase.components)) {
+      if (key.startsWith('sil.')) silComponents.push([key, val])
+      else if (key.startsWith('rde.')) rdeComponents.push([key, val])
+    }
+  }
+
+  // Sort SIL components by pipeline execution order
+  silComponents.sort((a, b) => {
+    const ai = SIL_COMPONENT_ORDER.indexOf(a[0])
+    const bi = SIL_COMPONENT_ORDER.indexOf(b[0])
+    return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi)
+  })
+
+  // Get all generation component keys
+  const genComponentKeys = generationPhase ? Object.keys(generationPhase.components || {}) : []
+
+  // Expand all / collapse all helpers
+  const expandAllSil = () => {
+    setExpandedComponents(prev => {
+      const next = new Set(prev)
+      for (const [key] of silComponents) next.add(key)
+      return next
+    })
+  }
+  const collapseAllSil = () => {
+    setExpandedComponents(prev => {
+      const next = new Set(prev)
+      for (const [key] of silComponents) next.delete(key)
+      return next
+    })
+  }
+  const allSilExpanded = silComponents.length > 0 && silComponents.every(([key]) => expandedComponents.has(key))
+
+  const expandAllGen = () => {
+    setExpandedComponents(prev => {
+      const next = new Set(prev)
+      for (const key of genComponentKeys) next.add(key)
+      return next
+    })
+  }
+  const collapseAllGen = () => {
+    setExpandedComponents(prev => {
+      const next = new Set(prev)
+      for (const key of genComponentKeys) next.delete(key)
+      return next
+    })
+  }
+  const allGenExpanded = genComponentKeys.length > 0 && genComponentKeys.every(key => expandedComponents.has(key))
+
+  // Detect RDE model from records
+  const rdeModel = useMemo(() => {
+    if (!tokens) return null
+    const rdeRecords = tokens.records.filter(r => r.component.startsWith('rde.'))
+    if (rdeRecords.length === 0) return null
+    const models = [...new Set(rdeRecords.map(r => r.model))]
+    return models.length === 1 ? models[0] : models.join(', ')
+  }, [tokens])
+
+  return (
+    <div className="space-y-6">
+      {/* Job Selector */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-lg">Token Usage</CardTitle>
+          <CardDescription>View LLM token usage and estimated costs per pipeline phase</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center gap-4">
+            <div className="flex-1">
+              <Select
+                value={selectedJob}
+                onValueChange={(val) => {
+                  setSelectedJob(val)
+                  setTokens(null)
+                  setActualCosts({})
+                  setCostMode('estimated')
+                  loadTokens(val)
+                }}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder={jobsLoading ? 'Loading jobs...' : 'Select a job'} />
+                </SelectTrigger>
+                <SelectContent>
+                  {jobsWithTokens.map((job) => (
+                    <SelectItem key={job.path} value={job.path}>
+                      {job.jobName} ({job.dirName})
+                    </SelectItem>
+                  ))}
+                  {jobsWithTokens.length === 0 && (
+                    <SelectItem value="_none" disabled>No jobs with token data</SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button variant="outline" size="sm" onClick={fetchJobs} disabled={jobsLoading}>
+              {jobsLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {loading && (
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+        </div>
+      )}
+
+      {!loading && !displayTokens && selectedJob && (
+        <Card>
+          <CardContent className="py-12 text-center text-muted-foreground">
+            No token data available for this job.
+          </CardContent>
+        </Card>
+      )}
+
+      {!loading && displayTokens && (
+        <>
+          {/* Cost Mode Toggle */}
+          <div className="flex items-center gap-2 justify-end">
+            <span className="text-xs text-muted-foreground">Cost Mode:</span>
+            <div className="flex rounded-md border">
+              <button
+                className={`px-3 py-1 text-xs font-medium rounded-l-md transition-colors ${
+                  costMode === 'estimated'
+                    ? 'bg-primary text-primary-foreground'
+                    : 'bg-background hover:bg-muted'
+                }`}
+                onClick={() => setCostMode('estimated')}
+              >
+                Estimated
+              </button>
+              <button
+                className={`px-3 py-1 text-xs font-medium rounded-r-md transition-colors ${
+                  costMode === 'actual'
+                    ? 'bg-primary text-primary-foreground'
+                    : 'bg-background hover:bg-muted'
+                }`}
+                onClick={() => {
+                  setCostMode('actual')
+                  if (Object.keys(actualCosts).length === 0) fetchActualCosts()
+                }}
+                disabled={actualCostsLoading}
+              >
+                {actualCostsLoading ? <Loader2 className="h-3 w-3 animate-spin inline mr-1" /> : null}
+                Actual
+              </button>
+            </div>
+          </div>
+
+          {/* Summary Stats */}
+          <div className="grid grid-cols-4 gap-4">
+            <Card>
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{formatTokenCount(displayTokens.totals.total_tokens)}</div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {formatTokenCount(displayTokens.totals.prompt_tokens)} in / {formatTokenCount(displayTokens.totals.completion_tokens)} out
+                </p>
+                <p className="text-sm text-muted-foreground mt-1">Total Tokens</p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{displayTokens.totals.total_calls.toLocaleString()}</div>
+                <p className="text-sm text-muted-foreground mt-1">Total Calls</p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{formatCost(displayTokens.totals.estimated_cost_usd)}</div>
+                <p className="text-sm text-muted-foreground mt-1">
+                  {costMode === 'actual' ? 'Actual Cost' : 'Estimated Cost'}
+                </p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <div className="text-2xl font-bold">{Object.keys(displayTokens.by_model).length}</div>
+                <p className="text-sm text-muted-foreground mt-1">Models Used</p>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* SIL+MAV Section */}
+          {silComponents.length > 0 && (
+            <Card>
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle className="text-base">SIL+MAV (Composition)</CardTitle>
+                    <CardDescription>
+                      {formatTokenCount(compositionPhase!.total_tokens)} tokens | {compositionPhase!.total_calls} calls | {formatCost(compositionPhase!.estimated_cost_usd)}
+                    </CardDescription>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs"
+                    onClick={allSilExpanded ? collapseAllSil : expandAllSil}
+                  >
+                    {allSilExpanded ? 'Collapse All' : 'Expand All'}
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-2 font-medium w-[280px]">Component</th>
+                        <th className="text-right p-2 font-medium">Input</th>
+                        <th className="text-right p-2 font-medium">Output</th>
+                        <th className="text-right p-2 font-medium">Total</th>
+                        <th className="text-right p-2 font-medium">Calls</th>
+                        <th className="text-right p-2 font-medium">Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {silComponents.map(([key, val]) => {
+                        const isExpanded = expandedComponents.has(key)
+                        const modelBreakdown = isExpanded ? getComponentModelBreakdown(key) : {}
+                        return (
+                          <React.Fragment key={key}>
+                            <tr
+                              className="border-b hover:bg-muted/30 cursor-pointer"
+                              onClick={() => toggleComponent(key)}
+                            >
+                              <td className="p-2 flex items-center gap-1">
+                                {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                                {COMPONENT_LABELS[key] || key}
+                              </td>
+                              <td className="text-right p-2 tabular-nums">{formatTokenCount(val.prompt_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums">{formatTokenCount(val.completion_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums font-medium">{formatTokenCount(val.total_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums">{val.total_calls}</td>
+                              <td className="text-right p-2 tabular-nums">{formatCost(val.estimated_cost_usd)}</td>
+                            </tr>
+                            {isExpanded && Object.entries(modelBreakdown).map(([model, mval]) => (
+                              <tr key={`${key}-${model}`} className="border-b bg-muted/10">
+                                <td className="p-2 pl-8 text-muted-foreground text-xs">{model.split('/').pop()}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(mval.prompt_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(mval.completion_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(mval.total_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{mval.total_calls}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatCost(mval.estimated_cost_usd)}</td>
+                              </tr>
+                            ))}
+                          </React.Fragment>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* RDE Section */}
+          {rdeComponents.length > 0 && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">RDE (Reference Dataset Extractor)</CardTitle>
+                <CardDescription>
+                  Context extraction from reference dataset
+                  {rdeModel && (
+                    <> &mdash; Model: <Badge variant="outline" className="font-mono text-xs ml-1">{rdeModel.split('/').pop()}</Badge></>
+                  )}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-2 font-medium w-[280px]">Component</th>
+                        <th className="text-right p-2 font-medium">Input</th>
+                        <th className="text-right p-2 font-medium">Output</th>
+                        <th className="text-right p-2 font-medium">Total</th>
+                        <th className="text-right p-2 font-medium">Calls</th>
+                        <th className="text-right p-2 font-medium">Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rdeComponents.map(([key, val]) => (
+                        <tr key={key} className="border-b hover:bg-muted/30">
+                          <td className="p-2">{COMPONENT_LABELS[key] || key}</td>
+                          <td className="text-right p-2 tabular-nums">{formatTokenCount(val.prompt_tokens)}</td>
+                          <td className="text-right p-2 tabular-nums">{formatTokenCount(val.completion_tokens)}</td>
+                          <td className="text-right p-2 tabular-nums font-medium">{formatTokenCount(val.total_tokens)}</td>
+                          <td className="text-right p-2 tabular-nums">{val.total_calls}</td>
+                          <td className="text-right p-2 tabular-nums">{formatCost(val.estimated_cost_usd)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* GenLLM Section */}
+          {generationPhase && Object.keys(generationPhase.components || {}).length > 0 && (
+            <Card>
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle className="text-base">
+                      {displayTokens.method === 'heuristic' ? 'Heuristic Generation' : 'GenLLM (Generation)'}
+                    </CardTitle>
+                    <CardDescription>
+                      {formatTokenCount(generationPhase.total_tokens)} tokens | {generationPhase.total_calls} calls | {formatCost(generationPhase.estimated_cost_usd)}
+                    </CardDescription>
+                  </div>
+                  {genComponentKeys.length > 1 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs"
+                      onClick={allGenExpanded ? collapseAllGen : expandAllGen}
+                    >
+                      {allGenExpanded ? 'Collapse All' : 'Expand All'}
+                    </Button>
+                  )}
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-2 font-medium w-[280px]">Component</th>
+                        <th className="text-right p-2 font-medium">Input</th>
+                        <th className="text-right p-2 font-medium">Output</th>
+                        <th className="text-right p-2 font-medium">Total</th>
+                        <th className="text-right p-2 font-medium">Calls</th>
+                        <th className="text-right p-2 font-medium">Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(generationPhase.components).map(([key, val]) => {
+                        const isExpanded = expandedComponents.has(key)
+                        const modelBreakdown = isExpanded ? getComponentModelBreakdown(key) : {}
+                        return (
+                          <React.Fragment key={key}>
+                            <tr
+                              className="border-b hover:bg-muted/30 cursor-pointer"
+                              onClick={() => toggleComponent(key)}
+                            >
+                              <td className="p-2 flex items-center gap-1">
+                                {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                                {COMPONENT_LABELS[key] || key}
+                              </td>
+                              <td className="text-right p-2 tabular-nums">{formatTokenCount(val.prompt_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums">{formatTokenCount(val.completion_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums font-medium">{formatTokenCount(val.total_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums">{val.total_calls}</td>
+                              <td className="text-right p-2 tabular-nums">{formatCost(val.estimated_cost_usd)}</td>
+                            </tr>
+                            {isExpanded && Object.entries(modelBreakdown).map(([model, mval]) => (
+                              <tr key={`${key}-${model}`} className="border-b bg-muted/10">
+                                <td className="p-2 pl-8 text-muted-foreground text-xs">{model.split('/').pop()}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(mval.prompt_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(mval.completion_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(mval.total_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{mval.total_calls}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatCost(mval.estimated_cost_usd)}</td>
+                              </tr>
+                            ))}
+                          </React.Fragment>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Model Breakdown */}
+          {Object.keys(displayTokens.by_model).length > 0 && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">Model Breakdown</CardTitle>
+                <CardDescription>Token usage aggregated by model</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-2 font-medium">Model</th>
+                        <th className="text-right p-2 font-medium">Input</th>
+                        <th className="text-right p-2 font-medium">Output</th>
+                        <th className="text-right p-2 font-medium">Total</th>
+                        <th className="text-right p-2 font-medium">Calls</th>
+                        <th className="text-right p-2 font-medium">Cost</th>
+                        <th className="text-right p-2 font-medium">Pricing (per 1M)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(displayTokens.by_model).map(([model, val]) => {
+                        const p = val.pricing
+                        const pricingStr = p
+                          ? `$${(p.prompt_per_token * 1_000_000).toFixed(2)} / $${(p.completion_per_token * 1_000_000).toFixed(2)}`
+                          : '—'
+                        return (
+                          <tr key={model} className="border-b hover:bg-muted/30">
+                            <td className="p-2">
+                              <Badge variant="outline" className="font-mono text-xs">{model.split('/').pop()}</Badge>
+                            </td>
+                            <td className="text-right p-2 tabular-nums">{formatTokenCount(val.prompt_tokens)}</td>
+                            <td className="text-right p-2 tabular-nums">{formatTokenCount(val.completion_tokens)}</td>
+                            <td className="text-right p-2 tabular-nums font-medium">{formatTokenCount(val.total_tokens)}</td>
+                            <td className="text-right p-2 tabular-nums">{val.total_calls}</td>
+                            <td className="text-right p-2 tabular-nums">{formatCost(val.estimated_cost_usd)}</td>
+                            <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{pricingStr}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                    <tfoot>
+                      <tr className="bg-muted/30 font-medium">
+                        <td className="p-2">Total</td>
+                        <td className="text-right p-2 tabular-nums">{formatTokenCount(displayTokens.totals.prompt_tokens)}</td>
+                        <td className="text-right p-2 tabular-nums">{formatTokenCount(displayTokens.totals.completion_tokens)}</td>
+                        <td className="text-right p-2 tabular-nums">{formatTokenCount(displayTokens.totals.total_tokens)}</td>
+                        <td className="text-right p-2 tabular-nums">{displayTokens.totals.total_calls}</td>
+                        <td className="text-right p-2 tabular-nums">{formatCost(displayTokens.totals.estimated_cost_usd)}</td>
+                        <td className="text-right p-2"></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Target Breakdown */}
+          {Object.keys(displayTokens.by_target).length > 0 && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">Target Breakdown</CardTitle>
+                <CardDescription>Token usage by dataset target size</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="rounded-md border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        <th className="text-left p-2 font-medium">Target</th>
+                        <th className="text-right p-2 font-medium">Input</th>
+                        <th className="text-right p-2 font-medium">Output</th>
+                        <th className="text-right p-2 font-medium">Total</th>
+                        <th className="text-right p-2 font-medium">Calls</th>
+                        <th className="text-right p-2 font-medium">Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(displayTokens.by_target).map(([target, val]) => {
+                        const isExpanded = expandedComponents.has(`target-${target}`)
+                        const runs = val.runs || {}
+                        const hasRuns = Object.keys(runs).length > 1
+                        return (
+                          <React.Fragment key={target}>
+                            <tr
+                              className={`border-b hover:bg-muted/30 ${hasRuns ? 'cursor-pointer' : ''}`}
+                              onClick={() => hasRuns && toggleComponent(`target-${target}`)}
+                            >
+                              <td className="p-2 flex items-center gap-1">
+                                {hasRuns && (isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />)}
+                                <Badge variant="secondary">{target}</Badge>
+                              </td>
+                              <td className="text-right p-2 tabular-nums">{formatTokenCount(val.prompt_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums">{formatTokenCount(val.completion_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums font-medium">{formatTokenCount(val.total_tokens)}</td>
+                              <td className="text-right p-2 tabular-nums">{val.total_calls}</td>
+                              <td className="text-right p-2 tabular-nums">{formatCost(val.estimated_cost_usd)}</td>
+                            </tr>
+                            {isExpanded && Object.entries(runs).sort().map(([run, rval]) => (
+                              <tr key={`${target}-${run}`} className="border-b bg-muted/10">
+                                <td className="p-2 pl-8 text-muted-foreground text-xs">{run}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(rval.prompt_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(rval.completion_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatTokenCount(rval.total_tokens)}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{rval.total_calls}</td>
+                                <td className="text-right p-2 tabular-nums text-xs text-muted-foreground">{formatCost(rval.estimated_cost_usd)}</td>
+                              </tr>
+                            ))}
+                          </React.Fragment>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Metadata */}
+          <Card>
+            <CardContent className="pt-6">
+              <div className="flex items-center gap-6 text-xs text-muted-foreground">
+                <span>Method: <Badge variant="outline" className="ml-1">{displayTokens.method}</Badge></span>
+                <span>Job: {displayTokens.job_id}</span>
+                <span>Generated: {new Date(displayTokens.generated_at).toLocaleString()}</span>
+                <span>{displayTokens.records.length} raw records</span>
+              </div>
+            </CardContent>
+          </Card>
+        </>
       )}
     </div>
   )
