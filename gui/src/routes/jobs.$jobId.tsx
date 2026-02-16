@@ -2,7 +2,7 @@ import { createFileRoute, Link } from '@tanstack/react-router'
 import { useQuery, useMutation, useAction } from 'convex/react'
 import { api } from 'convex/_generated/api'
 import { Id } from 'convex/_generated/dataModel'
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import {
   Clock,
   CheckCircle,
@@ -331,6 +331,38 @@ function JobDetailPage() {
     }
   }, [visiblePhases, activeTab])
 
+  // Multi-model detection (must be before auto-switch useEffect and getPhaseStatus)
+  const isMultiModel = (job?.modelProgress?.length ?? 0) > 1
+  const anyModelEvaluating = isMultiModel && job?.modelProgress?.some(
+    (m: { status: string }) => m.status === 'evaluating' || m.status === 'completed'
+  )
+  const allModelsCompleted = isMultiModel && job?.modelProgress?.every(
+    (m: { status: string }) => m.status === 'completed'
+  )
+
+  // Auto-switch tab to follow the active pipeline phase
+  const prevPhaseRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!job) return
+    // Determine the current pipeline phase from job status + modelProgress
+    let detectedPhase: string | null = null
+    if (job.status === 'composing') detectedPhase = 'composition'
+    else if (job.status === 'running') {
+      // Check if multi-model eval has started
+      if (anyModelEvaluating) detectedPhase = 'evaluation'
+      else detectedPhase = 'generation'
+    }
+    else if (job.status === 'evaluating') detectedPhase = 'evaluation'
+
+    // Only auto-switch when phase transitions forward
+    if (detectedPhase && detectedPhase !== prevPhaseRef.current) {
+      if (visiblePhases.some(p => p.id === detectedPhase)) {
+        prevPhaseRef.current = detectedPhase
+        setActiveTab(detectedPhase)
+      }
+    }
+  }, [job?.status, anyModelEvaluating, visiblePhases])
+
   // Collapsible states for each phase
   const [compositionSections, setCompositionSections] = useState({
     subject: true,
@@ -629,12 +661,21 @@ function JobDetailPage() {
         if (['pending', 'composing'].includes(job.status)) return 'pending'
         if (job.status === 'composed') return 'ready'
       }
-      if (job.status === 'running' || job.status === 'paused') return 'in_progress'
-      return 'done' // completed, terminated, failed
+      if (job.status === 'running' || job.status === 'paused') {
+        // In multi-model: if all models are evaluating/completed, generation is done
+        if (allModelsCompleted || (anyModelEvaluating && !job.modelProgress?.some(
+          (m: { status: string }) => m.status === 'generating' || m.status === 'pending'
+        ))) return 'done'
+        return 'in_progress'
+      }
+      return 'done' // completed, terminated, failed, evaluating
     }
     if (phaseId === 'evaluation') {
       if (job.status === 'completed') return 'done'
       if (job.status === 'evaluating') return 'in_progress'
+      // Multi-model: detect evaluation from modelProgress even if job status is still 'running'
+      if (anyModelEvaluating) return 'in_progress'
+      if (allModelsCompleted) return 'done'
       // If only evaluation phase, it's ready when pending/composed
       const hasGeneration = jobPhases.includes('generation')
       if (!hasGeneration && (job.status === 'pending' || job.status === 'composed')) return 'ready'
@@ -2267,6 +2308,22 @@ function JobDetailPage() {
               <div className="flex justify-between items-center">
                 <span className="text-muted-foreground">Phase</span>
                 {(() => {
+                  // Multi-model: detect phase from modelProgress
+                  if (isMultiModel && job.modelProgress && ['running', 'evaluating'].includes(job.status)) {
+                    const generating = job.modelProgress.filter((m: { status: string }) => m.status === 'generating' || m.status === 'pending').length
+                    const evaluating = job.modelProgress.filter((m: { status: string }) => m.status === 'evaluating').length
+                    const completed = job.modelProgress.filter((m: { status: string }) => m.status === 'completed').length
+                    const total = job.modelProgress.length
+                    const parts = []
+                    if (generating > 0) parts.push(`${generating} gen`)
+                    if (evaluating > 0) parts.push(`${evaluating} eval`)
+                    if (completed > 0) parts.push(`${completed} done`)
+                    return (
+                      <span className="text-xs text-muted-foreground font-medium">
+                        {parts.join(' / ')} ({total} models)
+                      </span>
+                    )
+                  }
                   // Map sub-phases to parent phase
                   const currentPhase = job.currentPhase?.toLowerCase()
                   let phaseInfo = null
@@ -2286,8 +2343,8 @@ function JobDetailPage() {
                   )
                 })()}
               </div>
-              {/* Run progress for multi-run jobs */}
-              {((job.totalRuns && job.totalRuns > 1) || (job.config.generation?.total_runs && job.config.generation.total_runs > 1)) && (
+              {/* Run progress for multi-run jobs (hide for multi-model — each model has own runs) */}
+              {!isMultiModel && ((job.totalRuns && job.totalRuns > 1) || (job.config.generation?.total_runs && job.config.generation.total_runs > 1)) && (
                 <>
                   <Separator />
                   <div className="flex justify-between">
