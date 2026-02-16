@@ -44,24 +44,35 @@ export function Table1aMdqa() {
 /**
  * Build Table 1a from data entries.
  * Rows: metrics (BLEU, ROUGE-L, etc.)
- * Columns: grouped by size, then by method within each size
+ * Columns: grouped by size, then by method within each size.
+ * Supports multiple entries per (method, size) for per-model comparisons.
  */
 function buildTable1a(entries: DataEntry[]): TableData {
-  // Get unique sizes and methods, sorted
   const sizes = [...new Set(entries.map(e => e.size))].sort((a, b) => a - b)
-  const methods: Method[] = ['real', 'cera', 'heuristic']
+  const methodOrder: Method[] = ['real', 'cera', 'heuristic']
 
-  // Build column headers and groups
+  // Build ordered entry list per size (sorted by method priority, then model slug)
+  const columnEntries: DataEntry[] = []
   const columnHeaders: string[] = []
+  const columnSubLabels: (string | null)[] = []
   const columnGroups: { label: string; span: number }[] = []
 
   for (const size of sizes) {
-    const methodsForSize = methods.filter(m =>
-      entries.some(e => e.size === size && e.method === m)
-    )
-    columnGroups.push({ label: `n=${size}`, span: methodsForSize.length })
-    for (const m of methodsForSize) {
-      columnHeaders.push(METHOD_LABELS[m])
+    const entriesForSize = entries
+      .filter(e => e.size === size)
+      .sort((a, b) => {
+        const mi = methodOrder.indexOf(a.method) - methodOrder.indexOf(b.method)
+        if (mi !== 0) return mi
+        return (a.modelSlug || '').localeCompare(b.modelSlug || '')
+      })
+
+    columnGroups.push({ label: `n=${size}`, span: entriesForSize.length })
+
+    for (const entry of entriesForSize) {
+      columnEntries.push(entry)
+      columnHeaders.push(METHOD_LABELS[entry.method])
+      // Always show model slug when present so user can tell which model produced the results
+      columnSubLabels.push(entry.modelSlug || null)
     }
   }
 
@@ -73,24 +84,11 @@ function buildTable1a(entries: DataEntry[]): TableData {
 
   // Build cells
   const cells: string[][] = MDQA_METRIC_KEYS.map(metricKey => {
-    const row: string[] = []
-    for (const size of sizes) {
-      const methodsForSize = methods.filter(m =>
-        entries.some(e => e.size === size && e.method === m)
-      )
-      for (const m of methodsForSize) {
-        const entry = entries.find(e => e.size === size && e.method === m)
-        if (!entry) {
-          row.push('---')
-          continue
-        }
-        row.push(formatMetricValue(entry, metricKey))
-      }
-    }
-    return row
+    return columnEntries.map(entry => formatMetricValue(entry, metricKey))
   })
 
-  return { rowHeaders, columnHeaders, cells, columnGroups }
+  const hasAnySub = columnSubLabels.some(l => l !== null)
+  return { rowHeaders, columnHeaders, cells, columnGroups, columnSubLabels: hasAnySub ? columnSubLabels : undefined }
 }
 
 /**

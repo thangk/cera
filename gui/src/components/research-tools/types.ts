@@ -68,6 +68,16 @@ export interface PerRunMetrics {
   metrics: Partial<Record<MdqaMetricKey, number>>
 }
 
+export interface PerModelMetrics {
+  model: string
+  modelSlug: string
+  metrics: Partial<Record<MdqaMetricKey, number>>
+  runs?: Array<{
+    run: number
+    metrics: Partial<Record<MdqaMetricKey, number>>
+  }>
+}
+
 // ==========================================
 // Data Source Types
 // ==========================================
@@ -78,6 +88,7 @@ export interface JobSource {
   jobName: string
   mdqaMetrics: Partial<Record<MdqaMetricKey, MetricStat>> | null
   perRunMetrics: PerRunMetrics[] | null
+  perModelMetrics: PerModelMetrics[] | null
 }
 
 export interface FileSource {
@@ -85,6 +96,7 @@ export interface FileSource {
   fileName: string
   mdqaMetrics: Partial<Record<MdqaMetricKey, MetricStat>> | null
   perRunMetrics: PerRunMetrics[] | null
+  perModelMetrics: PerModelMetrics[] | null
   ladyMetrics: Partial<Record<LadyMetricKey, MetricStat>> | null
 }
 
@@ -92,6 +104,7 @@ export interface DataEntry {
   id: string
   method: Method
   size: number
+  modelSlug?: string
   source: JobSource | FileSource
 }
 
@@ -106,6 +119,7 @@ export interface TableData {
   columnHeaders: string[]
   cells: string[][]
   columnGroups?: { label: string; span: number }[]
+  columnSubLabels?: (string | null)[]
 }
 
 // ==========================================

@@ -16,7 +16,7 @@ import {
 } from '@/components/ui/select'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Plus, X, Database, FileUp, Loader2 } from 'lucide-react'
-import type { DataEntry, Method, JobSource, FileSource, MetricStat, MdqaMetricKey, PerRunMetrics, LadyMetricKey } from './types'
+import type { DataEntry, Method, JobSource, FileSource, MetricStat, MdqaMetricKey, PerRunMetrics, PerModelMetrics, LadyMetricKey } from './types'
 import { MDQA_METRIC_KEYS } from './types'
 import { PYTHON_API_URL } from '@/lib/api-urls'
 
@@ -121,6 +121,25 @@ function EntryRow({ entry, onRemove }: { entry: DataEntry; onRemove: (id: string
   )
 }
 
+/**
+ * Compute mean ± std for each metric from an array of per-run metric records.
+ */
+function computeStatsFromRuns(
+  runs: Array<{ metrics: Partial<Record<MdqaMetricKey, number>> }>
+): Partial<Record<MdqaMetricKey, MetricStat>> {
+  const result: Partial<Record<MdqaMetricKey, MetricStat>> = {}
+  for (const key of MDQA_METRIC_KEYS) {
+    const values = runs.map(r => r.metrics[key]).filter((v): v is number => typeof v === 'number')
+    if (values.length === 0) continue
+    const mean = values.reduce((a, b) => a + b, 0) / values.length
+    const std = values.length > 1
+      ? Math.sqrt(values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (values.length - 1))
+      : undefined
+    result[key] = { mean, std }
+  }
+  return result
+}
+
 function AddEntryForm({
   onAdd,
   onCancel,
@@ -142,8 +161,12 @@ function AddEntryForm({
   const [jobSource, setJobSource] = useState<JobSource | null>(null)
   const [loadingMetrics, setLoadingMetrics] = useState(false)
 
-  // Multi-model state: when a job has perModelMetrics with >1 entries
-  const [availableModels, setAvailableModels] = useState<Array<{ model: string; modelSlug: string; metrics: Record<string, number>; perRunMetrics?: Array<{ run: number; datasetFile: string; metrics: Record<string, number> }> }>>([])
+  // Multi-target state
+  const [availableTargets, setAvailableTargets] = useState<Array<{ value: number; countMode: string }>>([])
+  const [selectedTargetValue, setSelectedTargetValue] = useState<number | null>(null)
+
+  // Multi-model state (within selected target)
+  const [availableModels, setAvailableModels] = useState<Array<{ model: string; modelSlug: string; metrics: Record<string, number> }>>([])
   const [selectedModelSlug, setSelectedModelSlug] = useState<string | null>(null)
 
   // File drop state
@@ -160,41 +183,378 @@ function AddEntryForm({
     return result
   }, [])
 
-  // Handle model selection from multi-model picker
-  const handleModelSelect = useCallback((modelSlug: string) => {
-    setSelectedModelSlug(modelSlug)
-    const modelData = availableModels.find(m => m.modelSlug === modelSlug)
-    if (!modelData) return
-
-    const job = completedJobs?.find((j: { _id: string }) => j._id === selectedJobId)
-    if (!job) return
-
-    const mdqaMetrics = extractMetricsFromFlat(modelData.metrics)
+  // Helper to build jobSource from target-level Convex data.
+  // Returns true if std data was found, false if caller should try API for richer data.
+  const buildJobSourceFromTarget = useCallback((
+    job: { _id: string; name: string },
+    targetData: Record<string, unknown>,
+    modelSlug?: string,
+  ): boolean => {
+    let mdqaMetrics: Partial<Record<MdqaMetricKey, MetricStat>> = {}
     let perRunMetrics: PerRunMetrics[] | null = null
-    if (modelData.perRunMetrics && modelData.perRunMetrics.length > 0) {
-      perRunMetrics = modelData.perRunMetrics.map(r => ({
-        run: r.run,
-        metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
-      }))
+    let suffix = ''
+    let hasStd = true
+
+    if (modelSlug) {
+      // Extract metrics for a specific model within the target
+      const pmm = targetData.perModelMetrics as Array<{ model: string; modelSlug: string; metrics?: Record<string, number>; perRunMetrics?: Array<{ run: number; metrics: Record<string, number> }> }> | undefined
+      const modelData = pmm?.find(m => m.modelSlug === modelSlug)
+      if (modelData) {
+        // Prefer computing from per-run data (includes std)
+        if (modelData.perRunMetrics && modelData.perRunMetrics.length > 1) {
+          mdqaMetrics = computeStatsFromRuns(modelData.perRunMetrics.map(r => ({
+            metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+          })))
+        } else if (modelData.metrics) {
+          mdqaMetrics = extractMetricsFromFlat(modelData.metrics)
+        }
+      }
+      suffix = ` [${modelSlug}]`
+      // Per-target per-model in Convex may lack per-run data; signal caller to try API
+      hasStd = Object.values(mdqaMetrics).some(s => s.std !== undefined)
+    } else {
+      // Use target-level averageMetrics (with std) or flat metrics
+      const avgMetrics = targetData.averageMetrics as Record<string, { mean: number; std?: number }> | undefined
+      if (avgMetrics) {
+        for (const key of MDQA_METRIC_KEYS) {
+          const val = avgMetrics[key]
+          if (val && typeof val === 'object' && 'mean' in val) {
+            mdqaMetrics[key] = { mean: val.mean, std: val.std ?? undefined }
+          }
+        }
+      }
+      // Fallback to flat target.metrics
+      if (Object.keys(mdqaMetrics).length === 0) {
+        const flatMetrics = targetData.metrics as Record<string, number> | undefined
+        if (flatMetrics) {
+          mdqaMetrics = extractMetricsFromFlat(flatMetrics)
+        }
+      }
+      // Extract per-run metrics
+      const prm = targetData.perRunMetrics as Array<{ run: number; datasetFile: string; metrics: Record<string, number> }> | undefined
+      if (prm && prm.length > 0) {
+        perRunMetrics = prm.map(r => ({
+          run: r.run,
+          metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+        }))
+      }
     }
 
     setJobSource({
       type: 'job',
       jobId: job._id,
-      jobName: `${job.name} [${modelSlug}]`,
+      jobName: `${job.name}${suffix}`,
       mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
       perRunMetrics,
+      perModelMetrics: null,
     })
-  }, [availableModels, completedJobs, selectedJobId, extractMetricsFromFlat])
+    return hasStd
+  }, [extractMetricsFromFlat])
+
+  // Helper to load metrics from Python API fallback
+  const loadMetricsFromApi = useCallback(async (
+    job: { _id: string; name: string; jobDir?: string },
+    targetSize?: number,
+    modelSlug?: string,
+  ) => {
+    const jobDirName = job.jobDir
+    if (!jobDirName) return
+
+    setLoadingMetrics(true)
+    try {
+      const body: Record<string, unknown> = { jobDir: jobDirName }
+      if (targetSize) body.targetSize = targetSize
+      const res = await fetch(`${PYTHON_API_URL}/api/read-metrics`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) return
+
+      const apiData = await res.json()
+      const metrics = apiData.metrics
+      if (!metrics) return
+
+      // Check for per-model data from API
+      if (metrics.perModel && Array.isArray(metrics.perModel) && metrics.perModel.length > 1 && !modelSlug) {
+        setAvailableModels(metrics.perModel.map((pm: Record<string, unknown>) => ({
+          model: pm.model as string,
+          modelSlug: pm.modelSlug as string,
+          metrics: (pm.metrics || {}) as Record<string, number>,
+        })))
+        return // Wait for model selection
+      }
+
+      const mdqaMetrics: Partial<Record<MdqaMetricKey, MetricStat>> = {}
+      let perRunMetrics: PerRunMetrics[] | null = null
+
+      // If model selected, extract that model's metrics from API perModel
+      if (modelSlug && metrics.perModel && Array.isArray(metrics.perModel)) {
+        const modelData = metrics.perModel.find((pm: Record<string, unknown>) => pm.modelSlug === modelSlug)
+        if (modelData) {
+          // Prefer computing from per-run data (includes std)
+          const runs = modelData.runs as Array<{ run: number; metrics: Record<string, number> }> | undefined
+          if (runs && runs.length > 1) {
+            const stats = computeStatsFromRuns(runs.map(r => ({
+              metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+            })))
+            Object.assign(mdqaMetrics, stats)
+            perRunMetrics = runs.map(r => ({
+              run: r.run,
+              metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+            }))
+          } else if (modelData.metrics) {
+            for (const key of MDQA_METRIC_KEYS) {
+              if (typeof (modelData.metrics as Record<string, number>)[key] === 'number') {
+                mdqaMetrics[key] = { mean: (modelData.metrics as Record<string, number>)[key] }
+              }
+            }
+            if (runs && runs.length === 1) {
+              perRunMetrics = runs.map(r => ({
+                run: r.run,
+                metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+              }))
+            }
+          }
+        }
+      } else {
+        // Parse aggregate metrics from API response categories
+        for (const category of ['lexical', 'semantic', 'diversity']) {
+          const catMetrics = metrics[category]
+          if (Array.isArray(catMetrics)) {
+            for (const item of catMetrics) {
+              const key = item.metric as MdqaMetricKey
+              if (MDQA_METRIC_KEYS.includes(key)) {
+                mdqaMetrics[key] = { mean: item.score }
+              }
+            }
+          }
+        }
+        // Extract std from API response
+        if (metrics.std) {
+          for (const category of ['lexical', 'semantic', 'diversity']) {
+            const catStd = metrics.std[category]
+            if (Array.isArray(catStd)) {
+              for (const item of catStd) {
+                const key = item.metric as MdqaMetricKey
+                if (mdqaMetrics[key]) {
+                  mdqaMetrics[key] = { ...mdqaMetrics[key]!, std: item.score }
+                }
+              }
+            }
+          }
+        }
+        // Extract per-run metrics from API response
+        if (metrics.perRun) {
+          const runMap = new Map<number, Partial<Record<MdqaMetricKey, number>>>()
+          for (const category of ['lexical', 'semantic', 'diversity']) {
+            const catRuns = metrics.perRun[category]
+            if (catRuns && typeof catRuns === 'object') {
+              for (const [runKey, runMetrics] of Object.entries(catRuns)) {
+                const runNum = parseInt(runKey.replace('run', ''))
+                if (!runMap.has(runNum)) runMap.set(runNum, {})
+                const existing = runMap.get(runNum)!
+                for (const item of runMetrics as { metric: string; score: number }[]) {
+                  const key = item.metric as MdqaMetricKey
+                  if (MDQA_METRIC_KEYS.includes(key)) {
+                    existing[key] = item.score
+                  }
+                }
+              }
+            }
+          }
+          if (runMap.size > 0) {
+            perRunMetrics = Array.from(runMap.entries())
+              .sort(([a], [b]) => a - b)
+              .map(([run, m]) => ({ run, metrics: m }))
+          }
+        }
+      }
+
+      const suffix = modelSlug ? ` [${modelSlug}]` : ''
+      setJobSource({
+        type: 'job',
+        jobId: job._id,
+        jobName: `${job.name}${suffix}`,
+        mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
+        perRunMetrics,
+        perModelMetrics: null,
+      })
+    } catch {
+      // API not available
+    } finally {
+      setLoadingMetrics(false)
+    }
+  }, [])
+
+  // Auto-detect method from job dir name or job fields
+  const autoDetectMethodAndSize = useCallback((job: { method: string; generationCount: number; jobDir?: string }) => {
+    const jobDirName = job.jobDir
+    if (jobDirName) {
+      const parts = jobDirName.replace(/\/$/, '').split('/').pop()?.split('-') || []
+      if (parts.length >= 2) {
+        const methodStr = parts[parts.length - 2]
+        if (methodStr === 'cera' || methodStr === 'heuristic' || methodStr === 'real') {
+          setMethod(methodStr as Method)
+        }
+        // Don't auto-set size from dir name here — targets will set it
+      }
+    }
+    if (job.method === 'cera' || job.method === 'heuristic') {
+      setMethod(job.method as Method)
+    }
+  }, [])
+
+  // Handle model selection within a target
+  const handleModelSelect = useCallback((modelSlug: string) => {
+    setSelectedModelSlug(modelSlug)
+    const job = completedJobs?.find((j: { _id: string }) => j._id === selectedJobId)
+    if (!job) return
+
+    // Try Convex per-target data first
+    const ptm = (job as any).perTargetMetrics as Array<Record<string, unknown>> | undefined
+    if (ptm && selectedTargetValue !== null) {
+      const targetData = ptm.find((t: Record<string, unknown>) => t.targetValue === selectedTargetValue)
+      if (targetData) {
+        const hasStd = buildJobSourceFromTarget(job, targetData, modelSlug)
+        if (hasStd) return
+        // Per-target per-model Convex data lacks per-run detail — fall through to API for std
+      }
+    }
+
+    // Try job-level perModelMetrics (has perRunMetrics for std)
+    const pmm = (job as any).perModelMetrics as Array<{ model: string; modelSlug: string; metrics: Record<string, number>; perRunMetrics?: Array<{ run: number; datasetFile: string; metrics: Record<string, number> }> }> | undefined
+    const modelData = pmm?.find(m => m.modelSlug === modelSlug)
+    if (modelData) {
+      let mdqaMetrics: Partial<Record<MdqaMetricKey, MetricStat>>
+      let perRunMetrics: PerRunMetrics[] | null = null
+      // Compute std from per-run data when available
+      if (modelData.perRunMetrics && modelData.perRunMetrics.length > 1) {
+        mdqaMetrics = computeStatsFromRuns(modelData.perRunMetrics.map(r => ({
+          metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+        })))
+        perRunMetrics = modelData.perRunMetrics.map(r => ({
+          run: r.run,
+          metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+        }))
+      } else {
+        mdqaMetrics = extractMetricsFromFlat(modelData.metrics)
+        if (modelData.perRunMetrics && modelData.perRunMetrics.length > 0) {
+          perRunMetrics = modelData.perRunMetrics.map(r => ({
+            run: r.run,
+            metrics: r.metrics as Partial<Record<MdqaMetricKey, number>>,
+          }))
+        }
+      }
+      setJobSource({
+        type: 'job',
+        jobId: job._id,
+        jobName: `${job.name} [${modelSlug}]`,
+        mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
+        perRunMetrics,
+        perModelMetrics: null,
+      })
+      return
+    }
+
+    // Fallback to API (reads full mdqa-results.json with per-model runs)
+    loadMetricsFromApi(job as any, selectedTargetValue ?? undefined, modelSlug)
+  }, [availableModels, completedJobs, selectedJobId, selectedTargetValue, extractMetricsFromFlat, buildJobSourceFromTarget, loadMetricsFromApi])
+
+  // Handle target size selection
+  const handleTargetSelect = useCallback((targetValue: number) => {
+    setSelectedTargetValue(targetValue)
+    setSelectedModelSlug(null)
+    setAvailableModels([])
+    setJobSource(null)
+    setSize(targetValue)
+
+    const job = completedJobs?.find((j: { _id: string }) => j._id === selectedJobId)
+    if (!job) return
+
+    // Look for this target in perTargetMetrics from Convex
+    const ptm = (job as any).perTargetMetrics as Array<Record<string, unknown>> | undefined
+    const targetData = ptm?.find((t: Record<string, unknown>) => t.targetValue === targetValue)
+
+    if (targetData) {
+      // Check for per-model metrics within this target
+      const pmm = targetData.perModelMetrics as Array<{ model: string; modelSlug: string; metrics?: Record<string, number> }> | undefined
+      if (pmm && pmm.length > 1) {
+        setAvailableModels(pmm.map(m => ({
+          model: m.model,
+          modelSlug: m.modelSlug,
+          metrics: (m.metrics || {}) as Record<string, number>,
+        })))
+        return // Wait for model selection
+      }
+      // Single or no models — extract metrics directly
+      buildJobSourceFromTarget(job, targetData)
+    } else {
+      // No per-target Convex data — fall back to API
+      loadMetricsFromApi(job as any, targetValue)
+    }
+  }, [completedJobs, selectedJobId, buildJobSourceFromTarget, loadMetricsFromApi])
 
   const handleJobSelect = useCallback(async (jobId: string) => {
     setSelectedJobId(jobId)
+    setSelectedTargetValue(null)
     setSelectedModelSlug(null)
+    setAvailableTargets([])
     setAvailableModels([])
+    setJobSource(null)
+
     const job = completedJobs?.find((j: { _id: string }) => j._id === jobId)
     if (!job) return
 
-    // Check for multi-model job
+    autoDetectMethodAndSize(job as any)
+
+    // Check for multi-target job
+    const targets = (job as any).targets as Array<{ value: number; countMode: string }> | null
+    const ptm = (job as any).perTargetMetrics as Array<Record<string, unknown>> | undefined
+
+    // Build target list from config targets or perTargetMetrics
+    let targetList: Array<{ value: number; countMode: string }> = []
+    if (targets && targets.length > 0) {
+      targetList = targets
+    } else if (ptm && ptm.length > 0) {
+      targetList = ptm.map(t => ({
+        value: t.targetValue as number,
+        countMode: (t.countMode as string) || 'sentences',
+      }))
+    }
+
+    if (targetList.length > 1) {
+      // Multi-target: show target picker
+      setAvailableTargets(targetList.sort((a, b) => a.value - b.value))
+      return
+    }
+
+    if (targetList.length === 1) {
+      // Single target: auto-select it
+      setAvailableTargets(targetList)
+      setSelectedTargetValue(targetList[0].value)
+      setSize(targetList[0].value)
+
+      // Try loading from perTargetMetrics
+      const targetData = ptm?.find((t: Record<string, unknown>) => t.targetValue === targetList[0].value)
+      if (targetData) {
+        const pmm = targetData.perModelMetrics as Array<{ model: string; modelSlug: string; metrics?: Record<string, number> }> | undefined
+        if (pmm && pmm.length > 1) {
+          setAvailableModels(pmm.map(m => ({
+            model: m.model,
+            modelSlug: m.modelSlug,
+            metrics: (m.metrics || {}) as Record<string, number>,
+          })))
+          return
+        }
+        buildJobSourceFromTarget(job, targetData)
+        return
+      }
+      // Fall through to legacy/API path
+    }
+
+    // Legacy path: no targets (old single-target jobs)
+    // Check for job-level multi-model
     const pmm = (job as any).perModelMetrics as Array<{
       model: string; modelSlug: string;
       metrics: Record<string, number>;
@@ -202,47 +562,24 @@ function AddEntryForm({
     }> | undefined
     if (pmm && pmm.length > 1) {
       setAvailableModels(pmm)
-      // Don't auto-set jobSource — wait for model selection
-      // Auto-detect method/size
-      if (job.method === 'cera' || job.method === 'heuristic') {
-        setMethod(job.method as Method)
-      }
-      if (job.generationCount > 0) {
-        setSize(job.generationCount)
-      }
+      if (job.generationCount > 0) setSize(job.generationCount)
       return
     }
 
-    // Auto-detect method and size from jobDir folder name (e.g. "j973...-rq1-cera-1000")
+    // Auto-detect size from dir name or generation count
     const jobDirName = (job as { jobDir?: string }).jobDir
     if (jobDirName) {
       const parts = jobDirName.replace(/\/$/, '').split('/').pop()?.split('-') || []
-      if (parts.length >= 2) {
-        const sizeStr = parts[parts.length - 1]
-        const methodStr = parts[parts.length - 2]
-        const parsedSize = parseInt(sizeStr)
-        if (!isNaN(parsedSize) && parsedSize > 0) {
-          setSize(parsedSize)
-        }
-        if (methodStr === 'cera' || methodStr === 'heuristic' || methodStr === 'real') {
-          setMethod(methodStr as Method)
-        }
-      }
-    } else {
-      // Fallback: auto-detect method from job field
-      if (job.method === 'cera' || job.method === 'heuristic') {
-        setMethod(job.method as Method)
-      }
-      // Fallback: auto-detect size from generation count
-      if (job.generationCount > 0) {
-        setSize(job.generationCount)
-      }
+      const sizeStr = parts[parts.length - 1]
+      const parsedSize = parseInt(sizeStr)
+      if (!isNaN(parsedSize) && parsedSize > 0) setSize(parsedSize)
+    } else if (job.generationCount > 0) {
+      setSize(job.generationCount)
     }
 
-    // Extract metrics from Convex data
+    // Extract metrics from Convex job-level data
     const mdqaMetrics: Partial<Record<MdqaMetricKey, MetricStat>> = {}
 
-    // Try averageMetrics first (multi-run format with mean/std)
     if (job.averageMetrics) {
       for (const key of MDQA_METRIC_KEYS) {
         const val = job.averageMetrics[key]
@@ -252,7 +589,6 @@ function AddEntryForm({
       }
     }
 
-    // Fallback to evaluationMetrics (flat format with key/key_std)
     if (Object.keys(mdqaMetrics).length === 0) {
       const evalMetrics = (job as { evaluationMetrics?: Record<string, number | undefined> }).evaluationMetrics
       if (evalMetrics) {
@@ -269,7 +605,6 @@ function AddEntryForm({
       }
     }
 
-    // Extract per-run metrics from Convex
     let perRunMetrics: PerRunMetrics[] | null = null
     if (job.perRunMetrics && Array.isArray(job.perRunMetrics)) {
       perRunMetrics = job.perRunMetrics.map((run: { run: number; metrics: Record<string, number | undefined> }) => ({
@@ -278,77 +613,10 @@ function AddEntryForm({
       }))
     }
 
-    // If no metrics found in Convex, try reading from filesystem via Python API
+    // If no metrics in Convex, try API
     if (Object.keys(mdqaMetrics).length === 0 && jobDirName) {
-      setLoadingMetrics(true)
-      try {
-        const res = await fetch(`${PYTHON_API_URL}/api/read-metrics`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jobDir: jobDirName }),
-        })
-        if (res.ok) {
-          const apiData = await res.json()
-          const metrics = apiData.metrics
-          if (metrics) {
-            // Parse flat metrics from API response categories
-            for (const category of ['lexical', 'semantic', 'diversity']) {
-              const catMetrics = metrics[category]
-              if (Array.isArray(catMetrics)) {
-                for (const item of catMetrics) {
-                  const key = item.metric as MdqaMetricKey
-                  if (MDQA_METRIC_KEYS.includes(key)) {
-                    mdqaMetrics[key] = { mean: item.score }
-                  }
-                }
-              }
-            }
-            // Extract std from API response
-            if (metrics.std) {
-              for (const category of ['lexical', 'semantic', 'diversity']) {
-                const catStd = metrics.std[category]
-                if (Array.isArray(catStd)) {
-                  for (const item of catStd) {
-                    const key = item.metric as MdqaMetricKey
-                    if (mdqaMetrics[key]) {
-                      mdqaMetrics[key] = { ...mdqaMetrics[key]!, std: item.score }
-                    }
-                  }
-                }
-              }
-            }
-            // Extract per-run metrics from API response
-            if (metrics.perRun && !perRunMetrics) {
-              const runMap = new Map<number, Partial<Record<MdqaMetricKey, number>>>()
-              for (const category of ['lexical', 'semantic', 'diversity']) {
-                const catRuns = metrics.perRun[category]
-                if (catRuns && typeof catRuns === 'object') {
-                  for (const [runKey, runMetrics] of Object.entries(catRuns)) {
-                    const runNum = parseInt(runKey.replace('run', ''))
-                    if (!runMap.has(runNum)) runMap.set(runNum, {})
-                    const existing = runMap.get(runNum)!
-                    for (const item of runMetrics as { metric: string; score: number }[]) {
-                      const key = item.metric as MdqaMetricKey
-                      if (MDQA_METRIC_KEYS.includes(key)) {
-                        existing[key] = item.score
-                      }
-                    }
-                  }
-                }
-              }
-              if (runMap.size > 0) {
-                perRunMetrics = Array.from(runMap.entries())
-                  .sort(([a], [b]) => a - b)
-                  .map(([run, metrics]) => ({ run, metrics }))
-              }
-            }
-          }
-        }
-      } catch {
-        // API not available, metrics remain empty
-      } finally {
-        setLoadingMetrics(false)
-      }
+      await loadMetricsFromApi(job as any, targetList.length === 1 ? targetList[0].value : undefined)
+      return
     }
 
     setJobSource({
@@ -357,8 +625,9 @@ function AddEntryForm({
       jobName: job.name,
       mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
       perRunMetrics,
+      perModelMetrics: null,
     })
-  }, [completedJobs, extractMetricsFromFlat])
+  }, [completedJobs, autoDetectMethodAndSize, buildJobSourceFromTarget, loadMetricsFromApi])
 
   const handleFileDrop = useCallback((file: File) => {
     const reader = new FileReader()
@@ -370,6 +639,7 @@ function AddEntryForm({
         fileName: file.name,
         mdqaMetrics: parsed.mdqa,
         perRunMetrics: parsed.perRunMetrics,
+        perModelMetrics: parsed.perModelMetrics,
         ladyMetrics: parsed.lady,
       })
     }
@@ -380,17 +650,31 @@ function AddEntryForm({
     const source = sourceType === 'job' ? jobSource : fileSource
     if (!source) return
 
+    // Determine model slug: explicit selection > single-model job config fallback
+    let resolvedModelSlug = selectedModelSlug || undefined
+    if (!resolvedModelSlug && sourceType === 'job' && selectedJobId) {
+      const job = completedJobs?.find((j: { _id: string }) => j._id === selectedJobId)
+      const slugs = (job as any)?.modelSlugs as string[] | undefined
+      if (slugs && slugs.length === 1) {
+        resolvedModelSlug = slugs[0]
+      }
+    }
+
     onAdd({
       id: crypto.randomUUID(),
       method,
       size,
+      modelSlug: resolvedModelSlug,
       source,
     })
   }
 
   const canAdd = sourceType === 'job'
-    ? jobSource !== null && (availableModels.length <= 1 || selectedModelSlug !== null)
+    ? jobSource !== null
     : fileSource !== null
+
+  const needsTargetSelection = availableTargets.length > 1 && selectedTargetValue === null
+  const needsModelSelection = availableModels.length > 1 && selectedModelSlug === null
 
   return (
     <div className="border rounded-lg p-4 space-y-4 bg-background">
@@ -405,7 +689,16 @@ function AddEntryForm({
       <div className="grid grid-cols-2 gap-4">
         <div className="space-y-1.5">
           <Label className="text-xs">Method</Label>
-          <Select value={method} onValueChange={(v) => setMethod(v as Method)}>
+          <Select value={method} onValueChange={(v) => {
+            setMethod(v as Method)
+            // Reset job selection when method changes (filtered list changes)
+            setSelectedJobId(null)
+            setJobSource(null)
+            setAvailableTargets([])
+            setAvailableModels([])
+            setSelectedTargetValue(null)
+            setSelectedModelSlug(null)
+          }}>
             <SelectTrigger>
               <SelectValue />
             </SelectTrigger>
@@ -440,7 +733,7 @@ function AddEntryForm({
           </TabsTrigger>
         </TabsList>
 
-        <TabsContent value="job" className="mt-3">
+        <TabsContent value="job" className="mt-3 space-y-2">
           <Select
             value={selectedJobId || ''}
             onValueChange={handleJobSelect}
@@ -449,7 +742,11 @@ function AddEntryForm({
               <SelectValue placeholder="Select a completed job..." />
             </SelectTrigger>
             <SelectContent className="max-h-60">
-              {completedJobs?.map((job: { _id: string; name: string; method: string; generationCount: number; totalRuns: number }) => (
+              {completedJobs?.filter((job: { method: string }) => {
+                // Filter jobs by selected method (real matches any since real datasets aren't generated)
+                if (method === 'real') return true
+                return (job.method || 'cera') === method
+              }).map((job: { _id: string; name: string; method: string; generationCount: number; totalRuns: number; targets?: Array<{ value: number }> | null }) => (
                 <SelectItem key={job._id} value={job._id}>
                   <span className="flex items-center gap-2">
                     <Badge variant="outline" className="text-[10px] px-1">
@@ -457,21 +754,49 @@ function AddEntryForm({
                     </Badge>
                     {job.name}
                     <span className="text-muted-foreground ml-1">
-                      (n={job.generationCount}, {job.totalRuns} run{job.totalRuns > 1 ? 's' : ''})
+                      {job.targets && job.targets.length > 0
+                        ? `(${job.targets.map(t => t.value).join(', ')} sents, ${job.totalRuns} run${job.totalRuns > 1 ? 's' : ''})`
+                        : `(n=${job.generationCount}, ${job.totalRuns} run${job.totalRuns > 1 ? 's' : ''})`
+                      }
                     </span>
                   </span>
                 </SelectItem>
               ))}
-              {(!completedJobs || completedJobs.length === 0) && (
+              {(!completedJobs || completedJobs.filter((j: { method: string }) => method === 'real' ? true : (j.method || 'cera') === method).length === 0) && (
                 <div className="px-2 py-4 text-sm text-muted-foreground text-center">
-                  No completed jobs with metrics found
+                  {method === 'real'
+                    ? 'No completed jobs found'
+                    : `No completed ${method.toUpperCase()} jobs found`}
                 </div>
               )}
             </SelectContent>
           </Select>
-          {/* Multi-model picker */}
+
+          {/* Target size picker */}
+          {selectedJobId && availableTargets.length > 1 && (
+            <div>
+              <Label className="text-xs text-muted-foreground">Select target size</Label>
+              <Select
+                value={selectedTargetValue !== null ? String(selectedTargetValue) : ''}
+                onValueChange={(v) => handleTargetSelect(parseInt(v))}
+              >
+                <SelectTrigger className="mt-1">
+                  <SelectValue placeholder="Select a target size..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {availableTargets.map(t => (
+                    <SelectItem key={t.value} value={String(t.value)}>
+                      {t.value} {t.countMode}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          {/* Model picker */}
           {availableModels.length > 1 && (
-            <div className="mt-2">
+            <div>
               <Label className="text-xs text-muted-foreground">Select model (multi-model job)</Label>
               <Select
                 value={selectedModelSlug || ''}
@@ -484,29 +809,32 @@ function AddEntryForm({
                   {availableModels.map(m => (
                     <SelectItem key={m.modelSlug} value={m.modelSlug}>
                       {m.modelSlug}
-                      {m.perRunMetrics && m.perRunMetrics.length > 1 && (
-                        <span className="text-muted-foreground ml-1">({m.perRunMetrics.length} runs)</span>
-                      )}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
           )}
+
           {loadingMetrics && (
-            <p className="text-xs text-muted-foreground mt-2 flex items-center gap-1.5">
+            <p className="text-xs text-muted-foreground flex items-center gap-1.5">
               <Loader2 className="h-3 w-3 animate-spin" />
               Loading metrics from job directory...
             </p>
           )}
           {jobSource && !loadingMetrics && (
-            <p className="text-xs text-muted-foreground mt-2">
+            <p className="text-xs text-muted-foreground">
               {jobSource.mdqaMetrics ? 'MDQA metrics loaded' : 'No MDQA metrics'}
               {jobSource.perRunMetrics ? ` | ${jobSource.perRunMetrics.length} runs` : ''}
             </p>
           )}
-          {availableModels.length > 1 && !selectedModelSlug && (
-            <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+          {needsTargetSelection && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              Please select a target size to continue.
+            </p>
+          )}
+          {!needsTargetSelection && needsModelSelection && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
               Please select a model to load its metrics.
             </p>
           )}
@@ -549,6 +877,7 @@ function AddEntryForm({
 function parseMetricsFile(content: string, metricType: 'mdqa' | 'lady' | 'both'): {
   mdqa: Partial<Record<MdqaMetricKey, MetricStat>> | null
   perRunMetrics: PerRunMetrics[] | null
+  perModelMetrics: PerModelMetrics[] | null
   lady: Partial<Record<LadyMetricKey, MetricStat>> | null
 } {
   try {
@@ -556,8 +885,9 @@ function parseMetricsFile(content: string, metricType: 'mdqa' | 'lady' | 'both')
     const result: {
       mdqa: Partial<Record<MdqaMetricKey, MetricStat>> | null
       perRunMetrics: PerRunMetrics[] | null
+      perModelMetrics: PerModelMetrics[] | null
       lady: Partial<Record<LadyMetricKey, MetricStat>> | null
-    } = { mdqa: null, perRunMetrics: null, lady: null }
+    } = { mdqa: null, perRunMetrics: null, perModelMetrics: null, lady: null }
 
     // Try parsing as MDQA results
     if (metricType === 'mdqa' || metricType === 'both') {
@@ -601,6 +931,21 @@ function parseMetricsFile(content: string, metricType: 'mdqa' | 'lady' | 'both')
               }
             }
           }
+        }
+
+        // Parse per-model data
+        if (data.perModel && Array.isArray(data.perModel) && data.perModel.length > 1) {
+          result.perModelMetrics = data.perModel.map((pm: Record<string, unknown>) => ({
+            model: pm.model as string,
+            modelSlug: pm.modelSlug as string,
+            metrics: (pm.metrics || {}) as Partial<Record<MdqaMetricKey, number>>,
+            runs: Array.isArray(pm.runs)
+              ? (pm.runs as Array<Record<string, unknown>>).map(r => ({
+                  run: r.run as number,
+                  metrics: (r.metrics || {}) as Partial<Record<MdqaMetricKey, number>>,
+                }))
+              : [],
+          }))
         }
       }
       // Single-run format: { lexical: {...}, semantic: {...}, diversity: {...}, _flat: {...} }
@@ -672,6 +1017,6 @@ function parseMetricsFile(content: string, metricType: 'mdqa' | 'lady' | 'both')
 
     return result
   } catch {
-    return { mdqa: null, perRunMetrics: null, lady: null }
+    return { mdqa: null, perRunMetrics: null, perModelMetrics: null, lady: null }
   }
 }

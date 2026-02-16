@@ -83,7 +83,12 @@ export function ResearchTable({ data, title, description, filename }: ResearchTa
                 <TableHead className="border-r font-semibold min-w-[120px]">Metric</TableHead>
                 {displayData.columnHeaders.map((header, i) => (
                   <TableHead key={i} className="text-center min-w-[120px]">
-                    {header}
+                    <div>{header}</div>
+                    {displayData.columnSubLabels?.[i] && (
+                      <div className="text-[10px] text-muted-foreground font-normal leading-tight mt-0.5">
+                        {displayData.columnSubLabels[i]}
+                      </div>
+                    )}
                   </TableHead>
                 ))}
               </TableRow>

@@ -22,8 +22,15 @@ export function tableDataToCsv(data: TableData): string {
     rows.push(groupRow)
   }
 
-  // Add column header row
-  rows.push(['', ...data.columnHeaders])
+  // Add column header row (merge sub-labels into headers for CSV)
+  if (data.columnSubLabels?.some(l => l !== null)) {
+    rows.push(['', ...data.columnHeaders.map((h, i) => {
+      const sub = data.columnSubLabels?.[i]
+      return sub ? `${h} (${sub})` : h
+    })])
+  } else {
+    rows.push(['', ...data.columnHeaders])
+  }
 
   // Add data rows
   for (let i = 0; i < data.rowHeaders.length; i++) {
@@ -65,20 +72,26 @@ export function downloadCsv(data: TableData, filename: string): void {
  * Transpose a TableData structure (swap rows and columns).
  */
 export function transposeTableData(data: TableData): TableData {
+  // Merge sub-labels into headers for transposed row labels
+  const effectiveHeaders = data.columnHeaders.map((h, i) => {
+    const sub = data.columnSubLabels?.[i]
+    return sub ? `${h} (${sub})` : h
+  })
+
   if (data.cells.length === 0 || data.cells[0].length === 0) {
     return {
-      rowHeaders: data.columnHeaders,
+      rowHeaders: effectiveHeaders,
       columnHeaders: data.rowHeaders,
       cells: [],
     }
   }
 
   return {
-    rowHeaders: data.columnHeaders,
+    rowHeaders: effectiveHeaders,
     columnHeaders: data.rowHeaders,
     cells: data.cells[0].map((_, colIdx) =>
       data.cells.map(row => row[colIdx])
     ),
-    // Column groups don't apply when transposed
+    // Column groups and sub-labels don't apply when transposed
   }
 }
