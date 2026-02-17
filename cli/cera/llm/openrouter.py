@@ -103,7 +103,8 @@ class OpenRouterClient:
     }
 
     def __init__(self, api_key: str, site_url: str = "", site_name: str = "CERA", usage_tracker=None,
-                 component: str = "", target: str = "", run: str = ""):
+                 component: str = "", target: str = "", run: str = "",
+                 base_url: str | None = None):
         self.api_key = api_key
         self.site_url = site_url
         self.site_name = site_name
@@ -112,10 +113,14 @@ class OpenRouterClient:
         self._component = component
         self._target = target
         self._run = run
+        self._base_url = base_url or self.BASE_URL
+        self._is_local = base_url is not None
         self.client = httpx.AsyncClient()
 
     def _get_model_id(self, model: str) -> str:
         """Get full model ID from short name or return as-is."""
+        if self._is_local:
+            return model  # Local vLLM models use their ID directly
         return self.MODELS.get(model, model)
 
     @retry(
@@ -164,14 +169,17 @@ class OpenRouterClient:
         if reasoning:
             body["reasoning"] = reasoning
 
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if not self._is_local:
+            headers["HTTP-Referer"] = self.site_url
+            headers["X-Title"] = self.site_name
+
         response = await self.client.post(
-            f"{self.BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "HTTP-Referer": self.site_url,
-                "X-Title": self.site_name,
-                "Content-Type": "application/json",
-            },
+            f"{self._base_url}/chat/completions",
+            headers=headers,
             json=body,
             timeout=180.0,
         )
@@ -237,14 +245,17 @@ class OpenRouterClient:
         """
         model_id = self._get_model_id(model)
 
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if not self._is_local:
+            headers["HTTP-Referer"] = self.site_url
+            headers["X-Title"] = self.site_name
+
         response = await self.client.post(
-            f"{self.BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "HTTP-Referer": self.site_url,
-                "X-Title": self.site_name,
-                "Content-Type": "application/json",
-            },
+            f"{self._base_url}/chat/completions",
+            headers=headers,
             json={
                 "model": model_id,
                 "messages": messages,

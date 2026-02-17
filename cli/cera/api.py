@@ -468,6 +468,34 @@ def save_job_config(
     return str(config_path)
 
 
+def _parse_local_model(model_id: str) -> tuple[bool, str]:
+    """Parse a model ID and detect if it's a local vLLM model.
+
+    Local models are prefixed with 'local/' (e.g., 'local/Qwen/Qwen3-30B-A3B').
+    Returns (is_local, actual_model_id) with the prefix stripped for local models.
+    """
+    if model_id.startswith("local/"):
+        return True, model_id[len("local/"):]
+    return False, model_id
+
+
+async def _get_local_llm_settings(convex) -> tuple[str, str]:
+    """Fetch local LLM endpoint and API key from Convex settings.
+
+    Returns (endpoint, api_key). Raises ValueError if not configured.
+    """
+    settings = await convex.run_query("settings:get")
+    endpoint = settings.get("localLlmEndpoint", "")
+    api_key = settings.get("localLlmApiKey", "")
+    if not endpoint:
+        raise ValueError("Local LLM endpoint not configured in Settings. Go to Settings > Local LLM Server.")
+    # Ensure endpoint ends with /v1
+    endpoint = endpoint.rstrip("/")
+    if not endpoint.endswith("/v1"):
+        endpoint += "/v1"
+    return endpoint, api_key
+
+
 async def check_openrouter_tier(api_key: str) -> dict:
     """
     Check OpenRouter account tier to determine rate limiting.
@@ -3995,12 +4023,16 @@ async def execute_generation(
             additional_context=reviewers_context.get("additional_context"),
         )
 
-        # OpenRouter client for LLM calls
+        # LLM client for generation calls
         _target_label = str(config.generation.count)
-        llm = OpenRouterClient(
-            api_key=api_key, usage_tracker=usage_tracker, component="aml",
+        _llm_kwargs = dict(
+            usage_tracker=usage_tracker, component="aml",
             target=_target_label, run=f"run{current_run}" if total_runs > 1 else "",
         )
+        if is_local_model:
+            llm = OpenRouterClient(api_key=local_api_key, base_url=local_endpoint, **_llm_kwargs)
+        else:
+            llm = OpenRouterClient(api_key=api_key, **_llm_kwargs)
 
         # Generation settings (count_mode, length_range, avg_sentences_per_review,
         # target_sentences, estimated_reviews, total_reviews already computed above)
@@ -4035,7 +4067,14 @@ async def execute_generation(
             # Add provider prefix
             model = f"{provider}/{model_name}"
 
-        print(f"[Generation] Using model: {model} (provider={provider}, model_name={model_name})")
+        # Detect local vLLM model (prefixed with "local/")
+        is_local_model, actual_model = _parse_local_model(model)
+        if is_local_model:
+            local_endpoint, local_api_key = await _get_local_llm_settings(convex)
+            print(f"[Generation] Using LOCAL vLLM model: {actual_model} at {local_endpoint}")
+            model = actual_model  # Strip local/ prefix for vLLM API
+        else:
+            print(f"[Generation] Using model: {model} (provider={provider}, model_name={model_name})")
 
         # Polarity distribution (length_range already set above for sentence count calculation)
         polarity_dist = attributes_context["polarity"]
@@ -4109,28 +4148,35 @@ Output ONLY the JSON object, no other text."""
         last_error_msg = ""
         last_progress_update = 0
 
-        # Check if using a free model (ends with :free) - these ALWAYS have rate limits
-        is_free_model = model.endswith(":free")
-
-        # Check OpenRouter account tier
-        tier_info = await check_openrouter_tier(api_key)
-        is_free_account = tier_info["is_free_tier"]
-
-        # Rate limiting: Apply for free models OR free accounts
-        # Free models have rate limits regardless of account tier
-        needs_rate_limiting = is_free_model or is_free_account
-
-        if needs_rate_limiting:
-            REQUEST_DELAY = 3.5  # seconds between requests (~17 req/min, under 20 req/min limit)
-            reason = "free model" if is_free_model else "free tier account"
-            print(f"[Generation] Rate limiting enabled ({reason}): {REQUEST_DELAY}s between requests")
+        # Rate limiting — local vLLM models skip OpenRouter tier checks entirely
+        if is_local_model:
+            REQUEST_DELAY = 0.05  # Minimal delay for local inference
+            print(f"[Generation] Local vLLM model - no rate limiting: {REQUEST_DELAY}s between requests")
             if convex:
-                await convex.add_log(job_id, "INFO", "AML", f"Rate limiting ({reason}): {REQUEST_DELAY}s between requests (~{60/REQUEST_DELAY:.0f} req/min)")
+                await convex.add_log(job_id, "INFO", "AML", "Local vLLM model - no rate limiting")
         else:
-            REQUEST_DELAY = 0.1  # Minimal delay for paid tier with paid models
-            print(f"[Generation] Paid tier + paid model - fast generation enabled: {REQUEST_DELAY}s")
-            if convex:
-                await convex.add_log(job_id, "INFO", "AML", "Paid tier + paid model - fast generation enabled")
+            # Check if using a free model (ends with :free) - these ALWAYS have rate limits
+            is_free_model = model.endswith(":free")
+
+            # Check OpenRouter account tier
+            tier_info = await check_openrouter_tier(api_key)
+            is_free_account = tier_info["is_free_tier"]
+
+            # Rate limiting: Apply for free models OR free accounts
+            # Free models have rate limits regardless of account tier
+            needs_rate_limiting = is_free_model or is_free_account
+
+            if needs_rate_limiting:
+                REQUEST_DELAY = 3.5  # seconds between requests (~17 req/min, under 20 req/min limit)
+                reason = "free model" if is_free_model else "free tier account"
+                print(f"[Generation] Rate limiting enabled ({reason}): {REQUEST_DELAY}s between requests")
+                if convex:
+                    await convex.add_log(job_id, "INFO", "AML", f"Rate limiting ({reason}): {REQUEST_DELAY}s between requests (~{60/REQUEST_DELAY:.0f} req/min)")
+            else:
+                REQUEST_DELAY = 0.1  # Minimal delay for paid tier with paid models
+                print(f"[Generation] Paid tier + paid model - fast generation enabled: {REQUEST_DELAY}s")
+                if convex:
+                    await convex.add_log(job_id, "INFO", "AML", "Paid tier + paid model - fast generation enabled")
 
         MAX_RETRIES = 3
         MAX_VALIDATION_RETRIES = 2  # Additional retries specifically for malformed JSON
@@ -5573,6 +5619,12 @@ async def execute_heuristic_pipeline(
         is_multi_model = len(effective_models) > 1
         use_format_prompt = heuristic_config.useFormatPrompt if heuristic_config.useFormatPrompt is not None else True
 
+        # Pre-detect local models and fetch settings once
+        _has_any_local = any(m.startswith("local/") for m in effective_models)
+        _local_endpoint, _local_api_key = "", ""
+        if _has_any_local and convex:
+            _local_endpoint, _local_api_key = await _get_local_llm_settings(convex)
+
         eval_lock = asyncio.Lock()  # GPU eval lock (shared)
 
         # Shared progress tracking for multi-target pipeline
@@ -5656,14 +5708,18 @@ async def execute_heuristic_pipeline(
                         while retries < 3:
                             try:
                                 from cera.llm.openrouter import OpenRouterClient
-                                llm = OpenRouterClient(
-                                    api_key=api_key, usage_tracker=usage_tracker,
-                                    component="heuristic",
+                                _is_local, _actual_mid = _parse_local_model(model_id)
+                                _llm_kw = dict(
+                                    usage_tracker=usage_tracker, component="heuristic",
                                     target=str(target.targetValue),
                                     run=f"run{run_num}" if t_runs > 1 else "",
                                 )
+                                if _is_local:
+                                    llm = OpenRouterClient(api_key=_local_api_key, base_url=_local_endpoint, **_llm_kw)
+                                else:
+                                    llm = OpenRouterClient(api_key=api_key, **_llm_kw)
                                 content = await llm.chat(
-                                    model=model_id,
+                                    model=_actual_mid,
                                     messages=[{"role": "user", "content": t_prompt}],
                                     temperature=0.8,
                                     max_tokens=16384,

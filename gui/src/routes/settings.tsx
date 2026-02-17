@@ -3,7 +3,7 @@ import { useQuery, useMutation } from 'convex/react'
 import { api } from 'convex/_generated/api'
 import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
-import { Save, Eye, EyeOff, Key, FolderOutput, Loader2, RefreshCw, Gauge, AlertCircle, CheckCircle2, Search, Trash2, Database, ToggleLeft, Layers, Plus, Edit2, Star, StarOff, X, ChevronDown } from 'lucide-react'
+import { Save, Eye, EyeOff, Key, FolderOutput, Loader2, RefreshCw, Gauge, AlertCircle, CheckCircle2, Search, Trash2, Database, ToggleLeft, Layers, Plus, Edit2, Star, StarOff, X, ChevronDown, Server } from 'lucide-react'
 import type { Id } from 'convex/_generated/dataModel'
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card'
@@ -87,6 +87,16 @@ function SettingsPage() {
   const [theme, setTheme] = useState<'light' | 'dark' | 'system'>('dark')
   const [jobsDir, setJobsDir] = useState('./jobs')
   const [saving, setSaving] = useState(false)
+
+  // Local LLMs state
+  const [localLlmEnabled, setLocalLlmEnabled] = useState(false)
+  const [localLlmEndpoint, setLocalLlmEndpoint] = useState('')
+  const [localLlmApiKey, setLocalLlmApiKey] = useState('')
+  const [showLocalLlmApiKey, setShowLocalLlmApiKey] = useState(false)
+  const [testingConnection, setTestingConnection] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'success' | 'error'>('idle')
+  const [connectionError, setConnectionError] = useState('')
+  const [localModels, setLocalModels] = useState<string[]>([])
 
   // Reset preset form when dialog opens/closes or editing preset changes
   const openPresetDialog = (preset?: LLMPreset) => {
@@ -176,6 +186,9 @@ function SettingsPage() {
       setConvexAdminKey(settings.convexAdminKey ?? '')
       setTheme(settings.theme)
       setJobsDir(settings.jobsDirectory ?? './jobs')
+      setLocalLlmEnabled(settings.localLlmEnabled ?? false)
+      setLocalLlmEndpoint(settings.localLlmEndpoint ?? '')
+      setLocalLlmApiKey(settings.localLlmApiKey ?? '')
     }
   }, [settings])
 
@@ -189,12 +202,45 @@ function SettingsPage() {
         convexAdminKey: convexAdminKey || undefined,
         theme,
         jobsDirectory: jobsDir,
+        localLlmEnabled,
+        localLlmEndpoint: localLlmEndpoint || undefined,
+        localLlmApiKey: localLlmApiKey || undefined,
       })
       toast.success('Settings saved successfully')
     } catch (error) {
       toast.error('Failed to save settings')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleTestConnection = async () => {
+    if (!localLlmEndpoint) {
+      toast.error('Enter an endpoint URL first')
+      return
+    }
+    setTestingConnection(true)
+    setConnectionStatus('idle')
+    try {
+      const url = localLlmEndpoint.replace(/\/+$/, '') + '/v1/models'
+      const headers: Record<string, string> = {}
+      if (localLlmApiKey) {
+        headers['Authorization'] = `Bearer ${localLlmApiKey}`
+      }
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(10000) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const models = (data.data || []).map((m: { id: string }) => m.id)
+      setLocalModels(models)
+      setConnectionStatus('success')
+      toast.success(`Connected! ${models.length} model(s) available.`)
+    } catch (err) {
+      setConnectionStatus('error')
+      setConnectionError(err instanceof Error ? err.message : 'Connection failed')
+      setLocalModels([])
+      toast.error('Failed to connect to local LLM server')
+    } finally {
+      setTestingConnection(false)
     }
   }
 
@@ -482,6 +528,114 @@ function SettingsPage() {
                 You'll still see results when the job completes.
               </AlertDescription>
             </Alert>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Local LLM Server */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Server className="h-5 w-5 text-muted-foreground" />
+            <CardTitle>Local LLM Server</CardTitle>
+            <Badge variant="outline" className="text-[10px]">Optional</Badge>
+          </div>
+          <CardDescription>
+            Connect to a self-hosted vLLM server for generation using open-source models.
+            Only affects the Generation phase — SIL, MAV, and other pipeline stages continue using OpenRouter.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Enable Toggle */}
+          <div className="flex items-center justify-between rounded-lg border p-4">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2">
+                <ToggleLeft className="h-4 w-4 text-muted-foreground" />
+                <Label htmlFor="local-llm-toggle" className="font-medium">
+                  Enable Local LLMs
+                </Label>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                {localLlmEnabled
+                  ? "Local models will appear in the generation model selector"
+                  : "All generation uses OpenRouter models"}
+              </p>
+            </div>
+            <Switch
+              id="local-llm-toggle"
+              checked={localLlmEnabled}
+              onCheckedChange={setLocalLlmEnabled}
+            />
+          </div>
+
+          {/* Configuration (only when enabled) */}
+          {localLlmEnabled && (
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label>Endpoint URL</Label>
+                <Input
+                  placeholder="http://your-vm-ip:8100"
+                  value={localLlmEndpoint}
+                  onChange={(e) => {
+                    setLocalLlmEndpoint(e.target.value)
+                    setConnectionStatus('idle')
+                  }}
+                />
+                <p className="text-xs text-muted-foreground">
+                  The vLLM server URL. Copy this from the cera-vLLM dashboard.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label>API Key <span className="text-muted-foreground">(from dashboard)</span></Label>
+                <div className="relative">
+                  <Input
+                    type={showLocalLlmApiKey ? 'text' : 'password'}
+                    placeholder="cvllm-..."
+                    value={localLlmApiKey}
+                    onChange={(e) => setLocalLlmApiKey(e.target.value)}
+                    className="pr-10"
+                  />
+                  <Button
+                    type="button" variant="ghost" size="icon"
+                    className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
+                    onClick={() => setShowLocalLlmApiKey(!showLocalLlmApiKey)}
+                  >
+                    {showLocalLlmApiKey
+                      ? <EyeOff className="h-4 w-4 text-muted-foreground" />
+                      : <Eye className="h-4 w-4 text-muted-foreground" />}
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Auto-generated by the cera-vLLM dashboard. Copy it from the Connection section.
+                </p>
+              </div>
+
+              {/* Test Connection Button + Status */}
+              <div className="flex items-center gap-3">
+                <Button
+                  variant="outline" size="sm"
+                  onClick={handleTestConnection}
+                  disabled={!localLlmEndpoint || testingConnection}
+                >
+                  {testingConnection
+                    ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Testing...</>
+                    : 'Test Connection'}
+                </Button>
+                {connectionStatus === 'success' && (
+                  <div className="flex items-center gap-2 text-sm text-green-500">
+                    <CheckCircle2 className="h-4 w-4" />
+                    <span>{localModels.length} model(s): {localModels.join(', ')}</span>
+                  </div>
+                )}
+                {connectionStatus === 'error' && (
+                  <div className="flex items-center gap-2 text-sm text-red-500">
+                    <AlertCircle className="h-4 w-4" />
+                    <span>{connectionError}</span>
+                  </div>
+                )}
+              </div>
+            </div>
           )}
         </CardContent>
       </Card>

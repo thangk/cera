@@ -25,6 +25,9 @@ export const get = query({
         defaultModel: "claude-sonnet-4-20250514",
         theme: "system" as const,
         jobsDirectory: "./jobs",
+        localLlmEnabled: false,
+        localLlmEndpoint: undefined,
+        localLlmApiKey: undefined,
       };
     }
     return settings;
@@ -42,6 +45,9 @@ export const update = mutation({
     defaultModel: v.optional(v.string()),
     theme: v.optional(v.union(v.literal("light"), v.literal("dark"), v.literal("system"))),
     jobsDirectory: v.optional(v.string()),
+    localLlmEnabled: v.optional(v.boolean()),
+    localLlmEndpoint: v.optional(v.string()),
+    localLlmApiKey: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const existing = await ctx.db.query("settings").first();
@@ -57,6 +63,9 @@ export const update = mutation({
       if (args.defaultModel !== undefined) updates.defaultModel = args.defaultModel;
       if (args.theme !== undefined) updates.theme = args.theme;
       if (args.jobsDirectory !== undefined) updates.jobsDirectory = args.jobsDirectory;
+      if (args.localLlmEnabled !== undefined) updates.localLlmEnabled = args.localLlmEnabled;
+      if (args.localLlmEndpoint !== undefined) updates.localLlmEndpoint = args.localLlmEndpoint;
+      if (args.localLlmApiKey !== undefined) updates.localLlmApiKey = args.localLlmApiKey;
 
       await ctx.db.patch(existing._id, updates);
       return existing._id;

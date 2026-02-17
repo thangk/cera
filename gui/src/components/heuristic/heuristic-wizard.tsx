@@ -221,6 +221,8 @@ export function HeuristicWizard({ onBack, onReset }: HeuristicWizardProps) {
     const defaultPricing = { input: 2.0, output: 8.0 } // Default pricing per 1M tokens
 
     const getModelPricing = (modelId: string): { input: number; output: number } => {
+      // Local vLLM models have zero cost
+      if (modelId.startsWith('local/')) return { input: 0, output: 0 }
       if (!rawModels || !modelId) return defaultPricing
       const model = rawModels.find((m: OpenRouterModel) => m.id === modelId)
       if (!model) return defaultPricing

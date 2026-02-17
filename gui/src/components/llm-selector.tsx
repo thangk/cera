@@ -15,6 +15,7 @@ import {
   TooltipTrigger,
 } from './ui/tooltip'
 import { useOpenRouterModels, type ProcessedModel, type ProviderInfo } from '../hooks/use-openrouter-models'
+import { useLocalLlmModels } from '../hooks/use-local-llm-models'
 
 export type ValidationStatus = 'idle' | 'checking' | 'valid' | 'error'
 
@@ -57,9 +58,25 @@ export function LLMSelector({
 }: LLMSelectorProps) {
   // Use external data if provided, otherwise fetch
   const hookData = useOpenRouterModels()
-  const providers = externalProviders ?? hookData.providers
-  const groupedModels = externalGroupedModels ?? hookData.groupedModels
+  const localData = useLocalLlmModels()
+  const baseProviders = externalProviders ?? hookData.providers
+  const baseGroupedModels = externalGroupedModels ?? hookData.groupedModels
   const loading = externalLoading ?? hookData.loading
+
+  // Merge local models at the top when enabled and configured
+  const providers = useMemo(() => {
+    if (!localData.enabled || !localData.configured || localData.providers.length === 0) {
+      return baseProviders
+    }
+    return [...localData.providers, ...baseProviders]
+  }, [localData.enabled, localData.configured, localData.providers, baseProviders])
+
+  const groupedModels = useMemo(() => {
+    if (!localData.enabled || !localData.configured || Object.keys(localData.groupedModels).length === 0) {
+      return baseGroupedModels
+    }
+    return { ...localData.groupedModels, ...baseGroupedModels }
+  }, [localData.enabled, localData.configured, localData.groupedModels, baseGroupedModels])
 
   // Internal thinking mode state (used when no external control provided)
   const [internalThinkingMode, setInternalThinkingMode] = useState(false)
@@ -195,8 +212,11 @@ export function LLMSelector({
                     />
                     <span className="font-medium truncate flex-1 min-w-0">{provider.label}</span>
                     <div className="flex items-center gap-1 shrink-0">
-                      {/* Order: OSS, Free, Paid - show all applicable badges */}
-                      {provider.isOpenSource && (
+                      {/* Order: Local, OSS, Free, Paid - show all applicable badges */}
+                      {provider.id === 'local' && (
+                        <Badge variant="secondary" className="bg-blue-500/20 text-blue-500 text-[9px] px-1 py-0">Local</Badge>
+                      )}
+                      {provider.isOpenSource && provider.id !== 'local' && (
                         <Badge variant="outline" className="text-[9px] px-1 py-0">OSS</Badge>
                       )}
                       {provider.hasFreeModels && (

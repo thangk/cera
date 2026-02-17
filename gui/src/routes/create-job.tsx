@@ -1812,6 +1812,8 @@ function GenerateWizard() {
 
     // Get pricing for selected generation model
     const getModelPricingLocal = (modelId: string): { input: number; output: number } => {
+      // Local vLLM models have zero cost
+      if (modelId.startsWith('local/')) return { input: 0, output: 0 }
       const model = rawModels.find((m) => m.id === modelId)
       if (!model) return defaultPricing
       const inputPrice = parseFloat(model.pricing?.prompt || '0') * 1_000_000
@@ -4144,6 +4146,9 @@ const TOKEN_ESTIMATES = {
 // Helper to get model pricing from OpenRouter models list
 // Returns pricing per 1M tokens
 function getModelPricing(models: any[], modelId: string): { input: number; output: number } | null {
+  // Local vLLM models have zero cost
+  if (modelId.startsWith('local/')) return { input: 0, output: 0 }
+
   const model = models.find((m: any) => m.id === modelId)
   if (!model) return null
 
