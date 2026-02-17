@@ -5897,7 +5897,7 @@ async def execute_heuristic_pipeline(
                                 evaluation_config=evaluation_config,
                                 dataset_file=str(dataset_file_path),
                                 convex=convex,
-                                save_files=True,
+                                save_files=False,
                             )
                             if metrics_result:
                                 target_eval_metrics.append((metrics_result, str(dataset_file_path)))
@@ -5974,12 +5974,141 @@ async def execute_heuristic_pipeline(
                                         for k, v in all_metrics_dicts[0].items()
                                         if k in metric_keys and v is not None}
 
-                    # Save target-level aggregated metrics (with per-model breakdown)
+                    # Save consolidated metrics in CERA format (runs array + average + std)
+                    import csv as _csv_module_h
+                    import numpy as _np_h
+
+                    _h_metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+                    _h_metric_categories = {
+                        "lexical": ["bleu", "rouge_l"],
+                        "semantic": ["bertscore", "moverscore"],
+                        "diversity": ["distinct_1", "distinct_2", "self_bleu"],
+                    }
+                    _h_metric_descriptions = {
+                        "bleu": "N-gram overlap precision score",
+                        "rouge_l": "Longest common subsequence recall",
+                        "bertscore": "Contextual similarity using BERT embeddings",
+                        "moverscore": "Earth mover distance on word embeddings",
+                        "distinct_1": "Unique unigram ratio",
+                        "distinct_2": "Unique bigram ratio",
+                        "self_bleu": "Intra-corpus similarity (lower = more diverse)",
+                    }
+
+                    # Group by run number and average across models within each run
+                    _h_per_run = {}
+                    for prm in per_run_metrics:
+                        rn = prm["run"]
+                        if rn not in _h_per_run:
+                            _h_per_run[rn] = []
+                        _h_per_run[rn].append(prm["metrics"])
+
+                    h_all_run_metrics = []
+                    for rn in sorted(_h_per_run.keys()):
+                        run_metrics_list = _h_per_run[rn]
+                        run_avg = {}
+                        for key in _h_metric_keys:
+                            vals = [m.get(key) for m in run_metrics_list if m.get(key) is not None]
+                            if vals:
+                                run_avg[key] = float(round(sum(vals) / len(vals), 6))
+                        h_all_run_metrics.append(run_avg)
+
+                    # Compute average/std across runs
+                    h_avg_metrics = {}
+                    h_std_metrics = {}
+                    for key in _h_metric_keys:
+                        vals = [m.get(key) for m in h_all_run_metrics if m.get(key) is not None]
+                        if vals:
+                            arr = _np_h.array([float(v) for v in vals])
+                            h_avg_metrics[key] = float(round(_np_h.mean(arr), 6))
+                            h_std_metrics[key] = float(round(_np_h.std(arr), 6)) if len(vals) > 1 else 0.0
+
+                    h_metrics_dir = Path(target_job_paths["metrics"])
+                    h_metrics_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Save CSV per category (matching CERA format)
+                    for category, cat_metrics in _h_metric_categories.items():
+                        csv_path = h_metrics_dir / f"{category}-metrics.csv"
+                        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                            writer = _csv_module_h.writer(f)
+                            if _h_is_multi_model:
+                                writer.writerow(["run", "model", "metric", "score", "description"])
+                                for prm in per_run_metrics:
+                                    model_match = None
+                                    for _, fp in target_eval_metrics:
+                                        if f"/run{prm['run']}/" in fp:
+                                            import re as _re2
+                                            mm = _re2.search(r'/run\d+/([^/]+)/', fp)
+                                            if mm:
+                                                model_match = mm.group(1)
+                                            break
+                                    m_slug = model_match or "unknown"
+                                    for metric in cat_metrics:
+                                        val = prm["metrics"].get(metric)
+                                        if val is not None:
+                                            writer.writerow([prm["run"], m_slug, metric, f"{val:.6f}", _h_metric_descriptions.get(metric, "")])
+                                for run_idx, run_met in enumerate(h_all_run_metrics, 1):
+                                    for metric in cat_metrics:
+                                        val = run_met.get(metric)
+                                        if val is not None:
+                                            writer.writerow([run_idx, "ALL", metric, f"{val:.6f}", f"Average across models"])
+                                for metric in cat_metrics:
+                                    val = h_avg_metrics.get(metric)
+                                    if val is not None:
+                                        writer.writerow(["avg", "ALL", metric, f"{val:.6f}", f"Average across {len(h_all_run_metrics)} runs"])
+                                for metric in cat_metrics:
+                                    val = h_std_metrics.get(metric)
+                                    if val is not None:
+                                        writer.writerow(["std", "ALL", metric, f"{val:.6f}", "Standard deviation"])
+                            else:
+                                writer.writerow(["run", "metric", "score", "description"])
+                                for run_idx, run_met in enumerate(h_all_run_metrics, 1):
+                                    for metric in cat_metrics:
+                                        val = run_met.get(metric)
+                                        if val is not None:
+                                            writer.writerow([run_idx, metric, f"{val:.6f}", _h_metric_descriptions.get(metric, "")])
+                                for metric in cat_metrics:
+                                    val = h_avg_metrics.get(metric)
+                                    if val is not None:
+                                        writer.writerow(["avg", metric, f"{val:.6f}", f"Average across {len(h_all_run_metrics)} runs"])
+                                for metric in cat_metrics:
+                                    val = h_std_metrics.get(metric)
+                                    if val is not None:
+                                        writer.writerow(["std", metric, f"{val:.6f}", "Standard deviation"])
+
+                    # Save consolidated JSON (CERA format with runs array)
+                    all_runs_json = {
+                        "runs": [],
+                        "average": {},
+                        "std": {},
+                        "totalRuns": len(h_all_run_metrics),
+                    }
+                    for run_idx, run_met in enumerate(h_all_run_metrics, 1):
+                        run_data = {"run": run_idx}
+                        for category, cat_metrics in _h_metric_categories.items():
+                            run_data[category] = {m: run_met.get(m) for m in cat_metrics if run_met.get(m) is not None}
+                        all_runs_json["runs"].append(run_data)
+
+                    for category, cat_metrics in _h_metric_categories.items():
+                        all_runs_json["average"][category] = {m: h_avg_metrics.get(m) for m in cat_metrics if h_avg_metrics.get(m) is not None}
+                        all_runs_json["std"][category] = {m: h_std_metrics.get(m) for m in cat_metrics}
+
+                    all_runs_json["average"]["_flat"] = h_avg_metrics
+                    all_runs_json["std"]["_flat"] = h_std_metrics
+
+                    if _h_is_multi_model:
+                        all_runs_json["totalModels"] = len(h_per_model_entries)
+                        all_runs_json["perModel"] = h_per_model_entries
+
+                    json_path = h_metrics_dir / "mdqa-results.json"
+                    with open(json_path, "w") as f:
+                        json.dump(all_runs_json, f, indent=2)
+
+                    # Also save legacy mdqa_metrics_average.json for backward compatibility
                     agg_data = dict(_all_target_metrics[-1])
                     if _h_is_multi_model:
                         agg_data["totalModels"] = len(h_per_model_entries)
                         agg_data["perModel"] = h_per_model_entries
-                    agg_path = Path(target_job_paths["metrics"]) / "mdqa_metrics_average.json"
+                    agg_path = h_metrics_dir / "mdqa_metrics_average.json"
                     with open(agg_path, "w") as f:
                         json.dump(agg_data, f, indent=2)
 
@@ -6098,6 +6227,52 @@ async def execute_heuristic_pipeline(
             })
 
 
+def subsample_by_greedy_accumulation(
+    reviews: list[dict],
+    target_sentences: int,
+    count_mode: str = "sentences",
+    seed: int = 42,
+) -> list[dict]:
+    """
+    Subsample reviews using greedy review accumulation.
+
+    Shuffles reviews randomly, picks whole reviews one by one until sentence
+    count >= target. Slight overshoot is expected and OK.
+
+    Args:
+        reviews: List of review dicts with 'sentences' field
+        target_sentences: Target sentence count (or review count if count_mode='reviews')
+        count_mode: "sentences" or "reviews"
+        seed: Random seed for reproducibility
+    Returns:
+        List of sampled review dicts (preserving original structure)
+    """
+    import copy
+    import random
+
+    rng = random.Random(seed)
+    shuffled = list(range(len(reviews)))
+    rng.shuffle(shuffled)
+
+    if count_mode == "reviews":
+        selected_indices = shuffled[:target_sentences]
+        return [copy.deepcopy(reviews[i]) for i in selected_indices]
+
+    # Sentence mode: accumulate whole reviews until sentence count >= target
+    sampled = []
+    total = 0
+    for idx in shuffled:
+        review = reviews[idx]
+        sentences = review.get("sentences", [])
+        n = len(sentences) if sentences else 1
+        sampled.append(copy.deepcopy(review))
+        total += n
+        if total >= target_sentences:
+            break
+
+    return sampled
+
+
 def escape_xml(text: str) -> str:
     """Escape special XML characters."""
     return (text
@@ -6106,6 +6281,257 @@ def escape_xml(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
         .replace("'", "&apos;"))
+
+
+async def _execute_real_dataset_pipeline(
+    job_id: str,
+    job_name: str,
+    dataset_file: Optional[str],
+    evaluation_config: Optional[dict],
+    jobs_directory: str,
+    convex_url: Optional[str],
+    convex_token: Optional[str],
+):
+    """
+    Execute real dataset evaluation pipeline with multi-target subsampling.
+
+    For each target size:
+    1. Subsample source dataset using greedy review accumulation (whole reviews)
+    2. Write subsample as both JSONL and SemEval XML: {job-name}-{explicit|implicit}.{jsonl|xml}
+    3. Run execute_evaluation (which handles self-test + MDQA internally)
+    4. Results written to datasets/{size}/metrics/mdqa-results.json
+    """
+    from pathlib import Path
+    import json
+    import xml.etree.ElementTree as ET
+
+    convex = None
+    if convex_url and convex_token:
+        convex = ConvexClient(convex_url, convex_token, pocketbase_url=os.environ.get("POCKETBASE_URL"))
+
+    try:
+        # Create job directory
+        job_paths = create_job_directory(jobs_directory, job_id, job_name)
+
+        # Extract targets from evaluationConfig
+        targets = []
+        if evaluation_config and "targets" in evaluation_config:
+            for t in evaluation_config["targets"]:
+                targets.append({
+                    "count_mode": t.get("count_mode", "sentences"),
+                    "target_value": t.get("target_value", 100),
+                })
+
+        if not targets:
+            raise ValueError("No target sizes specified for real dataset pipeline")
+
+        if convex:
+            target_labels = [f"{t['target_value']} {t['count_mode']}" for t in targets]
+            await convex.add_log(job_id, "INFO", "Pipeline",
+                f"Starting real dataset pipeline with {len(targets)} targets: {', '.join(target_labels)}")
+            await convex.update_progress(job_id, 5, "Loading source dataset")
+
+        # Locate the uploaded source dataset file
+        dataset_dir = Path(job_paths["dataset"])
+        source_path = None
+        if dataset_file:
+            candidate = dataset_dir / dataset_file
+            if candidate.exists():
+                source_path = candidate
+        if not source_path:
+            # Auto-discover
+            for ext in [".jsonl", ".csv", ".xml"]:
+                candidates = list(dataset_dir.glob(f"*{ext}"))
+                if candidates:
+                    source_path = candidates[0]
+                    break
+        if not source_path or not source_path.exists():
+            raise FileNotFoundError(f"Source dataset not found in {dataset_dir}")
+
+        # Parse source dataset into review dicts
+        source_reviews: list[dict] = []
+        if str(source_path).endswith(".jsonl"):
+            with open(source_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        source_reviews.append(json.loads(line))
+        elif str(source_path).endswith(".xml"):
+            tree = ET.parse(source_path)
+            root = tree.getroot()
+            for review_elem in root.findall("./Review"):
+                review_sentences = []
+                sentences_wrapper = review_elem.find("./sentences")
+                sentence_elems = (
+                    sentences_wrapper.findall("./sentence") if sentences_wrapper is not None
+                    else review_elem.findall("./sentence")
+                )
+                for sent_elem in sentence_elems:
+                    text_elem = sent_elem.find("text")
+                    if text_elem is not None and text_elem.text:
+                        sent_dict: dict = {"text": text_elem.text.strip()}
+                        # Preserve opinion annotations if present
+                        opinions_elem = sent_elem.find("Opinions")
+                        if opinions_elem is not None:
+                            opinions = []
+                            for op_elem in opinions_elem.findall("Opinion"):
+                                opinions.append({
+                                    "target": op_elem.get("target", "NULL"),
+                                    "category": op_elem.get("category", ""),
+                                    "polarity": op_elem.get("polarity", ""),
+                                    "from": op_elem.get("from", "0"),
+                                    "to": op_elem.get("to", "0"),
+                                })
+                            sent_dict["opinions"] = opinions
+                        review_sentences.append(sent_dict)
+                if review_sentences:
+                    source_reviews.append({"sentences": review_sentences})
+        elif str(source_path).endswith(".csv"):
+            import csv as csv_mod
+            with open(source_path, encoding="utf-8") as f:
+                reader = csv_mod.DictReader(f)
+                source_reviews = list(reader)
+        else:
+            # Fallback: try JSONL
+            with open(source_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        source_reviews.append(json.loads(line))
+
+        if not source_reviews:
+            raise ValueError(f"No reviews found in source dataset: {source_path.name}")
+
+        # Detect explicit vs implicit: explicit if any opinion has a real target (not "NULL")
+        is_explicit = False
+        for review in source_reviews:
+            for sent in review.get("sentences", []):
+                for op in sent.get("opinions", []):
+                    if op.get("target", "NULL") not in ("NULL", "null", ""):
+                        is_explicit = True
+                        break
+                if is_explicit:
+                    break
+            if is_explicit:
+                break
+        dataset_mode = "explicit" if is_explicit else "implicit"
+
+        # Sanitize job name for filenames
+        import re as _re
+        safe_job_name = _re.sub(r'[^\w\-]', '-', job_name).strip('-').lower()
+        safe_job_name = _re.sub(r'-+', '-', safe_job_name)
+
+        total_sentences = sum(len(r.get("sentences", [])) for r in source_reviews)
+        print(f"[Real Pipeline] Loaded {len(source_reviews)} reviews ({total_sentences} sentences) from {source_path.name}")
+        if convex:
+            await convex.add_log(job_id, "INFO", "Pipeline",
+                f"Loaded {len(source_reviews)} reviews ({total_sentences} sentences) from {source_path.name}")
+
+        # Process each target
+        for idx, target in enumerate(targets):
+            target_value = target["target_value"]
+            count_mode = target["count_mode"]
+            progress_base = 10 + int((idx / len(targets)) * 80)
+
+            if convex:
+                await convex.update_progress(job_id, progress_base, f"Target {target_value}: subsampling")
+                await convex.add_log(job_id, "INFO", "Pipeline",
+                    f"[Target {idx+1}/{len(targets)}] Subsampling {target_value} {count_mode}")
+
+            # Subsample using greedy review accumulation
+            sampled_reviews = subsample_by_greedy_accumulation(
+                reviews=source_reviews,
+                target_sentences=target_value,
+                count_mode=count_mode,
+                seed=42 + idx,  # Different seed per target for independence
+            )
+
+            sampled_sentences = sum(len(r.get("sentences", [])) for r in sampled_reviews)
+            print(f"[Real Pipeline] Target {target_value}: sampled {len(sampled_reviews)} reviews ({sampled_sentences} sentences)")
+            if convex:
+                await convex.add_log(job_id, "INFO", "Pipeline",
+                    f"Sampled {len(sampled_reviews)} reviews ({sampled_sentences} sentences)")
+
+            # Create target directory structure
+            target_dir = Path(job_paths["datasets"]) / str(target_value)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            metrics_dir = target_dir / "metrics"
+            metrics_dir.mkdir(exist_ok=True)
+
+            # Write subsample in both JSONL and SemEval XML
+            file_base = f"{safe_job_name}-{dataset_mode}"
+
+            # JSONL
+            jsonl_file = target_dir / f"{file_base}.jsonl"
+            with open(jsonl_file, "w", encoding="utf-8") as f:
+                for review in sampled_reviews:
+                    f.write(json.dumps(review, ensure_ascii=False) + "\n")
+
+            # SemEval XML
+            xml_file = target_dir / f"{file_base}.xml"
+            xml_content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            xml_content += '<Reviews>\n'
+            for r_idx, review in enumerate(sampled_reviews):
+                xml_content += f'  <Review rid="{r_idx}">\n'
+                xml_content += '    <sentences>\n'
+                for s_idx, sent in enumerate(review.get("sentences", [])):
+                    text_escaped = sent["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                    xml_content += f'      <sentence id="{r_idx}:{s_idx}">\n'
+                    xml_content += f'        <text>{text_escaped}</text>\n'
+                    opinions = sent.get("opinions", [])
+                    if opinions:
+                        xml_content += '        <Opinions>\n'
+                        for op in opinions:
+                            target_escaped = str(op.get("target", "NULL")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                            xml_content += f'          <Opinion target="{target_escaped}" category="{op.get("category", "")}" polarity="{op.get("polarity", "")}" from="{op.get("from", "0")}" to="{op.get("to", "0")}" />\n'
+                        xml_content += '        </Opinions>\n'
+                    xml_content += '      </sentence>\n'
+                xml_content += '    </sentences>\n'
+                xml_content += '  </Review>\n'
+            xml_content += '</Reviews>\n'
+            with open(xml_file, "w", encoding="utf-8") as f:
+                f.write(xml_content)
+
+            # Build target-specific job_paths for execute_evaluation
+            target_job_paths = dict(job_paths)
+            target_job_paths["dataset"] = str(target_dir)
+            target_job_paths["metrics"] = str(metrics_dir)
+
+            # Run MDQA evaluation (handles self-test internally)
+            if convex:
+                await convex.update_progress(job_id, progress_base + 5, f"Target {target_value}: evaluating")
+                await convex.add_log(job_id, "INFO", "MDQA",
+                    f"[Target {idx+1}/{len(targets)}] Starting evaluation for {target_value} {count_mode}")
+
+            await execute_evaluation(
+                job_id=job_id,
+                job_paths=target_job_paths,
+                evaluation_config=evaluation_config,
+                reviews_data=sampled_reviews,
+                save_files=True,
+                convex=convex,
+            )
+
+            if convex:
+                await convex.add_log(job_id, "INFO", "MDQA",
+                    f"[Target {idx+1}/{len(targets)}] Evaluation complete for {target_value}")
+
+        # Mark job as completed
+        if convex:
+            await convex.update_progress(job_id, 100, "Complete")
+            await convex.complete_job(job_id)
+            await convex.add_log(job_id, "INFO", "Pipeline",
+                f"Real dataset pipeline complete — {len(targets)} targets evaluated")
+
+        print(f"[Real Pipeline] Pipeline complete for job {job_id}")
+
+    except Exception as e:
+        print(f"[Real Pipeline] Pipeline failed: {e}")
+        import traceback
+        traceback.print_exc()
+        if convex:
+            await convex.fail_job(job_id, str(e))
+            await convex.add_log(job_id, "ERROR", "Pipeline", f"Pipeline failed: {e}")
 
 
 async def execute_pipeline(
@@ -6149,6 +6575,22 @@ async def execute_pipeline(
             rde_usage=rde_usage,
         )
         return  # Heuristic pipeline is complete
+
+    # ========================================
+    # REAL DATASET METHOD (RQ1 Real Baseline)
+    # Subsample source dataset at each target size, then self-test + MDQA.
+    # ========================================
+    if method == "real" and "evaluation" in phases and len(phases) == 1:
+        await _execute_real_dataset_pipeline(
+            job_id=job_id,
+            job_name=job_name,
+            dataset_file=dataset_file,
+            evaluation_config=evaluation_config,
+            jobs_directory=jobs_directory,
+            convex_url=convex_url,
+            convex_token=convex_token,
+        )
+        return  # Real dataset pipeline is complete
 
     try:
         # Get or create job directory
@@ -9184,6 +9626,298 @@ async def read_mav_reports(request: ReadMavRequest):
     }
 
 
+class ScanTargetsRequest(BaseModel):
+    jobDir: str
+
+
+@app.post("/api/scan-targets")
+async def scan_targets(request: ScanTargetsRequest):
+    """Scan a job directory for available target sizes and their metrics status.
+
+    Returns which targets exist under datasets/, whether each has MDQA metrics,
+    and detected model slugs for multi-model jobs.
+    """
+    from pathlib import Path
+    import json
+
+    job_dir = Path(request.jobDir)
+    datasets_dir = job_dir / "datasets"
+
+    if not datasets_dir.exists():
+        raise HTTPException(status_code=404, detail="No datasets directory found")
+
+    targets = []
+    is_multi_model = False
+
+    for target_dir in sorted(datasets_dir.iterdir()):
+        if not target_dir.is_dir() or not target_dir.name.isdigit():
+            continue
+
+        target_value = int(target_dir.name)
+        metrics_dir = target_dir / "metrics"
+        has_metrics = False
+        metrics_files = []
+        model_slugs = []
+
+        if metrics_dir.exists():
+            for fname in ("mdqa-results.json", "mdqa_metrics_average.json"):
+                fpath = metrics_dir / fname
+                if fpath.exists():
+                    has_metrics = True
+                    metrics_files.append(fname)
+                    try:
+                        data = json.loads(fpath.read_text(encoding="utf-8"))
+                        if isinstance(data.get("perModel"), list) and len(data["perModel"]) > 1:
+                            is_multi_model = True
+                            model_slugs = [pm.get("modelSlug", "") for pm in data["perModel"] if pm.get("modelSlug")]
+                    except Exception:
+                        pass
+                    break  # prefer mdqa-results.json if both exist
+
+        targets.append({
+            "targetValue": target_value,
+            "countMode": "sentences",
+            "hasMetrics": has_metrics,
+            "metricsFiles": metrics_files,
+            "modelSlugs": model_slugs,
+        })
+
+    return {
+        "targets": targets,
+        "isMultiModel": is_multi_model,
+        "totalTargets": len(targets),
+    }
+
+
+class RerunEvaluationRequest(BaseModel):
+    jobDir: str
+    targetSize: Optional[int] = None  # If set, only re-evaluate this target
+
+
+@app.post("/api/rerun-evaluation")
+async def rerun_evaluation(request: RerunEvaluationRequest):
+    """Re-run MDQA evaluation on existing generated datasets.
+
+    Scans run directories, evaluates each dataset, and saves consolidated
+    results in CERA format (runs array + average + std).
+    Works for both CERA and heuristic jobs.
+    """
+    from pathlib import Path
+    import json
+    import csv as csv_mod
+    import re as re_mod
+    import numpy as np
+
+    ds_dir = Path(request.jobDir) / "datasets"
+    if not ds_dir.exists():
+        raise HTTPException(status_code=404, detail="Datasets directory not found")
+
+    # Determine which targets to evaluate
+    target_dirs = sorted([
+        d for d in ds_dir.iterdir()
+        if d.is_dir() and d.name.isdigit()
+    ], key=lambda d: int(d.name))
+
+    if request.targetSize is not None:
+        target_dirs = [d for d in target_dirs if d.name == str(request.targetSize)]
+        if not target_dirs:
+            raise HTTPException(status_code=404, detail=f"Target size {request.targetSize} not found")
+
+    metric_keys = ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"]
+    metric_categories = {
+        "lexical": ["bleu", "rouge_l"],
+        "semantic": ["bertscore", "moverscore"],
+        "diversity": ["distinct_1", "distinct_2", "self_bleu"],
+    }
+    metric_descriptions = {
+        "bleu": "N-gram overlap precision score",
+        "rouge_l": "Longest common subsequence recall",
+        "bertscore": "Contextual similarity using BERT embeddings",
+        "moverscore": "Earth mover distance on word embeddings",
+        "distinct_1": "Unique unigram ratio",
+        "distinct_2": "Unique bigram ratio",
+        "self_bleu": "Intra-corpus similarity (lower = more diverse)",
+    }
+
+    # Build evaluation config with reference metrics enabled
+    eval_config = {
+        "metrics": ["bleu", "rouge_l", "bertscore", "moverscore", "distinct_1", "distinct_2", "self_bleu"],
+        "reference_metrics_enabled": True,
+    }
+
+    results_by_target = {}
+
+    for target_dir in target_dirs:
+        target_size = int(target_dir.name)
+        metrics_dir = target_dir / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find all explicit dataset files in run directories
+        dataset_files = sorted(target_dir.glob("run*/**/*-explicit.jsonl"))
+        if not dataset_files:
+            # Try without -explicit suffix
+            dataset_files = sorted(target_dir.glob("run*/**/*.jsonl"))
+        if not dataset_files:
+            continue
+
+        # Evaluate each dataset file
+        eval_metrics = []  # list of (metrics_dict, file_path, run_num, model_slug)
+        job_paths = {
+            "dataset": str(target_dir),
+            "metrics": str(metrics_dir),
+            "root": request.jobDir,
+        }
+
+        for dataset_file_path in dataset_files:
+            try:
+                metrics_result = await execute_evaluation(
+                    job_id="rerun",
+                    job_paths=job_paths,
+                    evaluation_config=eval_config,
+                    dataset_file=str(dataset_file_path),
+                    convex=None,
+                    save_files=False,
+                )
+                if metrics_result:
+                    # Extract run number and model slug from path
+                    fp = str(dataset_file_path)
+                    run_match = re_mod.search(r'/run(\d+)/', fp)
+                    run_num = int(run_match.group(1)) if run_match else 1
+                    model_match = re_mod.search(r'/run\d+/([^/]+)/', fp)
+                    model_slug = model_match.group(1) if model_match else "unknown"
+                    clean_metrics = {k: float(round(float(v), 6)) for k, v in metrics_result.items()
+                                    if k in metric_keys and v is not None}
+                    eval_metrics.append((clean_metrics, fp, run_num, model_slug))
+            except Exception as e:
+                print(f"[Rerun] Warning: Failed to evaluate {dataset_file_path}: {e}")
+
+        if not eval_metrics:
+            continue
+
+        # Group by run and average across models within each run
+        per_run = {}
+        for clean_m, _, rn, _ in eval_metrics:
+            if rn not in per_run:
+                per_run[rn] = []
+            per_run[rn].append(clean_m)
+
+        all_run_metrics = []
+        for rn in sorted(per_run.keys()):
+            run_avg = {}
+            for key in metric_keys:
+                vals = [m.get(key) for m in per_run[rn] if m.get(key) is not None]
+                if vals:
+                    run_avg[key] = float(round(sum(vals) / len(vals), 6))
+            all_run_metrics.append(run_avg)
+
+        # Compute average/std
+        avg_metrics = {}
+        std_metrics = {}
+        for key in metric_keys:
+            vals = [m.get(key) for m in all_run_metrics if m.get(key) is not None]
+            if vals:
+                arr = np.array([float(v) for v in vals])
+                avg_metrics[key] = float(round(np.mean(arr), 6))
+                std_metrics[key] = float(round(np.std(arr), 6)) if len(vals) > 1 else 0.0
+
+        # Build per-model breakdown
+        per_model_data = {}
+        for clean_m, _, rn, m_slug in eval_metrics:
+            if m_slug not in per_model_data:
+                per_model_data[m_slug] = {"metrics_list": [], "per_run": []}
+            per_model_data[m_slug]["metrics_list"].append(clean_m)
+            per_model_data[m_slug]["per_run"].append({"run": rn, "metrics": clean_m})
+
+        per_model_entries = []
+        for m_slug, m_data in per_model_data.items():
+            m_avg = {}
+            for key in metric_keys:
+                vals = [m.get(key) for m in m_data["metrics_list"] if m.get(key) is not None]
+                if vals:
+                    m_avg[key] = float(round(sum(vals) / len(vals), 6))
+            per_model_entries.append({
+                "model": m_slug, "modelSlug": m_slug,
+                "metrics": m_avg if m_avg else None,
+                "runs": sorted(m_data["per_run"], key=lambda x: x["run"]),
+            })
+        is_multi_model = len(per_model_entries) > 1
+
+        # Save CSV per category
+        for category, cat_metrics in metric_categories.items():
+            csv_path = metrics_dir / f"{category}-metrics.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv_mod.writer(f)
+                writer.writerow(["run", "metric", "score", "description"])
+                for run_idx, run_met in enumerate(all_run_metrics, 1):
+                    for metric in cat_metrics:
+                        val = run_met.get(metric)
+                        if val is not None:
+                            writer.writerow([run_idx, metric, f"{val:.6f}", metric_descriptions.get(metric, "")])
+                for metric in cat_metrics:
+                    val = avg_metrics.get(metric)
+                    if val is not None:
+                        writer.writerow(["avg", metric, f"{val:.6f}", f"Average across {len(all_run_metrics)} runs"])
+                for metric in cat_metrics:
+                    val = std_metrics.get(metric)
+                    if val is not None:
+                        writer.writerow(["std", metric, f"{val:.6f}", "Standard deviation"])
+
+        # Save consolidated JSON (CERA format)
+        all_runs_json = {
+            "runs": [],
+            "average": {},
+            "std": {},
+            "totalRuns": len(all_run_metrics),
+        }
+        for run_idx, run_met in enumerate(all_run_metrics, 1):
+            run_data = {"run": run_idx}
+            for category, cat_metrics in metric_categories.items():
+                run_data[category] = {m: run_met.get(m) for m in cat_metrics if run_met.get(m) is not None}
+            all_runs_json["runs"].append(run_data)
+
+        for category, cat_metrics in metric_categories.items():
+            all_runs_json["average"][category] = {m: avg_metrics.get(m) for m in cat_metrics if avg_metrics.get(m) is not None}
+            all_runs_json["std"][category] = {m: std_metrics.get(m) for m in cat_metrics}
+
+        all_runs_json["average"]["_flat"] = avg_metrics
+        all_runs_json["std"]["_flat"] = std_metrics
+
+        if is_multi_model:
+            all_runs_json["totalModels"] = len(per_model_entries)
+            all_runs_json["perModel"] = per_model_entries
+
+        json_path = metrics_dir / "mdqa-results.json"
+        with open(json_path, "w") as f:
+            json.dump(all_runs_json, f, indent=2)
+
+        # Also save legacy average file
+        agg_data = {}
+        for key in metric_keys:
+            if key in avg_metrics:
+                agg_data[key] = avg_metrics[key]
+            if key in std_metrics:
+                agg_data[f"{key}_std"] = std_metrics[key]
+        if is_multi_model:
+            agg_data["totalModels"] = len(per_model_entries)
+            agg_data["perModel"] = per_model_entries
+        agg_path = metrics_dir / "mdqa_metrics_average.json"
+        with open(agg_path, "w") as f:
+            json.dump(agg_data, f, indent=2)
+
+        results_by_target[target_size] = {
+            "totalRuns": len(all_run_metrics),
+            "totalDatasets": len(eval_metrics),
+            "averageMetrics": avg_metrics,
+        }
+        print(f"[Rerun] Target {target_size}: Evaluated {len(eval_metrics)} datasets across {len(all_run_metrics)} runs")
+
+    return {
+        "success": True,
+        "targets": results_by_target,
+        "totalTargets": len(results_by_target),
+    }
+
+
 class ReadMetricsRequest(BaseModel):
     jobDir: str
     targetSize: Optional[int] = None  # For multi-target jobs: which target to read
@@ -9387,6 +10121,39 @@ async def read_metrics(request: ReadMetricsRequest):
                         if v is not None
                     ]
 
+            # If mdqa_metrics_average.json also exists, read std from it
+            if heuristic_avg_path.exists():
+                try:
+                    avg_data = json.loads(heuristic_avg_path.read_text(encoding="utf-8"))
+                    category_map = {
+                        "bleu": "lexical", "rouge_l": "lexical",
+                        "bertscore": "semantic", "moverscore": "semantic",
+                        "distinct_1": "diversity", "distinct_2": "diversity", "self_bleu": "diversity",
+                    }
+                    for metric_key in category_map:
+                        std_val = avg_data.get(f"{metric_key}_std")
+                        if std_val is not None:
+                            cat = category_map[metric_key]
+                            if cat not in std_metrics:
+                                std_metrics[cat] = []
+                            std_metrics[cat].append(
+                                {"metric": metric_key, "score": std_val, "description": "Standard deviation"}
+                            )
+                    if std_metrics:
+                        result["std"] = std_metrics
+
+                    # Count run directories to determine totalRuns
+                    # (heuristic jobs have runN dirs but no per-run metric files)
+                    target_dir = metrics_dir.parent  # datasets/{targetSize}/
+                    run_dirs = sorted([
+                        d for d in target_dir.iterdir()
+                        if d.is_dir() and d.name.startswith("run") and d.name[3:].isdigit()
+                    ])
+                    if run_dirs:
+                        result["totalRuns"] = len(run_dirs)
+                except Exception:
+                    pass
+
         # Old flat format
         else:
             category_map = {
@@ -9475,6 +10242,131 @@ async def read_metrics(request: ReadMetricsRequest):
             result["totalModels"] = len(csv_per_model)
 
     return {"metrics": result}
+
+
+# ─── LADy Results API ─────────────────────────────────────────────────────────
+
+LADY_OUTPUT_DIR = os.environ.get("LADY_OUTPUT_DIR", "/app/lady-output")
+
+# Mapping from LADy CSV metric names (@5 cutoff) to our canonical keys
+_LADY_METRIC_MAP = {
+    "P_5": "precision_at_5",
+    "map_cut_5": "map_at_5",
+    "ndcg_cut_5": "ndcg_at_5",
+    "recall_5": "recall_at_5",
+    "success_5": "specificity_at_5",
+}
+
+
+@app.post("/api/scan-lady-outputs")
+async def scan_lady_outputs():
+    """Scan the LADy output directory for available evaluation results.
+
+    Returns a list of output directories, each with type and available target sizes.
+    """
+    from pathlib import Path
+
+    output_root = Path(LADY_OUTPUT_DIR)
+    if not output_root.exists():
+        return {"outputs": []}
+
+    outputs = []
+    for d in sorted(output_root.iterdir()):
+        if not d.is_dir():
+            continue
+        # Infer method type from directory name (e.g., "real", "cera", "heuristic", "real-1")
+        base_name = d.name.split("-")[0] if "-" in d.name else d.name
+        if base_name not in ("real", "cera", "heuristic"):
+            continue
+        # Discover target sizes
+        targets = []
+        for td in sorted(d.iterdir()):
+            if td.is_dir() and td.name.startswith("target-"):
+                size_str = td.name.replace("target-", "")
+                if size_str.isdigit():
+                    # Only include targets that have an aggregate.csv
+                    if (td / "aggregate.csv").exists():
+                        targets.append(int(size_str))
+        if targets:
+            outputs.append({
+                "name": d.name,
+                "path": str(d),
+                "type": base_name,
+                "targets": sorted(targets),
+            })
+
+    return {"outputs": outputs}
+
+
+class ReadLadyMetricsRequest(BaseModel):
+    outputDir: str
+    targetSize: int
+
+
+@app.post("/api/read-lady-metrics")
+async def read_lady_metrics(request: ReadLadyMetricsRequest):
+    """Read LADy evaluation metrics from an output directory for a specific target size.
+
+    Reads aggregate.csv (cross-run mean ± std) and per-run agg.ad.pred.eval.mean.csv files.
+    Returns metrics at @5 cutoff: P@5, MAP@5, NDCG@5, R@5, S@5.
+    """
+    from pathlib import Path
+    import csv
+
+    target_dir = Path(request.outputDir) / f"target-{request.targetSize}"
+    agg_path = target_dir / "aggregate.csv"
+
+    if not agg_path.exists():
+        raise HTTPException(status_code=404, detail=f"No aggregate.csv found for target {request.targetSize}")
+
+    # Parse aggregate.csv
+    metrics = {}
+    with open(agg_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            metric_name = row.get("metric", "")
+            canonical = _LADY_METRIC_MAP.get(metric_name)
+            if canonical:
+                mean_val = row.get("mean")
+                std_val = row.get("std")
+                if mean_val:
+                    entry = {"mean": float(mean_val)}
+                    if std_val and std_val.strip():
+                        entry["std"] = float(std_val)
+                    metrics[canonical] = entry
+
+    # Parse per-run data from run directories
+    per_run = []
+    run_dirs = sorted(
+        [d for d in target_dir.iterdir() if d.is_dir() and d.name.startswith("run")],
+        key=lambda d: int(d.name.replace("run", "")) if d.name.replace("run", "").isdigit() else 0,
+    )
+    for run_dir in run_dirs:
+        run_num_str = run_dir.name.replace("run", "")
+        if not run_num_str.isdigit():
+            continue
+        run_num = int(run_num_str)
+        run_csv = run_dir / "agg.ad.pred.eval.mean.csv"
+        if not run_csv.exists():
+            continue
+        run_metrics = {}
+        with open(run_csv, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                metric_name = row.get("metric", "")
+                canonical = _LADY_METRIC_MAP.get(metric_name)
+                if canonical:
+                    mean_val = row.get("mean")
+                    if mean_val:
+                        run_metrics[canonical] = float(mean_val)
+        if run_metrics:
+            per_run.append({"run": run_num, "metrics": run_metrics})
+
+    return {
+        "metrics": metrics,
+        "perRun": per_run if per_run else None,
+        "nRuns": len(per_run) if per_run else (len(run_dirs) if run_dirs else 1),
+    }
 
 
 class ReadConformityRequest(BaseModel):

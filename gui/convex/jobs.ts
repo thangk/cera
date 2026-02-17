@@ -102,8 +102,10 @@ export const listForResearch = query({
       // Extract available target sizes from config
       const ceraTargets = job.config?.generation?.targets as Array<{ target_value: number; count_mode: string }> | undefined;
       const heuristicTargets = job.heuristicConfig?.targets as Array<{ targetValue: number; targetMode: string }> | undefined;
+      const evalTargets = job.evaluationConfig?.targets as Array<{ target_value: number; count_mode: string }> | undefined;
       const targets = ceraTargets?.map(t => ({ value: t.target_value, countMode: t.count_mode }))
         ?? heuristicTargets?.map(t => ({ value: t.targetValue, countMode: t.targetMode }))
+        ?? evalTargets?.map(t => ({ value: t.target_value, countMode: t.count_mode }))
         ?? null;
 
       // Extract generation model slug(s) from config
@@ -252,6 +254,10 @@ export const create = mutation({
         enabled: v.boolean(),
         split_mode: v.string(),
       })),
+      targets: v.optional(v.array(v.object({
+        count_mode: v.string(),
+        target_value: v.number(),
+      }))),
     })),
     // Path to uploaded dataset (for EVALUATION-only jobs)
     datasetFile: v.optional(v.string()),

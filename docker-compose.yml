@@ -79,6 +79,7 @@ services:
       - ./cli/cera/config/custom-aspect-categories:/app/cera/config/custom-aspect-categories  # Persist extracted presets
       - ./cli/cera/config/domain-patterns.json:/app/cera/config/domain-patterns.json  # Domain patterns (editable via UI)
       - ./cli/cera/config/domain-patterns-defaults.json:/app/cera/config/domain-patterns-defaults.json  # Domain pattern defaults (for reset)
+      - ../cera-LADy/output:/app/lady-output:ro  # LADy evaluation results (read-only)
       # DEV ONLY: Mount source for hot-reload (comment out for production)
       - ./cli/cera:/app/cera:ro
     depends_on:

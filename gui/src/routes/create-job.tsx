@@ -39,6 +39,7 @@ import {
   XCircle,
   Database,
   Plus,
+  BarChart3,
 } from 'lucide-react'
 import type { Id } from 'convex/_generated/dataModel'
 import { Alert, AlertDescription, AlertTitle } from '../components/ui/alert'
@@ -665,6 +666,15 @@ function GenerateWizard() {
 
   // Self Test state (split dataset into two halves for self-referencing metrics)
   const [selfTest, setSelfTest] = useState({ enabled: false, splitMode: 'random' as 'random' | 'sequential' })
+
+  // Real dataset target sizes (method="real" eval-only: subsample at each size)
+  const [realTargets, setRealTargets] = useState<Array<{ count_mode: string; target_value: number }>>([
+    { count_mode: 'sentences', target_value: 100 },
+    { count_mode: 'sentences', target_value: 500 },
+    { count_mode: 'sentences', target_value: 1000 },
+    { count_mode: 'sentences', target_value: 1500 },
+    { count_mode: 'sentences', target_value: 2000 },
+  ])
 
   // RDE (Reference Dataset Extraction) state
   const [rdeModel, setRdeModel] = useState<string>('')
@@ -2044,6 +2054,7 @@ function GenerateWizard() {
           reference_metrics_enabled: selfTest.enabled || (referenceOptions.useForEvaluation && !!referenceDatasetFile) || (!selectedPhases.includes('composition') && reusedFrom && !!sourceConfig?.referenceDataset?.useForEvaluation),
           reference_file: selfTest.enabled ? undefined : (referenceDatasetFile && referenceOptions.useForEvaluation ? referenceDatasetFile.name : (!selectedPhases.includes('composition') && reusedFrom && sourceConfig?.referenceDataset?.useForEvaluation ? sourceConfig.referenceDataset.fileName : undefined)),
           self_test: selfTest.enabled ? { enabled: true, split_mode: selfTest.splitMode } : undefined,
+          targets: method === 'real' && isEvalOnly ? realTargets : undefined,
         } : undefined,
         datasetFile: datasetFile ? datasetFile.name : undefined,
         reusedFrom: reusedFrom || undefined,
@@ -2601,6 +2612,67 @@ function GenerateWizard() {
                       </p>
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* Real Dataset Target Sizes - shown for method="real" eval-only */}
+              {method === 'real' && isEvalOnly && (
+                <div className="rounded-lg border p-4 space-y-3">
+                  <div className="flex items-center gap-3">
+                    <BarChart3 className="h-5 w-5 text-muted-foreground" />
+                    <div>
+                      <Label className="text-sm font-medium">Target Sizes</Label>
+                      <p className="text-xs text-muted-foreground">
+                        The source dataset will be subsampled at each target size (greedy review accumulation)
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-2 pt-2 border-t">
+                    {realTargets.map((target, idx) => (
+                      <div key={idx} className="flex items-center gap-2">
+                        <Input
+                          type="number"
+                          value={target.target_value}
+                          onChange={(e) => {
+                            const updated = [...realTargets]
+                            updated[idx] = { ...updated[idx], target_value: parseInt(e.target.value) || 100 }
+                            setRealTargets(updated)
+                          }}
+                          className="w-32"
+                          min={10}
+                          step={10}
+                          placeholder="Sentences"
+                        />
+                        <span className="text-xs text-muted-foreground">sentences</span>
+                        {realTargets.length > 1 && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0"
+                            onClick={() => setRealTargets(realTargets.filter((_, i) => i !== idx))}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        const last = realTargets[realTargets.length - 1]
+                        setRealTargets([...realTargets, {
+                          count_mode: 'sentences',
+                          target_value: last.target_value + 500,
+                        }])
+                      }}
+                    >
+                      <Plus className="h-3.5 w-3.5 mr-1.5" />
+                      Add target size
+                    </Button>
+                  </div>
                 </div>
               )}
 

@@ -122,6 +122,11 @@ export default defineSchema({
         enabled: v.boolean(),
         split_mode: v.string(),
       })),
+      // Real dataset multi-target subsampling (method="real" eval-only)
+      targets: v.optional(v.array(v.object({
+        count_mode: v.string(), // "sentences" or "reviews"
+        target_value: v.number(),
+      }))),
     })),
     // Reference dataset configuration (for context extraction and/or MDQA comparison)
     referenceDataset: v.optional(v.object({

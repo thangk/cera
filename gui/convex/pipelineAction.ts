@@ -71,7 +71,17 @@ export const runPipeline = action({
     // Handle heuristic vs CERA method differently
     const isHeuristic = job.method === "heuristic";
 
-    if (isHeuristic) {
+    const isReal = job.method === "real";
+
+    if (isReal) {
+      // Real eval-only jobs: set jobDir and mark as evaluating
+      try {
+        await ctx.runMutation(api.jobs.setJobDir, { jobId: args.jobId, jobDir: jobDir });
+        await ctx.runMutation(api.jobs.startEvaluation, { id: args.jobId });
+      } catch (e) {
+        // Job might already be in a valid state
+      }
+    } else if (isHeuristic) {
       // Heuristic jobs skip composition, go straight to generation
       const totalReviews = job.heuristicConfig?.targetMode === "reviews"
         ? job.heuristicConfig.targetValue

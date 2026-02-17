@@ -19,6 +19,7 @@ import {
   DollarSign,
 } from 'lucide-react'
 
+import { PYTHON_API_URL } from '../../lib/api-urls'
 import { Button } from '../ui/button'
 import { Badge } from '../ui/badge'
 import { Progress } from '../ui/progress'
@@ -74,6 +75,7 @@ interface HeuristicJobViewProps {
     generatedCount?: number
     currentRun?: number
     totalRuns?: number
+    jobDir?: string
     heuristicConfig?: {
       prompt: string
       targetMode: string
@@ -517,6 +519,35 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
     }
   }
 
+  const [isRerunningEval, setIsRerunningEval] = useState(false)
+  const [rerunEvalResult, setRerunEvalResult] = useState<string | null>(null)
+
+  const handleRerunEvaluation = async () => {
+    if (!job.jobDir) {
+      setRerunEvalResult('No job directory path stored for this job.')
+      return
+    }
+    setIsRerunningEval(true)
+    setRerunEvalResult(null)
+    try {
+      const res = await fetch(`${PYTHON_API_URL}/api/rerun-evaluation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobDir: job.jobDir }),
+      })
+      if (!res.ok) {
+        const err = await res.text()
+        throw new Error(`Failed: ${err}`)
+      }
+      const data = await res.json()
+      setRerunEvalResult(`Re-evaluated ${data.totalTargets} target(s) successfully. Reload data sources in Research Tools to pick up new per-run metrics.`)
+    } catch (error) {
+      setRerunEvalResult(`Error: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setIsRerunningEval(false)
+    }
+  }
+
   // Status helpers
   const getStatusIcon = () => {
     switch (job.status) {
@@ -643,6 +674,15 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
                 <RefreshCcw className="mr-2 h-4 w-4" />
                 Rerun
               </Button>
+              <Button
+                variant="outline"
+                onClick={handleRerunEvaluation}
+                disabled={isRerunningEval || !job.jobDir}
+                style={{ borderColor: MDQA_COLOR, color: MDQA_COLOR }}
+              >
+                <RefreshCcw className={`mr-2 h-4 w-4 ${isRerunningEval ? 'animate-spin' : ''}`} />
+                {isRerunningEval ? 'Re-evaluating...' : 'Rerun Evaluation'}
+              </Button>
               <AlertDialog>
                 <AlertDialogTrigger asChild>
                   <Button variant="outline" className="text-destructive border-destructive">
@@ -675,6 +715,13 @@ export function HeuristicJobView({ job }: HeuristicJobViewProps) {
         <div className="rounded-lg border border-destructive bg-destructive/10 p-4">
           <h3 className="font-medium text-destructive mb-1">Error</h3>
           <p className="text-sm text-destructive/80">{job.error}</p>
+        </div>
+      )}
+
+      {/* Rerun Evaluation result */}
+      {rerunEvalResult && (
+        <div className={`rounded-lg border p-4 ${rerunEvalResult.startsWith('Error') ? 'border-destructive bg-destructive/10' : 'border-green-500 bg-green-500/10'}`}>
+          <p className="text-sm">{rerunEvalResult}</p>
         </div>
       )}
 
