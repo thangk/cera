@@ -247,6 +247,8 @@ function AddEntryForm({
       mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
       perRunMetrics,
       perModelMetrics: null,
+      ladyMetrics: null,
+      perRunLadyMetrics: null,
     })
     return hasStd
   }, [extractMetricsFromFlat])
@@ -379,6 +381,8 @@ function AddEntryForm({
         mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
         perRunMetrics,
         perModelMetrics: null,
+        ladyMetrics: null,
+        perRunLadyMetrics: null,
       })
     } catch {
       // API not available
@@ -453,6 +457,8 @@ function AddEntryForm({
         mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
         perRunMetrics,
         perModelMetrics: null,
+        ladyMetrics: null,
+        perRunLadyMetrics: null,
       })
       return
     }
@@ -626,6 +632,8 @@ function AddEntryForm({
       mdqaMetrics: Object.keys(mdqaMetrics).length > 0 ? mdqaMetrics : null,
       perRunMetrics,
       perModelMetrics: null,
+      ladyMetrics: null,
+      perRunLadyMetrics: null,
     })
   }, [completedJobs, autoDetectMethodAndSize, buildJobSourceFromTarget, loadMetricsFromApi])
 
@@ -641,6 +649,7 @@ function AddEntryForm({
         perRunMetrics: parsed.perRunMetrics,
         perModelMetrics: parsed.perModelMetrics,
         ladyMetrics: parsed.lady,
+        perRunLadyMetrics: null,
       })
     }
     reader.readAsText(file)

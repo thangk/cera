@@ -103,3 +103,46 @@ export function stdev(arr: number[]): number {
   if (arr.length < 2) return 0
   return jStat.stdev(arr, true)
 }
+
+/**
+ * Welch's t-test (independent two-sample) from summary statistics.
+ * Used when per-run raw data isn't available but mean, std, n are known.
+ */
+export function welchTTest(
+  mean1: number, std1: number, n1: number,
+  mean2: number, std2: number, n2: number,
+): { t: number; p: number; df: number } {
+  if (n1 < 2 || n2 < 2 || (std1 === 0 && std2 === 0)) {
+    return { t: 0, p: 1, df: 0 }
+  }
+
+  const se1 = (std1 * std1) / n1
+  const se2 = (std2 * std2) / n2
+  const se = Math.sqrt(se1 + se2)
+
+  if (se === 0) return { t: 0, p: 1, df: 0 }
+
+  const t = (mean1 - mean2) / se
+  // Welch-Satterthwaite degrees of freedom
+  const df = Math.floor(
+    ((se1 + se2) ** 2) / ((se1 ** 2) / (n1 - 1) + (se2 ** 2) / (n2 - 1))
+  )
+  const p = 2 * (1 - jStat.studentt.cdf(Math.abs(t), Math.max(df, 1)))
+
+  return { t, p, df }
+}
+
+/**
+ * Cohen's d from summary statistics (independent samples).
+ * Uses pooled standard deviation.
+ */
+export function cohensDFromSummary(
+  mean1: number, std1: number, n1: number,
+  mean2: number, std2: number, n2: number,
+): number {
+  const pooledSd = Math.sqrt(
+    ((n1 - 1) * std1 * std1 + (n2 - 1) * std2 * std2) / (n1 + n2 - 2)
+  )
+  if (pooledSd === 0) return 0
+  return (mean1 - mean2) / pooledSd
+}

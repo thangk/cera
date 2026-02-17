@@ -1,29 +1,64 @@
-import { useState } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { DataSourcePanel } from '../data-source-panel'
+import { BatchDataSourcePanel } from '../batch-data-source-panel'
 import { ResearchTable } from '../research-table'
 import type { DataEntry, TableData, MdqaMetricKey, Method } from '../types'
 import { MDQA_METRIC_KEYS, MDQA_METRIC_LABELS, MDQA_METRIC_DIRECTION, METHOD_LABELS } from '../types'
 
+const STORAGE_KEY = 'rq1a-entries'
+
+function loadEntries(): DataEntry[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch { /* ignore corrupt data */ }
+  return []
+}
+
 export function Table1aMdqa() {
-  const [entries, setEntries] = useState<DataEntry[]>([])
-  const [tableData, setTableData] = useState<TableData | null>(null)
+  const [entries, setEntries] = useState<DataEntry[]>(loadEntries)
+  const [tableData, setTableData] = useState<TableData | null>(() => {
+    const initial = loadEntries()
+    return initial.length > 0 ? buildTable1a(initial) : null
+  })
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries))
+  }, [entries])
 
   const canGenerate = entries.length > 0
 
-  const generateTable = () => {
+  const generateTable = useCallback(() => {
     const data = buildTable1a(entries)
     setTableData(data)
-  }
+  }, [entries])
 
   return (
     <div className="space-y-4">
-      <DataSourcePanel
-        entries={entries}
-        onEntriesChange={setEntries}
-        metricType="mdqa"
-        fileHint="Drop mdqa-results.json from a CERA/Heuristic job"
-      />
+      <Tabs defaultValue="batch">
+        <TabsList className="grid w-full grid-cols-2 max-w-md">
+          <TabsTrigger value="batch">Batch Add (Multi-Target)</TabsTrigger>
+          <TabsTrigger value="single">Single Add</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="batch" className="mt-4">
+          <BatchDataSourcePanel
+            entries={entries}
+            onEntriesChange={setEntries}
+          />
+        </TabsContent>
+
+        <TabsContent value="single" className="mt-4">
+          <DataSourcePanel
+            entries={entries}
+            onEntriesChange={setEntries}
+            metricType="mdqa"
+            fileHint="Drop mdqa-results.json from a CERA/Heuristic job"
+          />
+        </TabsContent>
+      </Tabs>
 
       <Button onClick={generateTable} disabled={!canGenerate}>
         Generate Table
@@ -82,13 +117,27 @@ function buildTable1a(entries: DataEntry[]): TableData {
     return `${MDQA_METRIC_LABELS[key]} ${arrow}`
   })
 
-  // Build cells
+  // Build cells and raw numeric values
   const cells: string[][] = MDQA_METRIC_KEYS.map(metricKey => {
     return columnEntries.map(entry => formatMetricValue(entry, metricKey))
   })
+  const cellValues: (number | null)[][] = MDQA_METRIC_KEYS.map(metricKey => {
+    return columnEntries.map(entry => extractNumericValue(entry, metricKey))
+  })
+  const metricDirections = MDQA_METRIC_KEYS.map(key => MDQA_METRIC_DIRECTION[key])
 
   const hasAnySub = columnSubLabels.some(l => l !== null)
-  return { rowHeaders, columnHeaders, cells, columnGroups, columnSubLabels: hasAnySub ? columnSubLabels : undefined }
+  return { rowHeaders, columnHeaders, cells, columnGroups, columnSubLabels: hasAnySub ? columnSubLabels : undefined, cellValues, metricDirections }
+}
+
+/**
+ * Extract the raw numeric mean value for color coding.
+ */
+function extractNumericValue(entry: DataEntry, metricKey: MdqaMetricKey): number | null {
+  const metrics = entry.source.mdqaMetrics
+  if (!metrics) return null
+  const stat = metrics[metricKey]
+  return stat ? stat.mean : null
 }
 
 /**

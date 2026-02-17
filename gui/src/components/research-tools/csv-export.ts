@@ -2,11 +2,19 @@
 
 import type { TableData } from './types'
 
+export interface CsvExportOptions {
+  showSubLabels?: boolean
+  showSd?: boolean
+}
+
 /**
  * Convert TableData to CSV string.
  * Handles column groups by adding a header row.
+ * Respects view options (sub-labels, SD visibility).
  */
-export function tableDataToCsv(data: TableData): string {
+export function tableDataToCsv(data: TableData, options?: CsvExportOptions): string {
+  const showSubLabels = options?.showSubLabels ?? true
+  const showSd = options?.showSd ?? true
   const rows: string[][] = []
 
   // Add column group header row if present
@@ -22,8 +30,8 @@ export function tableDataToCsv(data: TableData): string {
     rows.push(groupRow)
   }
 
-  // Add column header row (merge sub-labels into headers for CSV)
-  if (data.columnSubLabels?.some(l => l !== null)) {
+  // Add column header row (merge sub-labels into headers for CSV if visible)
+  if (showSubLabels && data.columnSubLabels?.some(l => l !== null)) {
     rows.push(['', ...data.columnHeaders.map((h, i) => {
       const sub = data.columnSubLabels?.[i]
       return sub ? `${h} (${sub})` : h
@@ -32,9 +40,12 @@ export function tableDataToCsv(data: TableData): string {
     rows.push(['', ...data.columnHeaders])
   }
 
-  // Add data rows
+  // Add data rows (strip SD if hidden)
   for (let i = 0; i < data.rowHeaders.length; i++) {
-    rows.push([data.rowHeaders[i], ...(data.cells[i] || [])])
+    const cells = (data.cells[i] || []).map(cell =>
+      showSd ? cell : cell.replace(/\s*\u00B1\s*\S+/, '')
+    )
+    rows.push([data.rowHeaders[i], ...cells])
   }
 
   // Convert to CSV with proper escaping
@@ -56,10 +67,12 @@ function escapeCsvCell(value: string): string {
 
 /**
  * Trigger a CSV file download in the browser.
+ * Adds UTF-8 BOM so Excel correctly renders ± and other unicode.
  */
-export function downloadCsv(data: TableData, filename: string): void {
-  const csv = tableDataToCsv(data)
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+export function downloadCsv(data: TableData, filename: string, options?: CsvExportOptions): void {
+  const csv = tableDataToCsv(data, options)
+  const bom = '\uFEFF'
+  const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8;' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -86,12 +99,25 @@ export function transposeTableData(data: TableData): TableData {
     }
   }
 
+  const transposedCells = data.cells[0].map((_, colIdx) =>
+    data.cells.map(row => row[colIdx])
+  )
+
+  // Transpose cellValues if present
+  const transposedCellValues = data.cellValues && data.cellValues.length > 0 && data.cellValues[0].length > 0
+    ? data.cellValues[0].map((_, colIdx) =>
+        data.cellValues!.map(row => row[colIdx])
+      )
+    : undefined
+
   return {
     rowHeaders: effectiveHeaders,
     columnHeaders: data.rowHeaders,
-    cells: data.cells[0].map((_, colIdx) =>
-      data.cells.map(row => row[colIdx])
-    ),
+    cells: transposedCells,
+    cellValues: transposedCellValues,
+    // When swapped: each row is a (size, method) combo, each column is a metric
+    // metricDirections maps to columns now (was rows before)
+    metricDirections: data.metricDirections,
     // Column groups and sub-labels don't apply when transposed
   }
 }

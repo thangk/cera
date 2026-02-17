@@ -39,6 +39,15 @@ export const LADY_METRIC_LABELS: Record<LadyMetricKey, string> = {
   specificity_at_5: 'S@5',
 }
 
+/** Direction indicator for LADy metrics (all higher = better) */
+export const LADY_METRIC_DIRECTION: Record<LadyMetricKey, 'up' | 'down'> = {
+  precision_at_5: 'up',
+  map_at_5: 'up',
+  ndcg_at_5: 'up',
+  recall_at_5: 'up',
+  specificity_at_5: 'up',
+}
+
 // ==========================================
 // Method & RQ Types
 // ==========================================
@@ -68,6 +77,11 @@ export interface PerRunMetrics {
   metrics: Partial<Record<MdqaMetricKey, number>>
 }
 
+export interface PerRunLadyMetrics {
+  run: number
+  metrics: Partial<Record<LadyMetricKey, number>>
+}
+
 export interface PerModelMetrics {
   model: string
   modelSlug: string
@@ -89,6 +103,9 @@ export interface JobSource {
   mdqaMetrics: Partial<Record<MdqaMetricKey, MetricStat>> | null
   perRunMetrics: PerRunMetrics[] | null
   perModelMetrics: PerModelMetrics[] | null
+  ladyMetrics: Partial<Record<LadyMetricKey, MetricStat>> | null
+  perRunLadyMetrics: PerRunLadyMetrics[] | null
+  nRuns?: number
 }
 
 export interface FileSource {
@@ -98,6 +115,8 @@ export interface FileSource {
   perRunMetrics: PerRunMetrics[] | null
   perModelMetrics: PerModelMetrics[] | null
   ladyMetrics: Partial<Record<LadyMetricKey, MetricStat>> | null
+  perRunLadyMetrics: PerRunLadyMetrics[] | null
+  nRuns?: number
 }
 
 export interface DataEntry {
@@ -106,6 +125,45 @@ export interface DataEntry {
   size: number
   modelSlug?: string
   source: JobSource | FileSource
+}
+
+// ==========================================
+// Scan Targets API Types
+// ==========================================
+
+export interface ScannedTarget {
+  targetValue: number
+  countMode: string
+  hasMetrics: boolean
+  metricsFiles: string[]
+  modelSlugs: string[]
+}
+
+export interface ScanTargetsResponse {
+  targets: ScannedTarget[]
+  isMultiModel: boolean
+  totalTargets: number
+}
+
+// ==========================================
+// LADy Scan/Read API Types
+// ==========================================
+
+export interface LadyOutputDir {
+  name: string
+  path: string
+  type: Method
+  targets: number[]
+}
+
+export interface LadyScanResponse {
+  outputs: LadyOutputDir[]
+}
+
+export interface LadyReadMetricsResponse {
+  metrics: Partial<Record<LadyMetricKey, MetricStat>>
+  perRun: PerRunLadyMetrics[] | null
+  nRuns: number
 }
 
 // ==========================================
@@ -120,6 +178,10 @@ export interface TableData {
   cells: string[][]
   columnGroups?: { label: string; span: number }[]
   columnSubLabels?: (string | null)[]
+  /** Raw numeric values for each cell (for color coding). Same shape as cells. */
+  cellValues?: (number | null)[][]
+  /** Direction for each row metric: 'up' = higher is better, 'down' = lower is better. */
+  metricDirections?: ('up' | 'down')[]
 }
 
 // ==========================================

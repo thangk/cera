@@ -41,7 +41,7 @@ function ResearchToolsPage() {
   const rqDef = selectedRq ? RQ_DEFINITIONS.find(r => r.id === selectedRq) : null
 
   return (
-    <div className="flex flex-col gap-6 p-6 max-w-5xl">
+    <div className="flex flex-col gap-6 p-6">
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Research Tools</h1>
         <p className="text-muted-foreground">
