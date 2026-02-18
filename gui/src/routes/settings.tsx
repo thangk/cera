@@ -30,6 +30,7 @@ import { Badge } from '../components/ui/badge'
 import { Switch } from '../components/ui/switch'
 import { useOpenRouterLimits } from '../hooks/use-openrouter-limits'
 import { useOpenRouterModels } from '../hooks/use-openrouter-models'
+import { useLocalLlmModels } from '../hooks/use-local-llm-models'
 import { LLMSelector } from '../components/llm-selector'
 
 export const Route = createFileRoute('/settings')({
@@ -61,6 +62,9 @@ function SettingsPage() {
   const setDefaultPreset = useMutation(api.llmPresets.setDefault)
   const clearDefaultPreset = useMutation(api.llmPresets.clearDefault)
   const { providers, groupedModels, processedModels, loading: modelsLoading } = useOpenRouterModels()
+  const { models: localModels } = useLocalLlmModels()
+  // Combine OpenRouter + local models for preset display/validation
+  const allModels = [...processedModels, ...localModels]
 
   // Preset dialog state
   const [presetDialogOpen, setPresetDialogOpen] = useState(false)
@@ -172,7 +176,7 @@ function SettingsPage() {
   // Helper to get model display name
   const getModelDisplay = (modelId: string | undefined) => {
     if (!modelId) return null
-    const model = processedModels.find(m => m.id === modelId)
+    const model = allModels.find(m => m.id === modelId)
     if (model) return model.name
     // Model not found - show as unavailable
     return <span className="text-destructive">{modelId.split('/').pop()} (unavailable)</span>

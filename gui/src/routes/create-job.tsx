@@ -83,6 +83,7 @@ import {
   PopoverTrigger,
 } from '../components/ui/popover'
 import { useOpenRouterModels } from '../hooks/use-openrouter-models'
+import { useLocalLlmModels } from '../hooks/use-local-llm-models'
 import { useUIConstraints, type UIConstraints } from '../hooks/use-ui-constraints'
 import { LLMSelector, type ValidationStatus } from '../components/llm-selector'
 import { PresetSelector, type LLMPreset } from '../components/preset-selector'
@@ -494,6 +495,8 @@ function GenerateWizard() {
   const completedJobs = useQuery(api.jobs.listForReuse)
   const { constraints } = useUIConstraints()
   const { models: rawModels, processedModels, providers, groupedModels, loading: modelsLoading } = useOpenRouterModels()
+  const { models: localModels } = useLocalLlmModels()
+  const allModels = [...processedModels, ...localModels]
 
   // LLM Presets
   const presets = useQuery(api.llmPresets.list)
@@ -804,7 +807,7 @@ function GenerateWizard() {
   useEffect(() => {
     if (modelsLoading || processedModels.length === 0) return
 
-    const validModelIds = new Set(processedModels.map(m => m.id))
+    const validModelIds = new Set(allModels.map(m => m.id))
     let hasInvalidModels = false
     const newConfig = { ...config }
 
@@ -1114,7 +1117,7 @@ function GenerateWizard() {
 
   // Apply preset to config
   const applyPreset = useCallback((preset: LLMPreset) => {
-    const validModelIds = new Set(processedModels.map(m => m.id))
+    const validModelIds = new Set(allModels.map(m => m.id))
     let appliedCount = 0
 
     // Apply RDE model if valid
@@ -1163,7 +1166,7 @@ function GenerateWizard() {
     if (appliedCount === 0) {
       toast.warning(`Preset "${preset.name}" has no valid models`)
     }
-  }, [processedModels, config.subject_profile?.mav?.models, updateConfig])
+  }, [allModels, config.subject_profile?.mav?.models, updateConfig])
 
   // Handler for preset selection
   const handlePresetSelect = useCallback((preset: LLMPreset) => {
@@ -2546,7 +2549,7 @@ function GenerateWizard() {
                       selectedPresetId={selectedPresetId}
                       onSelect={handlePresetSelect}
                       onClear={handlePresetClear}
-                      processedModels={processedModels}
+                      processedModels={allModels}
                       loading={modelsLoading}
                     />
                   </div>
