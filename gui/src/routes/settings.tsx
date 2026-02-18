@@ -62,9 +62,9 @@ function SettingsPage() {
   const setDefaultPreset = useMutation(api.llmPresets.setDefault)
   const clearDefaultPreset = useMutation(api.llmPresets.clearDefault)
   const { providers, groupedModels, processedModels, loading: modelsLoading } = useOpenRouterModels()
-  const { models: localModels } = useLocalLlmModels()
+  const { models: localLlmModelsForPresets } = useLocalLlmModels()
   // Combine OpenRouter + local models for preset display/validation
-  const allModels = [...processedModels, ...localModels]
+  const allModels = [...processedModels, ...localLlmModelsForPresets]
 
   // Preset dialog state
   const [presetDialogOpen, setPresetDialogOpen] = useState(false)

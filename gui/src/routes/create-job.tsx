@@ -1198,6 +1198,15 @@ function GenerateWizard() {
       return
     }
 
+    // Local models (local/ prefix) don't need OpenRouter validation — mark as valid
+    if (modelId.startsWith('local/')) {
+      setModelValidations(prev => ({
+        ...prev,
+        [modelKey]: { status: 'valid', modelId }
+      }))
+      return
+    }
+
     // Skip if already validated for this exact model ID
     setModelValidations(prev => {
       const current = prev[modelKey]
@@ -1437,8 +1446,8 @@ function GenerateWizard() {
       modelsToValidate.push(config.generation.model)
     }
 
-    // Remove duplicates
-    const uniqueModels = [...new Set(modelsToValidate)]
+    // Remove duplicates and filter out local models (they don't use OpenRouter)
+    const uniqueModels = [...new Set(modelsToValidate)].filter(m => !m.startsWith('local/'))
 
     if (uniqueModels.length === 0) {
       return { valid: true, failures: [] }
