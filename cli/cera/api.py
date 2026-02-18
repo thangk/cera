@@ -484,7 +484,9 @@ async def _get_local_llm_settings(convex) -> tuple[str, str]:
 
     Returns (endpoint, api_key). Raises ValueError if not configured.
     """
-    settings = await convex.run_query("settings:get")
+    settings = await convex.get_settings()
+    if not settings:
+        raise ValueError("Could not fetch settings from Convex")
     endpoint = settings.get("localLlmEndpoint", "")
     api_key = settings.get("localLlmApiKey", "")
     if not endpoint:
@@ -4023,17 +4025,6 @@ async def execute_generation(
             additional_context=reviewers_context.get("additional_context"),
         )
 
-        # LLM client for generation calls
-        _target_label = str(config.generation.count)
-        _llm_kwargs = dict(
-            usage_tracker=usage_tracker, component="aml",
-            target=_target_label, run=f"run{current_run}" if total_runs > 1 else "",
-        )
-        if is_local_model:
-            llm = OpenRouterClient(api_key=local_api_key, base_url=local_endpoint, **_llm_kwargs)
-        else:
-            llm = OpenRouterClient(api_key=api_key, **_llm_kwargs)
-
         # Generation settings (count_mode, length_range, avg_sentences_per_review,
         # target_sentences, estimated_reviews, total_reviews already computed above)
         if count_mode == 'sentences':
@@ -4075,6 +4066,17 @@ async def execute_generation(
             model = actual_model  # Strip local/ prefix for vLLM API
         else:
             print(f"[Generation] Using model: {model} (provider={provider}, model_name={model_name})")
+
+        # LLM client for generation calls
+        _target_label = str(config.generation.count)
+        _llm_kwargs = dict(
+            usage_tracker=usage_tracker, component="aml",
+            target=_target_label, run=f"run{current_run}" if total_runs > 1 else "",
+        )
+        if is_local_model:
+            llm = OpenRouterClient(api_key=local_api_key, base_url=local_endpoint, **_llm_kwargs)
+        else:
+            llm = OpenRouterClient(api_key=api_key, **_llm_kwargs)
 
         # Polarity distribution (length_range already set above for sentence count calculation)
         polarity_dist = attributes_context["polarity"]
