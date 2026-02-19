@@ -9,14 +9,9 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-in%20development-yellow" alt="Status">
   <img src="https://img.shields.io/badge/python-3.10+-blue" alt="Python">
   <img src="https://img.shields.io/badge/license-research%20only-lightgrey" alt="License">
 </p>
-
----
-
-> **Note:** This repository is currently under active development as part of an MSc thesis at the University of Windsor. Code will be released upon completion.
 
 ---
 
@@ -82,7 +77,7 @@ Unlike existing approaches that require model fine-tuning, CERA generates high-q
 
 1. **Clone and create `.env`**
    ```bash
-   git clone https://github.com/thangk/cera.git
+   git clone <this-repo-url>
    cd cera
    cp .env.example .env
    ```
@@ -410,7 +405,7 @@ cera/
 
 ## Key Results
 
-Evaluated across three domains (laptop, restaurant, hotel) using [cera-LADy](https://github.com/thangk/cera-LADy) for extrinsic evaluation and MDQA for intrinsic evaluation:
+Evaluated across three review domains (laptop, restaurant, hotel) using four latent aspect detection architectures:
 
 | Metric | CERA | Heuristic | Real |
 |--------|------|-----------|------|
@@ -426,39 +421,8 @@ Evaluated across three domains (laptop, restaurant, hotel) using [cera-LADy](htt
 
 ---
 
-## Roadmap
-
-- [x] Core pipeline implementation
-- [x] Subject Intelligence Layer (SIL)
-- [x] Multi-Agent Verification (MAV)
-- [x] Authenticity Modeling Layer (AML)
-- [x] Reviewer Generation Module (RGM)
-- [x] Diversity Enforcement Module (DEM)
-- [x] MDQA evaluation suite
-- [x] Experiments & ablation studies (RQ1-RQ4)
-- [x] Paper submission (Canadian AI 2026)
-- [ ] Public release
-
----
-
-## Citation
-
-```bibtex
-@mastersthesis{thang2026cera,
-  title     = {CERA: Context-Engineered Reviews Architecture for
-               Synthetic ABSA Dataset Generation},
-  author    = {Thang, Kap},
-  school    = {University of Windsor},
-  year      = {2026},
-  type      = {Master's Thesis}
-}
-```
-
----
-
 ## Related Projects
 
-- [cera-LADy](https://github.com/thangk/cera-LADy) — Latent Aspect Detection evaluation framework for benchmarking CERA datasets
 - [LADy](https://github.com/fani-lab/LADy) — Original LADy framework by fani-lab
 
 ---
@@ -466,18 +430,3 @@ Evaluated across three domains (laptop, restaurant, hotel) using [cera-LADy](htt
 ## License
 
 This project is for **research purposes only**.
-
----
-
-## Acknowledgments
-
-- Supervisor: Dr. Luis Rueda *(School of Computer Science)*
-- Internal reader: Dr. Arunita Jaekel *(School of Computer Science)*
-- External reader: Dr. Mahsa Hosseini *(Odette School of Business)*
-- University of Windsor
-
----
-
-<p align="center">
-  <i>Last Updated: February 2026</i>
-</p>
