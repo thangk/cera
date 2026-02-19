@@ -55,7 +55,9 @@
    ```bash
    cd gui
    npm install
-   npx convex deploy --url http://localhost:3210 --admin-key YOUR_KEY
+   CONVEX_SELF_HOSTED_URL="http://localhost:3210" \
+   CONVEX_SELF_HOSTED_ADMIN_KEY="$CONVEX_ADMIN_KEY" \
+   npx convex dev --once
    cd ..
    ```
 
@@ -70,6 +72,7 @@
 | Web GUI | http://localhost:3001 |
 | Python API | http://localhost:8000 |
 | Convex Dashboard | http://localhost:6791 |
+| PocketBase Admin | http://localhost:8090 |
 
 ### Optional: Add OpenRouter API Key
 For real LLM generation (instead of placeholder mode), add your [OpenRouter API key](https://openrouter.ai/keys) to `.env`:
@@ -123,21 +126,39 @@ CERA addresses critical challenges in ABSA research:
 - **Class imbalance** - Real reviews skew ~65% positive, hurting minority class performance
 - **Domain sparsity** - Niche domains lack sufficient annotated data
 
-Unlike existing approaches that require model fine-tuning, CERA generates high-quality synthetic ABSA data using only **prompt engineering** and **multi-agent verification**.
+Unlike existing approaches that require model fine-tuning, CERA generates high-quality synthetic ABSA data using only **context engineering** and **multi-agent verification** — no GPU infrastructure, fine-tuning, or pre-existing embeddings required.
 
 ---
 
 ## Key Features
 
+**Composition Phase:**
+
 | Component | Description |
 |-----------|-------------|
-| **Subject Intelligence Layer (SIL)** | Agentic web search for factual grounding - reduces hallucination |
-| **Multi-Agent Verification (MAV)** | Cross-model consensus (2/3 majority voting) for fact verification |
-| **Authenticity Modeling Layer (AML)** | Configurable polarity control with diversity enforcement and authentic writing patterns |
-| **Negative Example Buffer (NEB)** | Rolling buffer of previously generated reviews injected as "what to avoid" — enforces cross-batch diversity |
-| **Opening Directives** | Per-review assigned opening strategies ensuring within-batch structural diversity (15 distinct patterns) |
-| **Authentic Imperfections** | Prompt-driven writing imperfections: capitalization variation, run-on sentences, informal grammar, regional colloquialisms |
-| **Multi-Dimensional Quality Assessment (MDQA)** | Comprehensive evaluation: lexical, semantic, and diversity metrics |
+| **Subject Intelligence Layer (SIL)** | Agentic web search for factual grounding — reduces hallucination via current product intelligence |
+| **Multi-Agent Verification (MAV)** | Cross-provider consensus (2/3 majority voting, $\tau$=0.85) for fact verification |
+| **Reviewer Generation Module (RGM)** | Demographic-grounded persona diversity across 7 dimensions — personas, writing patterns, structure variants |
+| **Attributes Composition Module (ACM)** | Configurable polarity distribution, noise injection, length/temperature bounds |
+
+**Generation Phase:**
+
+| Component | Description |
+|-----------|-------------|
+| **Authenticity Modeling Layer (AML)** | Combines all composition outputs into per-review blueprints under zero creative latitude |
+| **Diversity Enforcement Module (DEM)** | Four submodules enforcing corpus diversity without additional LLM calls: |
+| &nbsp;&nbsp; Vocabulary Diversity Tracker (VDT) | Monitors cumulative phrase frequencies; injects avoidance guidance when phrases exceed 5% threshold |
+| &nbsp;&nbsp; Reference Style Injection (RSI) | Samples real review sentences as tone references |
+| &nbsp;&nbsp; Opening Directive Module (ODM) | Per-review opening strategies (15 patterns) ensuring structural diversity |
+| &nbsp;&nbsp; Capitalization Style Module (CSM) | Weighted-random capitalization styles reflecting authentic surface variation |
+| **Negative Example Buffer (NEB)** | Rolling FIFO buffer of prior reviews injected as "what to avoid" — enforces cross-batch diversity |
+| **Noise Injection** | Post-generation via nlpaug: character (typos), lexical (colloquialisms), sentence (run-ons) |
+
+**Evaluation Phase:**
+
+| Component | Description |
+|-----------|-------------|
+| **Multi-Dimensional Quality Assessment (MDQA)** | Three-axis evaluation: lexical (BLEU, ROUGE-L), semantic (BERTScore, MoverScore), diversity (Distinct-1/2, Self-BLEU) |
 
 ---
 
@@ -242,10 +263,17 @@ CERA uses a single JSON configuration file to control all aspects of generation:
   "subject_profile": {
     "query": "The Keg Steakhouse",
     "region": "canada",
-    "category": "restaurant",
+    "domain": "restaurant",
     "feature_count": "5-10",
     "sentiment_depth": "praise and complain",
-    "context_scope": "typical dining experiences, food quality, service, ambiance, value"
+    "mav": {
+      "enabled": true,
+      "models": [
+        "perplexity/sonar-reasoning-pro",
+        "anthropic/claude-opus-4",
+        "google/gemini-2.5-flash-preview"
+      ]
+    }
   },
   "reviewer_profile": {
     "age_range": [18, 65],
@@ -254,7 +282,6 @@ CERA uses a single JSON configuration file to control all aspects of generation:
       "female": 0.45,
       "unspecified": 0.10
     },
-    "audience_context": ["regular diners", "food enthusiasts", "business lunch customers"],
     "additional_context": "The Keg is an upscale steakhouse..."
   },
   "attributes_profile": {
@@ -277,8 +304,8 @@ CERA uses a single JSON configuration file to control all aspects of generation:
     "batch_size": 50,
     "request_size": 5,
     "mode": "single-provider",
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-20250514",
+    "provider": "openrouter",
+    "model": "qwen/qwen3-235b-a22b",
     "dataset_mode": "explicit",
     "neb_enabled": true,
     "neb_depth": 2
@@ -312,98 +339,43 @@ CERA produces datasets in three formats:
 | Category | Metrics |
 |----------|---------|
 | **Lexical Quality** | BLEU, ROUGE-L |
-| **Semantic Similarity** | BERTScore, MoverScore |
+| **Semantic Fidelity** | BERTScore, MoverScore |
 | **Corpus Diversity** | Distinct-1/2, Self-BLEU |
-| **Downstream Task** | Macro-F1, Per-class F1, APG |
 
 ---
 
 ## Job Directory Structure
 
-When a generation job runs, CERA creates a structured directory for all job-related files:
+When a generation job runs, CERA creates a structured directory supporting multi-target and multi-run experiments:
 
 ```
 ./jobs/{jobId}-{sanitized-job-name}/
-├── amls/                    # AML prompt files (one per review)
-│   ├── aml-0001.md
-│   ├── aml-0002.md
-│   └── ...
-├── mavs/                    # MAV raw data (for verification)
+├── config.json              # Job configuration snapshot
+├── contexts/                # Composition phase outputs (shared across all targets)
+│   ├── subject-context.json # SIL output: verified subject intelligence
+│   ├── reviewers-context.json # RGM output: personas, writing patterns, structure variants
+│   └── attributes-context.json # ACM output: polarity, noise, constraints
+├── mavs/                    # MAV raw data per model (shared)
 │   ├── perplexity-sonar-pro/
 │   │   ├── understanding.md # Model's interpretation of the subject
 │   │   ├── query.md         # Search queries generated
 │   │   └── response.md      # Search results returned
-│   ├── anthropic-claude-35-sonnet/
-│   │   ├── understanding.md
-│   │   ├── query.md
-│   │   └── response.md
-│   └── google-gemini-25-flash/
-│       ├── understanding.md
-│       ├── query.md
-│       └── response.md
-├── metrics/                 # Evaluation metrics (MDQA)
-│   ├── mdqa-results.json
-│   └── mdqa-results.csv
-├── reports/                 # Analysis reports (JSON + CSV)
-│   ├── mav-report.json      # MAV verification results
-│   ├── mav-summary.csv      # For paper tables
-│   ├── mav-facts.csv        # Per-fact verification data
-│   ├── conformity-report.json
-│   ├── conformity-summary.csv
-│   └── conformity-details.csv
-└── dataset/                 # Final dataset
-    ├── reviews.jsonl
-    └── reviews.csv
+│   ├── anthropic-claude-opus/
+│   └── google-gemini-flash/
+├── reports/                 # MAV reports (shared)
+│   ├── mav-consensus.json   # Consensus verification results
+│   └── mav-summary.csv      # For paper tables
+└── datasets/                # Per-target output
+    └── {target_size}/       # e.g., 100/, 500/, 1000/
+        ├── run1/
+        │   ├── amls/        # AML prompt files for this run
+        │   └── {model-slug}/ # Generated dataset per model
+        ├── run2/
+        ├── metrics/         # MDQA evaluation for this target
+        └── reviewer-personas/ # Generated personas for this target
 ```
 
-### MAV Raw Data Files
-
-Each MAV model gets its own subfolder with three files:
-
-**understanding.md** - How the model interpreted the subject:
-```markdown
-# MAV Understanding - perplexity/sonar-pro
-
-## Subject: iPhone 15 Pro
-
-## Subject Type
-Consumer electronics (smartphone)
-
-## Relevant Aspects
-- Technical specifications
-- Camera quality
-- Battery life
-- Build quality and materials
-- Pricing and value
-
-## Timestamp
-2026-01-21T10:30:00Z
-```
-
-**query.md** - The search queries the model generated:
-```markdown
-# MAV Query - perplexity/sonar-pro
-
-## Generated Search Queries
-1. "iPhone 15 Pro specifications A17 Pro chip"
-2. "iPhone 15 Pro camera review 48MP"
-3. "iPhone 15 Pro battery life test"
-4. "iPhone 15 Pro titanium build quality"
-5. "iPhone 15 Pro price comparison"
-```
-
-**response.md** - The search results and extracted facts:
-```markdown
-# MAV Response - perplexity/sonar-pro
-
-## Extracted Facts
-- characteristics: ["A17 Pro chip", "48MP main camera", "Titanium frame"]
-- positives: ["Premium build quality", "Excellent camera system"]
-- negatives: ["High price", "Heavy weight"]
-- use_cases: ["Professional photography", "Mobile gaming"]
-```
-
-Comparing these files across models allows verification of MAV independence - each model should have different queries reflecting their unique understanding.
+Composition outputs (contexts, MAV) are computed once and shared across all target sizes and runs. Each target size gets its own metrics and per-run generation output.
 
 ---
 
@@ -421,44 +393,52 @@ cera/
 │       │   ├── generation/  # Phase 2: Review generation
 │       │   │   ├── aml.py   # Authenticity Modeling Layer
 │       │   │   ├── neb.py   # Negative Example Buffer
-│       │   │   ├── batch_engine.py
-│       │   │   └── noise.py # Noise injection
+│       │   │   ├── vocab_tracker.py # Vocabulary Diversity Tracker (VDT)
+│       │   │   ├── batch_engine.py  # LLM Batch Engine
+│       │   │   └── noise.py # Noise injection (nlpaug)
 │       │   └── evaluation/  # Phase 3: Quality assessment
 │       │       └── mdqa.py  # Multi-Dimensional Quality Assessment
 │       ├── llm/             # LLM provider abstraction
 │       ├── prompts/         # Prompt templates
-│       ├── models/          # Pydantic models
+│       ├── models/          # Pydantic models (config schema)
 │       └── utils/           # Utility functions
-├── gui/                     # React frontend (Vite + Convex)
+├── gui/                     # React frontend (Vite + Convex + PocketBase)
 ├── configs/                 # Configuration files
 ├── jobs/                    # Generated job output directories
-├── output/                  # Dataset outputs
 └── assets/                  # Logo and diagrams
 ```
 
 ---
 
-## Preliminary Results
+## Key Results
 
-Using [LADy-kap](https://github.com/thangk/LADy-kap) for implicit aspect detection:
+Evaluated across three domains (laptop, restaurant, hotel) using [cera-LADy](https://github.com/thangk/cera-LADy) for extrinsic evaluation and MDQA for intrinsic evaluation:
 
-| Synthetic Dataset | APG vs Real Data |
-|-------------------|------------------|
-| Claude Sonnet 4 (2000 reviews) | **-6.8%** |
+| Metric | CERA | Heuristic | Real |
+|--------|------|-----------|------|
+| Distinct-2 (n=1,000) | 0.736 | 0.254 | 0.776 |
+| Self-BLEU (n=1,000) | 0.450 | 0.935 | 0.420 |
+| BERTScore (n=1,000) | 0.403 | 0.481 | — |
 
-Synthetic LLM-generated data achieves **up to 93.2%** of real human-annotated dataset performance.
+- CERA achieves Real-data-level corpus diversity while heuristic prompting collapses ($p<.001$, Cohen's $d>22$)
+- RGM removal increases inter-review similarity by 37%
+- Quality maintained from n=25 to n=8,000 without degradation
+- Cross-domain invariant: $\sigma<0.01$ for semantic fidelity across all three domains
+- Total pipeline cost: **$0.90** per run (composition only; generation uses free-tier models)
 
 ---
 
 ## Roadmap
 
-- [ ] Core pipeline implementation
-- [ ] Subject Intelligence Layer (SIL)
-- [ ] Multi-Agent Verification (MAV)
-- [ ] Authenticity Modeling Layer (AML)
-- [ ] MDQA evaluation suite
-- [ ] Experiments & ablation studies
-- [ ] Paper submission
+- [x] Core pipeline implementation
+- [x] Subject Intelligence Layer (SIL)
+- [x] Multi-Agent Verification (MAV)
+- [x] Authenticity Modeling Layer (AML)
+- [x] Reviewer Generation Module (RGM)
+- [x] Diversity Enforcement Module (DEM)
+- [x] MDQA evaluation suite
+- [x] Experiments & ablation studies (RQ1-RQ4)
+- [x] Paper submission (Canadian AI 2026)
 - [ ] Public release
 
 ---
