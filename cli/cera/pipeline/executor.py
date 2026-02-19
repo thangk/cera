@@ -92,7 +92,8 @@ class PipelineExecutor:
                 similarity_threshold=mav.similarity_threshold,
             )
 
-        self.sil = SubjectIntelligenceLayer(api_key, mav_config=mav_config, usage_tracker=self.usage_tracker)
+        sil_enabled = getattr(config.ablation, 'sil_enabled', True) if config.ablation else True
+        self.sil = SubjectIntelligenceLayer(api_key, mav_config=mav_config, usage_tracker=self.usage_tracker, sil_enabled=sil_enabled)
 
         # Check ablation settings for age and sex
         age_enabled = getattr(config.ablation, 'age_enabled', True) if config.ablation else True

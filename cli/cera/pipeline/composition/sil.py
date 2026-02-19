@@ -167,11 +167,13 @@ class SubjectIntelligenceLayer:
         tavily_api_key: Optional[str] = None,
         usage_tracker=None,
         log_callback=None,
+        sil_enabled: bool = True,
     ):
         self.api_key = api_key
         self.mav_config = mav_config or MAVConfig(enabled=False)
         self.tavily_api_key = tavily_api_key
         self.usage_tracker = usage_tracker
+        self.sil_enabled = sil_enabled  # When False, skip web search and use parametric knowledge only
         self._similarity_model = None  # Lazy-loaded SentenceTransformer
         self._log = log_callback  # Optional async callback: async (level, phase, message, progress) -> None
 
@@ -1379,6 +1381,10 @@ class SubjectIntelligenceLayer:
         Returns:
             MAVResult with verified context and full reporting data
         """
+        # Check if SIL (web search) is disabled — use parametric knowledge only
+        if not self.sil_enabled:
+            return await self._parametric_only_fallback(query, additional_context)
+
         model_data_list: list[MAVModelData] = []
 
         # Check if MAV is enabled with at least 2 models
@@ -1837,6 +1843,78 @@ class SubjectIntelligenceLayer:
             )
         except Exception:
             # Complete failure - return empty context
+            context = SubjectContext(
+                subject=query,
+                features=[],
+                pros=[],
+                cons=[],
+                use_cases=[],
+                mav_verified=False,
+            )
+            return MAVResult(
+                context=context,
+                model_data=[],
+                total_facts_extracted=0,
+                facts_verified=0,
+                facts_rejected=0,
+            )
+
+    async def _parametric_only_fallback(
+        self,
+        query: str,
+        additional_context: Optional[str] = None,
+    ) -> MAVResult:
+        """Generate subject context from LLM's parametric knowledge only (no web search)."""
+        from cera.llm.openrouter import OpenRouterClient
+
+        fallback_model = (
+            self.mav_config.models[0]
+            if self.mav_config.models
+            else "anthropic/claude-sonnet-4"
+        )
+
+        await self._emit_log("INFO", "SIL", "SIL disabled — using LLM parametric knowledge only (no web search)", progress=5)
+
+        additional_context_block = ""
+        if additional_context:
+            additional_context_block = f"\nAdditional context: {additional_context}\n"
+
+        prompt = load_and_format(
+            "sil", "parametric_only",
+            subject=query,
+            additional_context_block=additional_context_block,
+        )
+
+        try:
+            async with OpenRouterClient(self.api_key, usage_tracker=self.usage_tracker, component="sil.parametric") as client:
+                response = await client.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=fallback_model,
+                    temperature=0.3,
+                )
+
+            from cera.api import _extract_json_from_llm
+            data = _extract_json_from_llm(response, expected_type="object")
+            context = SubjectContext(
+                subject=query,
+                features=data.get("characteristics", []),
+                pros=data.get("positives", []),
+                cons=data.get("negatives", []),
+                use_cases=data.get("use_cases", []),
+                mav_verified=False,
+            )
+
+            await self._emit_log("INFO", "SIL", f"Parametric knowledge: {len(context.features)} characteristics, {len(context.pros)} positives, {len(context.cons)} negatives, {len(context.use_cases)} use cases", progress=90)
+
+            return MAVResult(
+                context=context,
+                model_data=[],
+                total_facts_extracted=0,
+                facts_verified=0,
+                facts_rejected=0,
+            )
+        except Exception as e:
+            await self._emit_log("WARN", "SIL", f"Parametric fallback failed: {e}, returning empty context")
             context = SubjectContext(
                 subject=query,
                 features=[],

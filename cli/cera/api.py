@@ -143,6 +143,7 @@ class AblationConfig(BaseModel):
     """Ablation study settings - toggle components on/off."""
     sil_enabled: bool = True
     mav_enabled: bool = True
+    rgm_enabled: bool = True  # Controls PGM, WPM, SVM, and DEM (NEB, vocab tracking, opening directives, cap styles)
     polarity_enabled: bool = True
     noise_enabled: bool = True
     age_enabled: bool = True
@@ -447,6 +448,7 @@ def save_job_config(
         config_data["ablation"] = {
             "sil_enabled": config.ablation.sil_enabled,
             "mav_enabled": config.ablation.mav_enabled,
+            "rgm_enabled": config.ablation.rgm_enabled,
             "polarity_enabled": config.ablation.polarity_enabled,
             "noise_enabled": config.ablation.noise_enabled,
             "age_enabled": config.ablation.age_enabled,
@@ -1280,6 +1282,9 @@ async def execute_composition(
         # Phase 1: SIL - Subject Intelligence Layer (with MAV)
         # ========================================
         mav_enabled = config.subject_profile.mav.enabled if config.subject_profile.mav else False
+        # Ablation override: force MAV off if ablation says so
+        if config.ablation and not config.ablation.mav_enabled:
+            mav_enabled = False
         mav_models = config.subject_profile.mav.models if config.subject_profile.mav else []
         mav_threshold = config.subject_profile.mav.similarity_threshold if config.subject_profile.mav else 0.85
         mav_answer_threshold = getattr(config.subject_profile.mav, 'answer_threshold', 0.80) if config.subject_profile.mav else 0.80
@@ -1318,15 +1323,19 @@ async def execute_composition(
                 if progress is not None:
                     await convex.update_composition_progress(job_id, progress, phase)
 
+        sil_enabled = config.ablation.sil_enabled if config.ablation else True
         sil = SubjectIntelligenceLayer(
             api_key=api_key,
             mav_config=sil_mav_config,
             tavily_api_key=tavily_api_key,
             log_callback=sil_log_callback if convex else None,
+            sil_enabled=sil_enabled,
         )
 
         if convex:
             await convex.update_composition_progress(job_id, 5, "SIL")
+            if not sil_enabled:
+                await convex.add_log(job_id, "INFO", "SIL", "SIL disabled — using LLM parametric knowledge only")
             if mav_enabled:
                 await convex.add_log(job_id, "INFO", "MAV", "Starting multi-agent verification...")
 
@@ -1898,6 +1907,9 @@ async def execute_composition_simple(
 
     # Configure MAV if enabled
     mav_enabled = config.subject_profile.mav.enabled if config.subject_profile.mav else False
+    # Ablation override: force MAV off if ablation says so
+    if config.ablation and not config.ablation.mav_enabled:
+        mav_enabled = False
     mav_models = config.subject_profile.mav.models if config.subject_profile.mav else []
     mav_threshold = config.subject_profile.mav.similarity_threshold if config.subject_profile.mav else 0.85
     mav_answer_threshold = getattr(config.subject_profile.mav, 'answer_threshold', 0.80) if config.subject_profile.mav else 0.80
@@ -1919,15 +1931,19 @@ async def execute_composition_simple(
                 await convex.update_composition_progress(job_id, progress, phase)
 
     # Initialize SIL with MAV config and log callback
+    sil_enabled = config.ablation.sil_enabled if config.ablation else True
     sil = SubjectIntelligenceLayer(
         api_key=api_key,
         mav_config=sil_mav_config,
         tavily_api_key=tavily_api_key,
         log_callback=sil_log_callback if convex else None,
         usage_tracker=usage_tracker,
+        sil_enabled=sil_enabled,
     )
 
     # Gather intelligence (this runs MAV if enabled)
+    if not sil_enabled:
+        await log_progress("SIL", "SIL disabled — using LLM parametric knowledge only")
     await log_progress("SIL", f"Starting gather_intelligence for: {config.subject_profile.query}", 5)
     await log_progress("SIL", f"MAV config: enabled={sil_mav_config.enabled}, models={sil_mav_config.models}")
 
@@ -3835,169 +3851,180 @@ async def execute_generation(
         # ========================================
         import math as _math
 
-        if convex:
-            await convex.add_log(job_id, "INFO", "Personas", "Starting persona generation for this target...")
-            await convex.update_progress(job_id, 1, "Personas")
+        # Check RGM ablation flag (controls PGM, WPM, SVM, and DEM)
+        rgm_enabled = getattr(config.ablation, 'rgm_enabled', True) if config.ablation else True
 
-        # Determine persona count based on actual target size
-        persona_ratio = getattr(config.reviewer_profile, 'persona_ratio', 0.9) or 0.9
-        persona_count = max(1, _math.ceil(total_reviews * persona_ratio))
-
-        # Check if personas already exist (from legacy composition or reuse)
         personas_pool: list[dict] = []
-        personas_json_path = contexts_path / "personas.json"
-        if personas_json_path.exists():
-            try:
-                with open(personas_json_path) as f:
-                    existing_pool = json.load(f)
-                if len(existing_pool) >= persona_count:
-                    personas_pool = existing_pool[:persona_count]
-                    print(f"[Generation] Loaded {len(personas_pool)} personas from existing pool (sufficient for {persona_count} needed)")
-                else:
-                    # Need more — generate the difference
-                    print(f"[Generation] Existing pool has {len(existing_pool)} personas, need {persona_count}. Generating {persona_count - len(existing_pool)} more...")
-                    try:
-                        age_enabled = getattr(config.reviewer_profile, 'age_enabled', True) if hasattr(config.reviewer_profile, 'age_enabled') else True
-                        sex_enabled = getattr(config.reviewer_profile, 'sex_enabled', True) if hasattr(config.reviewer_profile, 'sex_enabled') else True
-                        extra = await _generate_personas(
-                            persona_count=persona_count - len(existing_pool),
-                            reviewer_profile=config.reviewer_profile,
-                            reviewers_context=reviewers_context,
-                            subject_context=subject_context,
-                            gen_model=config.generation.model,
-                            api_key=api_key,
-                            age_enabled=age_enabled,
-                            sex_enabled=sex_enabled,
-                            usage_tracker=usage_tracker,
-                        )
-                        personas_pool = existing_pool + extra
-                    except Exception as e:
-                        print(f"[Generation] Warning: Could not generate additional personas: {e}")
-                        personas_pool = existing_pool
-            except Exception as e:
-                print(f"[Generation] Warning: Could not load existing personas: {e}")
-
-        if not personas_pool:
-            # Generate from scratch
-            try:
-                age_enabled = getattr(config.reviewer_profile, 'age_enabled', True) if hasattr(config.reviewer_profile, 'age_enabled') else True
-                sex_enabled = getattr(config.reviewer_profile, 'sex_enabled', True) if hasattr(config.reviewer_profile, 'sex_enabled') else True
-                personas_pool = await _generate_personas(
-                    persona_count=persona_count,
-                    reviewer_profile=config.reviewer_profile,
-                    reviewers_context=reviewers_context,
-                    subject_context=subject_context,
-                    gen_model=config.generation.model,
-                    api_key=api_key,
-                    age_enabled=age_enabled,
-                    sex_enabled=sex_enabled,
-                    usage_tracker=usage_tracker,
-                )
-                print(f"[Generation] Generated {len(personas_pool)} personas")
-
-                # Save to target-level personas dir (datasets/{target}/reviewer-personas/)
-                # dataset_dir_override is model dir: datasets/{target}/run{N}/model-slug/
-                # .parent.parent = datasets/{target}/ (target level)
-                if dataset_dir_override:
-                    _target_dir = Path(dataset_dir_override).parent.parent
-                else:
-                    _target_dir = Path(job_paths["root"])
-                _personas_save_dir = _target_dir / "reviewer-personas"
-                _save_personas_to_dir(personas_pool, _personas_save_dir, subject_context.get("region", "unknown"))
-
-                # Save JSON at target level and contexts level (for cross-target reuse)
-                _personas_json_save = _target_dir / "personas.json"
-                with open(_personas_json_save, "w") as f:
-                    json.dump(personas_pool, f, indent=2)
-                # Also save to contexts for reuse by subsequent targets
-                _contexts_json_save = contexts_path / "personas.json"
-                with open(_contexts_json_save, "w") as f:
-                    json.dump(personas_pool, f, indent=2)
-
-            except Exception as e:
-                print(f"[Generation] Warning: Persona generation failed, will use RGM fallback: {e}")
-                if convex:
-                    await convex.add_log(job_id, "WARN", "Personas", f"Persona generation failed ({e}), using RGM fallback")
-
-        if convex and personas_pool:
-            await convex.add_log(job_id, "INFO", "Personas", f"Personas ready: {len(personas_pool)} for {total_reviews} reviews")
-            await convex.update_progress(job_id, 2, "Personas")
-
-        # Generate writing patterns (or load from existing)
         writing_patterns: dict = {}
-        patterns_path = contexts_path / "writing-patterns.json"
-        if patterns_path.exists():
-            try:
-                with open(patterns_path) as f:
-                    writing_patterns = json.load(f)
-                print(f"[Generation] Loaded {len(writing_patterns.get('patterns', {}))} writing pattern categories from existing")
-            except Exception as e:
-                print(f"[Generation] Warning: Could not load writing patterns: {e}")
-
-        if not writing_patterns:
-            try:
-                writing_patterns = await _generate_writing_patterns(
-                    subject_context=subject_context,
-                    job_paths=job_paths,
-                    gen_model=config.generation.model,
-                    api_key=api_key,
-                    usage_tracker=usage_tracker,
-                )
-                # Save for reuse
-                _patterns_save = contexts_path / "writing-patterns.json"
-                with open(_patterns_save, "w") as f:
-                    json.dump(writing_patterns, f, indent=2)
-                print(f"[Generation] Generated {len(writing_patterns.get('patterns', {}))} writing pattern categories")
-            except Exception as e:
-                print(f"[Generation] Warning: Pattern generation failed: {e}")
-
-        # Generate structure variants (per-target: variant count scales with target size)
-        import math as _sv_math
         structure_variants: list[dict] = []
-        _needed_variants = max(6, min(30, _sv_math.ceil(total_reviews * 0.15)))
 
-        # Check target-level first, then contexts-level fallback
-        if dataset_dir_override:
-            _target_structs_path = Path(dataset_dir_override).parent.parent / "structure-variants.json"
-        else:
-            _target_structs_path = None
-        _contexts_structs_path = contexts_path / "structure-variants.json"
+        if rgm_enabled:
+            if convex:
+                await convex.add_log(job_id, "INFO", "Personas", "Starting persona generation for this target...")
+                await convex.update_progress(job_id, 1, "Personas")
 
-        for _sp in [_target_structs_path, _contexts_structs_path]:
-            if _sp and _sp.exists():
+            # Determine persona count based on actual target size
+            persona_ratio = getattr(config.reviewer_profile, 'persona_ratio', 0.9) or 0.9
+            persona_count = max(1, _math.ceil(total_reviews * persona_ratio))
+
+            # Check if personas already exist (from legacy composition or reuse)
+            personas_json_path = contexts_path / "personas.json"
+            if personas_json_path.exists():
                 try:
-                    with open(_sp) as f:
-                        _loaded = json.load(f)
-                    if len(_loaded) >= _needed_variants:
-                        structure_variants = _loaded[:_needed_variants]
-                        print(f"[Generation] Loaded {len(structure_variants)} structure variants from {_sp.name} (needed {_needed_variants})")
-                        break
+                    with open(personas_json_path) as f:
+                        existing_pool = json.load(f)
+                    if len(existing_pool) >= persona_count:
+                        personas_pool = existing_pool[:persona_count]
+                        print(f"[Generation] Loaded {len(personas_pool)} personas from existing pool (sufficient for {persona_count} needed)")
                     else:
-                        print(f"[Generation] Found {len(_loaded)} variants in {_sp.name}, need {_needed_variants} — regenerating")
+                        # Need more — generate the difference
+                        print(f"[Generation] Existing pool has {len(existing_pool)} personas, need {persona_count}. Generating {persona_count - len(existing_pool)} more...")
+                        try:
+                            age_enabled = getattr(config.reviewer_profile, 'age_enabled', True) if hasattr(config.reviewer_profile, 'age_enabled') else True
+                            sex_enabled = getattr(config.reviewer_profile, 'sex_enabled', True) if hasattr(config.reviewer_profile, 'sex_enabled') else True
+                            extra = await _generate_personas(
+                                persona_count=persona_count - len(existing_pool),
+                                reviewer_profile=config.reviewer_profile,
+                                reviewers_context=reviewers_context,
+                                subject_context=subject_context,
+                                gen_model=config.generation.model,
+                                api_key=api_key,
+                                age_enabled=age_enabled,
+                                sex_enabled=sex_enabled,
+                                usage_tracker=usage_tracker,
+                            )
+                            personas_pool = existing_pool + extra
+                        except Exception as e:
+                            print(f"[Generation] Warning: Could not generate additional personas: {e}")
+                            personas_pool = existing_pool
                 except Exception as e:
-                    print(f"[Generation] Warning: Could not load structure variants from {_sp.name}: {e}")
+                    print(f"[Generation] Warning: Could not load existing personas: {e}")
 
-        if not structure_variants:
-            try:
-                structure_variants = await _generate_structure_variants(
-                    subject_context=subject_context,
-                    reviewers_context=reviewers_context,
-                    estimated_reviews=total_reviews,
-                    gen_model=config.generation.model,
-                    api_key=api_key,
-                    usage_tracker=usage_tracker,
-                )
-                # Save at target level
-                if _target_structs_path:
-                    _target_structs_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(_target_structs_path, "w") as f:
+            if not personas_pool:
+                # Generate from scratch
+                try:
+                    age_enabled = getattr(config.reviewer_profile, 'age_enabled', True) if hasattr(config.reviewer_profile, 'age_enabled') else True
+                    sex_enabled = getattr(config.reviewer_profile, 'sex_enabled', True) if hasattr(config.reviewer_profile, 'sex_enabled') else True
+                    personas_pool = await _generate_personas(
+                        persona_count=persona_count,
+                        reviewer_profile=config.reviewer_profile,
+                        reviewers_context=reviewers_context,
+                        subject_context=subject_context,
+                        gen_model=config.generation.model,
+                        api_key=api_key,
+                        age_enabled=age_enabled,
+                        sex_enabled=sex_enabled,
+                        usage_tracker=usage_tracker,
+                    )
+                    print(f"[Generation] Generated {len(personas_pool)} personas")
+
+                    # Save to target-level personas dir (datasets/{target}/reviewer-personas/)
+                    # dataset_dir_override is model dir: datasets/{target}/run{N}/model-slug/
+                    # .parent.parent = datasets/{target}/ (target level)
+                    if dataset_dir_override:
+                        _target_dir = Path(dataset_dir_override).parent.parent
+                    else:
+                        _target_dir = Path(job_paths["root"])
+                    _personas_save_dir = _target_dir / "reviewer-personas"
+                    _save_personas_to_dir(personas_pool, _personas_save_dir, subject_context.get("region", "unknown"))
+
+                    # Save JSON at target level and contexts level (for cross-target reuse)
+                    _personas_json_save = _target_dir / "personas.json"
+                    with open(_personas_json_save, "w") as f:
+                        json.dump(personas_pool, f, indent=2)
+                    # Also save to contexts for reuse by subsequent targets
+                    _contexts_json_save = contexts_path / "personas.json"
+                    with open(_contexts_json_save, "w") as f:
+                        json.dump(personas_pool, f, indent=2)
+
+                except Exception as e:
+                    print(f"[Generation] Warning: Persona generation failed, will use RGM fallback: {e}")
+                    if convex:
+                        await convex.add_log(job_id, "WARN", "Personas", f"Persona generation failed ({e}), using RGM fallback")
+
+            if convex and personas_pool:
+                await convex.add_log(job_id, "INFO", "Personas", f"Personas ready: {len(personas_pool)} for {total_reviews} reviews")
+                await convex.update_progress(job_id, 2, "Personas")
+
+            # Generate writing patterns (or load from existing)
+            patterns_path = contexts_path / "writing-patterns.json"
+            if patterns_path.exists():
+                try:
+                    with open(patterns_path) as f:
+                        writing_patterns = json.load(f)
+                    print(f"[Generation] Loaded {len(writing_patterns.get('patterns', {}))} writing pattern categories from existing")
+                except Exception as e:
+                    print(f"[Generation] Warning: Could not load writing patterns: {e}")
+
+            if not writing_patterns:
+                try:
+                    writing_patterns = await _generate_writing_patterns(
+                        subject_context=subject_context,
+                        job_paths=job_paths,
+                        gen_model=config.generation.model,
+                        api_key=api_key,
+                        usage_tracker=usage_tracker,
+                    )
+                    # Save for reuse
+                    _patterns_save = contexts_path / "writing-patterns.json"
+                    with open(_patterns_save, "w") as f:
+                        json.dump(writing_patterns, f, indent=2)
+                    print(f"[Generation] Generated {len(writing_patterns.get('patterns', {}))} writing pattern categories")
+                except Exception as e:
+                    print(f"[Generation] Warning: Pattern generation failed: {e}")
+
+            # Generate structure variants (per-target: variant count scales with target size)
+            import math as _sv_math
+            _needed_variants = max(6, min(30, _sv_math.ceil(total_reviews * 0.15)))
+
+            # Check target-level first, then contexts-level fallback
+            if dataset_dir_override:
+                _target_structs_path = Path(dataset_dir_override).parent.parent / "structure-variants.json"
+            else:
+                _target_structs_path = None
+            _contexts_structs_path = contexts_path / "structure-variants.json"
+
+            for _sp in [_target_structs_path, _contexts_structs_path]:
+                if _sp and _sp.exists():
+                    try:
+                        with open(_sp) as f:
+                            _loaded = json.load(f)
+                        if len(_loaded) >= _needed_variants:
+                            structure_variants = _loaded[:_needed_variants]
+                            print(f"[Generation] Loaded {len(structure_variants)} structure variants from {_sp.name} (needed {_needed_variants})")
+                            break
+                        else:
+                            print(f"[Generation] Found {len(_loaded)} variants in {_sp.name}, need {_needed_variants} — regenerating")
+                    except Exception as e:
+                        print(f"[Generation] Warning: Could not load structure variants from {_sp.name}: {e}")
+
+            if not structure_variants:
+                try:
+                    structure_variants = await _generate_structure_variants(
+                        subject_context=subject_context,
+                        reviewers_context=reviewers_context,
+                        estimated_reviews=total_reviews,
+                        gen_model=config.generation.model,
+                        api_key=api_key,
+                        usage_tracker=usage_tracker,
+                    )
+                    # Save at target level
+                    if _target_structs_path:
+                        _target_structs_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(_target_structs_path, "w") as f:
+                            json.dump(structure_variants, f, indent=2)
+                    # Also save to contexts for fallback
+                    with open(_contexts_structs_path, "w") as f:
                         json.dump(structure_variants, f, indent=2)
-                # Also save to contexts for fallback
-                with open(_contexts_structs_path, "w") as f:
-                    json.dump(structure_variants, f, indent=2)
-                print(f"[Generation] Generated {len(structure_variants)} structure variants for {total_reviews} reviews")
-            except Exception as e:
-                print(f"[Generation] Warning: Structure generation failed: {e}")
+                    print(f"[Generation] Generated {len(structure_variants)} structure variants for {total_reviews} reviews")
+                except Exception as e:
+                    print(f"[Generation] Warning: Structure generation failed: {e}")
+        else:
+            # RGM disabled — skip PGM, WPM, SVM
+            print("[Generation] RGM disabled — skipping persona generation, writing patterns, and structure variants")
+            if convex:
+                await convex.add_log(job_id, "INFO", "RGM", "RGM disabled — skipping personas, writing patterns, structure variants, and diversity enforcement")
+                await convex.update_progress(job_id, 2, "RGM")
 
         if convex:
             await convex.add_log(job_id, "INFO", "AML", "Starting generation phase...")
@@ -4318,52 +4345,62 @@ Output ONLY the JSON object, no other text."""
         # Pass subject features + pros/cons as exempt terms so product vocabulary isn't penalized
         _subject_terms = all_features + all_pros + all_cons
         vocab_tracker = VocabDiversityTracker(top_k=10, subject_terms=_subject_terms)
-        neb_enabled = getattr(config.generation, 'neb_enabled', True)
-        neb_depth = getattr(config.generation, 'neb_depth', 3)
         neb_buffer = None
-        if neb_enabled and neb_depth > 0:
-            max_buffer_size = neb_depth * request_size
-            neb_buffer = NegativeExampleBuffer(max_size=max_buffer_size)
-            print(f"[NEB] Enabled with depth={neb_depth}, max_buffer={max_buffer_size} reviews", flush=True)
-            if convex:
-                await convex.add_log(job_id, "INFO", "NEB", f"Negative Example Buffer enabled (depth={neb_depth}, max={max_buffer_size})")
+
+        if rgm_enabled:
+            # DEM enabled — initialize NEB, opening directives, cap styles
+            neb_enabled = getattr(config.generation, 'neb_enabled', True)
+            neb_depth = getattr(config.generation, 'neb_depth', 3)
+            if neb_enabled and neb_depth > 0:
+                max_buffer_size = neb_depth * request_size
+                neb_buffer = NegativeExampleBuffer(max_size=max_buffer_size)
+                print(f"[NEB] Enabled with depth={neb_depth}, max_buffer={max_buffer_size} reviews", flush=True)
+                if convex:
+                    await convex.add_log(job_id, "INFO", "NEB", f"Negative Example Buffer enabled (depth={neb_depth}, max={max_buffer_size})")
+            else:
+                print(f"[NEB] Disabled (neb_enabled={neb_enabled}, neb_depth={neb_depth})", flush=True)
+
+            # Opening directives for per-review diversity enforcement
+            OPENING_DIRECTIVES = [
+                "Start with a specific product detail, measurement, or physical observation you noticed immediately",
+                "Start mid-thought or mid-story, as if continuing a conversation (e.g., 'So I finally...' or 'Three weeks in and...')",
+                "Start with a rhetorical question or genuine question to the reader",
+                "Start with a raw emotional reaction -- excitement, disappointment, surprise, or frustration",
+                "Start with when, where, or how you acquired/visited/discovered this (time and place context)",
+                "Start with a comparison to a competitor, alternative, or your previous experience",
+                "Start with a casual filler word or interjection (e.g., 'Ok so...', 'Man,', 'Alright,', 'Look,')",
+                "Start with a direct complaint or frustration about a specific issue",
+                "Start with enthusiastic praise or a strong recommendation",
+                "Start with a warning, caveat, or 'heads up' to other buyers/visitors",
+                "Start by addressing the reader directly (e.g., 'If you're looking for...', 'For anyone considering...')",
+                "Start with a time reference (e.g., 'After two months...', 'First day with this...')",
+                "Start with a contradictory or nuanced take (e.g., 'I wanted to love this but...', 'Mixed feelings...')",
+                "Start with a factual statement about usage (e.g., 'Used this daily for 3 months...')",
+                "Start with a story or anecdote about why you bought/visited this",
+            ]
+
+            # Capitalization styles for per-review authenticity (weighted distribution)
+            # Read weights from config or use defaults (decimal values, e.g., 0.55 = 55%)
+            cap_weights = getattr(config.attributes_profile, 'cap_weights', None) or {}
+            _cap_w = {
+                "standard": cap_weights.get("standard", 0.55),
+                "lowercase": cap_weights.get("lowercase", 0.20),
+                "mixed": cap_weights.get("mixed", 0.15),
+                "emphasis": cap_weights.get("emphasis", 0.10),
+            }
+            CAPITALIZATION_STYLES = [
+                ("Write with standard/proper capitalization. Capitalize the first word of each sentence normally.", _cap_w["standard"]),
+                ("Write in mostly lowercase. Start your review and most sentences with lowercase letters. Use lowercase 'i' instead of 'I'. Example: 'honestly this laptop is pretty solid. i use it every day and the keyboard feels great.'", _cap_w["lowercase"]),
+                ("Write with casual/mixed capitalization. Start the review lowercase, occasionally skip capitalization after periods, but not consistently. Example: 'so i picked this up last week. The screen is decent but the speakers kinda suck.'", _cap_w["mixed"]),
+                ("Write with occasional ALL CAPS for emphasis on key words, but otherwise normal capitalization. Example: 'The battery life is AMAZING but the trackpad is SO frustrating to use.'", _cap_w["emphasis"]),
+            ]
         else:
-            print(f"[NEB] Disabled (neb_enabled={neb_enabled}, neb_depth={neb_depth})", flush=True)
-
-        # Opening directives for per-review diversity enforcement
-        OPENING_DIRECTIVES = [
-            "Start with a specific product detail, measurement, or physical observation you noticed immediately",
-            "Start mid-thought or mid-story, as if continuing a conversation (e.g., 'So I finally...' or 'Three weeks in and...')",
-            "Start with a rhetorical question or genuine question to the reader",
-            "Start with a raw emotional reaction -- excitement, disappointment, surprise, or frustration",
-            "Start with when, where, or how you acquired/visited/discovered this (time and place context)",
-            "Start with a comparison to a competitor, alternative, or your previous experience",
-            "Start with a casual filler word or interjection (e.g., 'Ok so...', 'Man,', 'Alright,', 'Look,')",
-            "Start with a direct complaint or frustration about a specific issue",
-            "Start with enthusiastic praise or a strong recommendation",
-            "Start with a warning, caveat, or 'heads up' to other buyers/visitors",
-            "Start by addressing the reader directly (e.g., 'If you're looking for...', 'For anyone considering...')",
-            "Start with a time reference (e.g., 'After two months...', 'First day with this...')",
-            "Start with a contradictory or nuanced take (e.g., 'I wanted to love this but...', 'Mixed feelings...')",
-            "Start with a factual statement about usage (e.g., 'Used this daily for 3 months...')",
-            "Start with a story or anecdote about why you bought/visited this",
-        ]
-
-        # Capitalization styles for per-review authenticity (weighted distribution)
-        # Read weights from config or use defaults (decimal values, e.g., 0.55 = 55%)
-        cap_weights = getattr(config.attributes_profile, 'cap_weights', None) or {}
-        _cap_w = {
-            "standard": cap_weights.get("standard", 0.55),
-            "lowercase": cap_weights.get("lowercase", 0.20),
-            "mixed": cap_weights.get("mixed", 0.15),
-            "emphasis": cap_weights.get("emphasis", 0.10),
-        }
-        CAPITALIZATION_STYLES = [
-            ("Write with standard/proper capitalization. Capitalize the first word of each sentence normally.", _cap_w["standard"]),
-            ("Write in mostly lowercase. Start your review and most sentences with lowercase letters. Use lowercase 'i' instead of 'I'. Example: 'honestly this laptop is pretty solid. i use it every day and the keyboard feels great.'", _cap_w["lowercase"]),
-            ("Write with casual/mixed capitalization. Start the review lowercase, occasionally skip capitalization after periods, but not consistently. Example: 'so i picked this up last week. The screen is decent but the speakers kinda suck.'", _cap_w["mixed"]),
-            ("Write with occasional ALL CAPS for emphasis on key words, but otherwise normal capitalization. Example: 'The battery life is AMAZING but the trackpad is SO frustrating to use.'", _cap_w["emphasis"]),
-        ]
+            # RGM disabled — DEM off: no NEB, no opening directives, standard cap only
+            print("[Generation] RGM disabled — DEM off (no NEB, no vocab tracking, no opening directives, standard capitalization)", flush=True)
+            OPENING_DIRECTIVES = [""]
+            CAPITALIZATION_STYLES = [
+                ("Write with standard/proper capitalization. Capitalize the first word of each sentence normally.", 1.0),
+            ]
 
         if dataset_mode == "implicit":
             dataset_mode_instruction = "For implicit mode: do NOT include target terms. Only provide the category and polarity for each opinion."
@@ -4794,7 +4831,8 @@ Requirements:
                         if texts:
                             review_text = " ".join(texts)
                             batch_review_texts.append(review_text)
-                            vocab_tracker.update(review_text)
+                            if rgm_enabled:
+                                vocab_tracker.update(review_text)
 
             if neb_buffer is not None:
                 print(f"[NEB DEBUG] Batch {batch_start}-{batch_end}: {successful_count} successful, {error_in_batch} errors, {len(batch_review_texts)} texts collected", flush=True)

@@ -237,6 +237,7 @@ export const create = mutation({
       ablation: v.optional(v.object({
         sil_enabled: v.boolean(),
         mav_enabled: v.boolean(),
+        rgm_enabled: v.boolean(),
         polarity_enabled: v.boolean(),
         noise_enabled: v.boolean(),
         age_enabled: v.boolean(),

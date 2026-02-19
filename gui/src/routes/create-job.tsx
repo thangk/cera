@@ -141,6 +141,7 @@ function AblationSettingsDialog({ config, updateConfig }: { config: any; updateC
   const disabledCount = [
     !config.ablation.sil_enabled,
     !config.ablation.mav_enabled,
+    !config.ablation.rgm_enabled,
     !config.ablation.polarity_enabled,
     !config.ablation.noise_enabled,
     !config.ablation.age_enabled,
@@ -192,18 +193,36 @@ function AblationSettingsDialog({ config, updateConfig }: { config: any; updateC
                   <td className="p-3 text-center">
                     <Switch
                       checked={config.ablation.sil_enabled}
-                      onCheckedChange={(v) => updateConfig('ablation.sil_enabled', v)}
+                      onCheckedChange={(v) => {
+                        updateConfig('ablation.sil_enabled', v)
+                        // SIL off → force MAV off (no web search to verify)
+                        if (!v) updateConfig('ablation.mav_enabled', false)
+                      }}
                     />
                   </td>
                 </tr>
-                <tr>
-                  <td className="p-3 font-mono text-xs font-semibold text-primary">MAV</td>
-                  <td className="p-3 text-muted-foreground">Multi-Agent Verification - 2/3 consensus voting</td>
-                  <td className="p-3 text-muted-foreground">Single LLM (no consensus)</td>
+                <tr className="border-b border-primary/20">
+                  <td className={`p-3 font-mono text-xs font-semibold ${config.ablation.sil_enabled ? 'text-primary' : 'text-muted-foreground/50'}`}>MAV</td>
+                  <td className={`p-3 ${config.ablation.sil_enabled ? 'text-muted-foreground' : 'text-muted-foreground/50'}`}>Multi-Agent Verification - 2/3 consensus voting</td>
+                  <td className={`p-3 ${config.ablation.sil_enabled ? 'text-muted-foreground' : 'text-muted-foreground/50'}`}>
+                    {config.ablation.sil_enabled ? 'SAV mode (single LLM, no consensus)' : 'N/A — SIL is off (no web search to verify)'}
+                  </td>
                   <td className="p-3 text-center">
                     <Switch
                       checked={config.ablation.mav_enabled}
                       onCheckedChange={(v) => updateConfig('ablation.mav_enabled', v)}
+                      disabled={!config.ablation.sil_enabled}
+                    />
+                  </td>
+                </tr>
+                <tr>
+                  <td className="p-3 font-mono text-xs font-semibold text-primary">RGM</td>
+                  <td className="p-3 text-muted-foreground">Reviewer Generation Module - personas, writing patterns, diversity</td>
+                  <td className="p-3 text-muted-foreground">No personas, patterns, or diversity controls</td>
+                  <td className="p-3 text-center">
+                    <Switch
+                      checked={config.ablation.rgm_enabled}
+                      onCheckedChange={(v) => updateConfig('ablation.rgm_enabled', v)}
                     />
                   </td>
                 </tr>
@@ -281,6 +300,7 @@ function AblationSettingsDialog({ config, updateConfig }: { config: any; updateC
             <span className="text-xs text-muted-foreground">Disabled components:</span>
             {!config.ablation.sil_enabled && <Badge variant="outline" className="text-xs">SIL</Badge>}
             {!config.ablation.mav_enabled && <Badge variant="outline" className="text-xs">MAV</Badge>}
+            {!config.ablation.rgm_enabled && <Badge variant="outline" className="text-xs">RGM</Badge>}
             {!config.ablation.polarity_enabled && <Badge variant="outline" className="text-xs">Polarity</Badge>}
             {!config.ablation.noise_enabled && <Badge variant="outline" className="text-xs">Noise</Badge>}
             {!config.ablation.age_enabled && <Badge variant="outline" className="text-xs">Age</Badge>}
@@ -477,6 +497,7 @@ const DEFAULT_CONFIG = {
   ablation: {
     sil_enabled: true,
     mav_enabled: true,
+    rgm_enabled: true,
     polarity_enabled: true,
     noise_enabled: true,
     age_enabled: true,
@@ -1549,6 +1570,7 @@ function GenerateWizard() {
       ablation: {
         sil_enabled: config.ablation.sil_enabled,
         mav_enabled: config.ablation.mav_enabled,
+        rgm_enabled: config.ablation.rgm_enabled,
         polarity_enabled: config.ablation.polarity_enabled,
         noise_enabled: config.ablation.noise_enabled,
         age_enabled: config.ablation.age_enabled,
@@ -5396,7 +5418,11 @@ function IntelligenceStepContent({ config, updateConfig, constraints, modelValid
             </div>
             <Switch
               checked={silEnabled}
-              onCheckedChange={(v) => updateConfig('ablation.sil_enabled', v)}
+              onCheckedChange={(v) => {
+                updateConfig('ablation.sil_enabled', v)
+                // SIL off → force MAV off (no web search to verify)
+                if (!v) updateConfig('ablation.mav_enabled', false)
+              }}
             />
           </div>
           <AblationSection enabled={silEnabled} effect="No web search, LLM uses internal knowledge only">
@@ -5432,9 +5458,10 @@ function IntelligenceStepContent({ config, updateConfig, constraints, modelValid
             <Switch
               checked={mavEnabled}
               onCheckedChange={(v) => updateConfig('ablation.mav_enabled', v)}
+              disabled={!silEnabled}
             />
           </div>
-          <AblationSection enabled={mavEnabled} effect="Single model, no cross-validation">
+          <AblationSection enabled={mavEnabled || !silEnabled} effect={silEnabled ? "SAV mode (single LLM, no consensus)" : "N/A — SIL is off (no web search to verify)"}>
             <div className="space-y-4">
               <div className="rounded-lg border bg-muted/30 p-4 space-y-2">
                 <p className="text-sm">

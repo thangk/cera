@@ -101,6 +101,7 @@ export default defineSchema({
       ablation: v.optional(v.object({
         sil_enabled: v.boolean(),
         mav_enabled: v.boolean(),
+        rgm_enabled: v.optional(v.boolean()),
         polarity_enabled: v.boolean(),
         noise_enabled: v.boolean(),
         age_enabled: v.boolean(),
