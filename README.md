@@ -240,16 +240,14 @@ These imperfections are guided by the reviewer persona and writing temperature �
 
 ### Per-Review Injection vs. Batch-Level Instructions
 
-A key architectural distinction in CERA is that Opening Directives and Capitalization Style Directives are **injected per-review** — each individual review receives its own dedicated system prompt with a specific, mandatory directive. This contrasts with the heuristic baseline approach where diversity instructions are given once at the batch level (e.g., "vary your opening lines" or "assign each review a different capitalization style").
+A key architectural distinction in CERA is that Opening Directives and Capitalization Style Directives are **injected per-review** — each individual review receives its own dedicated system prompt with a specific, mandatory directive. Both CERA and the heuristic baseline generate one review per API call, but they differ in *what* the prompt contains:
 
 | Approach | Mechanism | Enforcement |
 |----------|-----------|-------------|
-| **CERA (per-review)** | Each review gets a unique system prompt with `"You MUST follow this assigned opening strategy"` and `"You MUST follow this capitalization style"` | Mandatory — the LLM has no choice but to comply since it sees only one directive |
-| **Heuristic (batch-level)** | All reviews share a single prompt containing the full list of strategies and a general instruction to vary | Advisory — the LLM tends to favor a subset of patterns and often defaults to proper capitalization |
+| **CERA (per-review directives)** | Each review gets a unique system prompt with `"You MUST follow this assigned opening strategy"` and `"You MUST follow this capitalization style"` | Mandatory — the LLM has no choice but to comply since it sees only one directive |
+| **Heuristic (general instructions)** | Each review gets the same prompt containing a general instruction to "vary your style" without specific per-review assignments | Advisory — the LLM tends to favor a subset of patterns and often defaults to proper capitalization |
 
-In practice, we observed that batch-level instructions for capitalization variation are largely ignored by LLMs — even with explicit percentage targets (e.g., "~20% should be lowercase"), generated reviews consistently default to proper capitalization. Per-review mandatory injection overcomes this by removing the LLM's discretion: it receives exactly one style directive and is instructed to follow it without deviation.
-
-This per-review injection is made possible by CERA's architecture where each review is generated as an independent API call with its own composed system prompt, rather than generating multiple reviews in a single batch call.
+In practice, we observed that general instructions for capitalization variation are largely ignored by LLMs — even with explicit percentage targets (e.g., "~20% should be lowercase"), generated reviews consistently default to proper capitalization. Per-review mandatory injection overcomes this by removing the LLM's discretion: it receives exactly one style directive and is instructed to follow it without deviation.
 
 ---
 
