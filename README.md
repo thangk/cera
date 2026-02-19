@@ -20,6 +20,58 @@
 
 ---
 
+## Overview
+
+CERA addresses critical challenges in ABSA research:
+
+- **Data scarcity** - Benchmark datasets like SemEval contain only ~3K sentences
+- **Class imbalance** - Real reviews skew ~65% positive, hurting minority class performance
+- **Domain sparsity** - Niche domains lack sufficient annotated data
+
+Unlike existing approaches that require model fine-tuning, CERA generates high-quality synthetic ABSA data using only **context engineering** and **multi-agent verification** — no GPU infrastructure, fine-tuning, or pre-existing embeddings required.
+
+---
+
+## Pipeline Architecture
+
+<p align="center">
+  <img src="assets/cera-pipeline.jpg" alt="CERA Pipeline Architecture">
+</p>
+
+---
+
+## Key Features
+
+**Composition Phase:**
+
+| Component | Description |
+|-----------|-------------|
+| **Subject Intelligence Layer (SIL)** | Agentic web search for factual grounding — reduces hallucination via current product intelligence |
+| **Multi-Agent Verification (MAV)** | Cross-provider consensus (2/3 majority voting, $\tau$=0.85) for fact verification |
+| **Reviewer Generation Module (RGM)** | Demographic-grounded persona diversity across 7 dimensions — personas, writing patterns, structure variants |
+| **Attributes Composition Module (ACM)** | Configurable polarity distribution, noise injection, length/temperature bounds |
+
+**Generation Phase:**
+
+| Component | Description |
+|-----------|-------------|
+| **Authenticity Modeling Layer (AML)** | Combines all composition outputs into per-review blueprints under zero creative latitude |
+| **Diversity Enforcement Module (DEM)** | Four submodules enforcing corpus diversity without additional LLM calls: |
+| &nbsp;&nbsp; Vocabulary Diversity Tracker (VDT) | Monitors cumulative phrase frequencies; injects avoidance guidance when phrases exceed 5% threshold |
+| &nbsp;&nbsp; Reference Style Injection (RSI) | Samples real review sentences as tone references |
+| &nbsp;&nbsp; Opening Directive Module (ODM) | Per-review opening strategies (15 patterns) ensuring structural diversity |
+| &nbsp;&nbsp; Capitalization Style Module (CSM) | Weighted-random capitalization styles reflecting authentic surface variation |
+| **Negative Example Buffer (NEB)** | Rolling FIFO buffer of prior reviews injected as "what to avoid" — enforces cross-batch diversity |
+| **Noise Injection** | Post-generation via nlpaug: character (typos), lexical (colloquialisms), sentence (run-ons) |
+
+**Evaluation Phase:**
+
+| Component | Description |
+|-----------|-------------|
+| **Multi-Dimensional Quality Assessment (MDQA)** | Three-axis evaluation: lexical (BLEU, ROUGE-L), semantic (BERTScore, MoverScore), diversity (Distinct-1/2, Self-BLEU) |
+
+---
+
 ## Quick Start (Docker)
 
 ### Prerequisites
@@ -115,58 +167,6 @@ docker exec cli python -c "import torch; print(f'CUDA: {torch.cuda.is_available(
 ```
 
 > **Note:** The GPU-enabled image is larger (~5GB vs ~1GB). To use CPU-only, comment out the `deploy` section in `docker-compose.yml` and change the base image in `cli/Dockerfile` to `python:3.11-slim`.
-
----
-
-## Overview
-
-CERA addresses critical challenges in ABSA research:
-
-- **Data scarcity** - Benchmark datasets like SemEval contain only ~3K sentences
-- **Class imbalance** - Real reviews skew ~65% positive, hurting minority class performance
-- **Domain sparsity** - Niche domains lack sufficient annotated data
-
-Unlike existing approaches that require model fine-tuning, CERA generates high-quality synthetic ABSA data using only **context engineering** and **multi-agent verification** — no GPU infrastructure, fine-tuning, or pre-existing embeddings required.
-
----
-
-## Key Features
-
-**Composition Phase:**
-
-| Component | Description |
-|-----------|-------------|
-| **Subject Intelligence Layer (SIL)** | Agentic web search for factual grounding — reduces hallucination via current product intelligence |
-| **Multi-Agent Verification (MAV)** | Cross-provider consensus (2/3 majority voting, $\tau$=0.85) for fact verification |
-| **Reviewer Generation Module (RGM)** | Demographic-grounded persona diversity across 7 dimensions — personas, writing patterns, structure variants |
-| **Attributes Composition Module (ACM)** | Configurable polarity distribution, noise injection, length/temperature bounds |
-
-**Generation Phase:**
-
-| Component | Description |
-|-----------|-------------|
-| **Authenticity Modeling Layer (AML)** | Combines all composition outputs into per-review blueprints under zero creative latitude |
-| **Diversity Enforcement Module (DEM)** | Four submodules enforcing corpus diversity without additional LLM calls: |
-| &nbsp;&nbsp; Vocabulary Diversity Tracker (VDT) | Monitors cumulative phrase frequencies; injects avoidance guidance when phrases exceed 5% threshold |
-| &nbsp;&nbsp; Reference Style Injection (RSI) | Samples real review sentences as tone references |
-| &nbsp;&nbsp; Opening Directive Module (ODM) | Per-review opening strategies (15 patterns) ensuring structural diversity |
-| &nbsp;&nbsp; Capitalization Style Module (CSM) | Weighted-random capitalization styles reflecting authentic surface variation |
-| **Negative Example Buffer (NEB)** | Rolling FIFO buffer of prior reviews injected as "what to avoid" — enforces cross-batch diversity |
-| **Noise Injection** | Post-generation via nlpaug: character (typos), lexical (colloquialisms), sentence (run-ons) |
-
-**Evaluation Phase:**
-
-| Component | Description |
-|-----------|-------------|
-| **Multi-Dimensional Quality Assessment (MDQA)** | Three-axis evaluation: lexical (BLEU, ROUGE-L), semantic (BERTScore, MoverScore), diversity (Distinct-1/2, Self-BLEU) |
-
----
-
-## Pipeline Architecture
-
-<p align="center">
-  <img src="assets/cera-pipeline.jpg" alt="CERA Pipeline Architecture">
-</p>
 
 ---
 
